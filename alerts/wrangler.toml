@@ -1,0 +1,100 @@
+# Pearl Hub price-alert worker — see src/index.js for the API.
+#
+# One-time setup:
+#   npx wrangler d1 create prl-alerts
+#   npx wrangler d1 execute prl-alerts --remote --file=schema.sql
+#   npx wrangler secret put APNS_KEY        # paste the AuthKey_<APNS_KEY_ID>.p8 contents
+#   npx wrangler secret put INGEST_TOKEN    # bearer token of POST /v1/ingest/safetrade
+#   npx wrangler secret put ASN_SECRET      # path secret of the App Store Server Notifications URL
+#                                           #   https://prl.tools.video/v1/asn/<ASN_SECRET> (both prod + sandbox, V2)
+# Schema changes after the first setup live in migrations/ (tracked, so re-running is a no-op):
+#   npx wrangler d1 migrations apply prl-alerts --remote
+# Deploy:  npm run deploy  (applies pending migrations FIRST — the worker reads the
+#          tables they add, so the other order breaks requests in flight)
+# Tests:   npm test
+
+name = "prl-alerts"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+# All domains share this Worker and D1 database. Keep the original domain for
+# installed native apps, extensions, existing browser storage and Web Push.
+routes = [
+  { pattern = "pearlhub.net/*", zone_name = "pearlhub.net" },
+  { pattern = "www.pearlhub.net/*", zone_name = "pearlhub.net" },
+  { pattern = "prl.tools.video", custom_domain = true }
+]
+workers_dev = false
+
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "prl-alerts"
+database_id = "<your D1 database id>"
+
+# Per-IP throttle on device writes (PUT / DELETE / test push).
+[[ratelimits]]
+name = "RL"
+namespace_id = "7301"
+simple = { limit = 30, period = 60 }
+
+# Tighter per-IP throttle on registering a token the worker hasn't seen before
+# (each costs an APNs round trip to prove the token is real).
+[[ratelimits]]
+name = "RL_NEW"
+namespace_id = "7302"
+simple = { limit = 5, period = 60 }
+
+[vars]
+APNS_TEAM_ID = "<your Apple team id>"
+APNS_KEY_ID = "<your APNs key id>"
+APNS_TOPICS = "com.prl.wizard"   # bundle ids allowed to register (iOS + macOS share it)
+# "1" = a registration must carry a signed Pro transaction (pro_jws). Keep "0"
+# while apps older than 1.17 (which never send one) are still in use.
+REQUIRE_PRO = "0"
+# "1" = /v1/asn accepts only Apple-signed notifications. Off until one real notification
+# has logged "asn: signature verified" in production; meanwhile an unverified one is
+# accepted, but a refund / revoke in it is not acted on.
+ASN_STRICT = "0"
+# Owner selected the existing donation address for Web Pro on 2026-10-10.
+# Orders use a unique exact amount; unrelated donations do not grant Pro.
+PAY_ADDRESS = "prl1pmkyxyht58rzhe7cj9ha7ncpm6r28x6g0htq93ffs5hsh7lqsxj7qw9pyjv"
+PRO_USD = "4.99"
+PAY_CONFIRMATIONS = "1"
+# VAPID_PRIVATE and ADMIN_TOKEN belong in secrets, never here.
+VAPID_PUBLIC = "BOd5xDMZB2WQlBxW2X4Y37bumOxAYgzBFvZTcXPeJFsaPbmB5UCMIau2vDUCxzJjUZShhPhTW8X5FHSwxppiy_0"
+VAPID_SUBJECT = "https://pearlhub.net/"
+# Enable only after the sending domain, Turnstile and account secrets are ready.
+ACCOUNT_ENABLED = "1"
+ACCOUNT_CONFIG_WRITE_ENABLED = "1"
+# Derive the expected origin from each request's URL. Cookie writes and guest
+# purchases still require an exact same-origin header, and Turnstile's hostname
+# must match that request. This lets the bound domains work independently.
+ACCOUNT_ORIGIN = ""
+ACCOUNT_CONFIG_KEY_VERSION = "1"
+EMAIL_DAILY_LIMIT = "100"
+EMAIL_FROM = "login@login.prl.tools.video"
+TURNSTILE_SITE_KEY = "0x4AAAAAAFT1cMjI81y5tCJ7"
+ACCOUNT_REDIRECTS = "prlhub://account,https://njnhepcaamfibhkfbfhlmknoldgjmefc.chromiumapp.org/account"
+# AUTH_PEPPER, ACCOUNT_CONFIG_KEY and TURNSTILE_SECRET are Worker secrets.
+
+[[send_email]]
+name = "EMAIL"
+
+[observability]
+enabled = true
+
+# Web assets share the API origin; /v1 paths always reach the Worker. The web app
+# is its own repository (prl-hub-web), checked out next to this one.
+[assets]
+directory = "../../prl-hub-web/web/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/v1", "/v1/*", "/__scheduled"]
+
+[[ratelimits]]
+name = "RL_READ"
+namespace_id = "7303"
+simple = { limit = 120, period = 60 }
