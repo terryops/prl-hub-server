@@ -111,7 +111,7 @@ export async function claimPurchasePush(env,session,token,account=null) {
       AND EXISTS(SELECT 1 FROM account_devices WHERE user_id=? AND id=? AND revoked_at IS NULL)
       AND EXISTS(SELECT 1 FROM purchase_visitors WHERE id=? AND revoked_at IS NULL)`)
       .bind(session.user_id,session.device_id,token,account.user_id,account.device_id,account.id,account.user_id,account.device_id,session.id),
-    db.prepare(`UPDATE devices SET gid=?,account_device_id=? WHERE token=? AND chan='webpush'
+    db.prepare(`UPDATE devices SET gid=?,account_device_id=? WHERE token=? AND chan IN('webpush','fcm')
       AND EXISTS(SELECT 1 FROM account_push_claims WHERE token=? AND user_id=? AND device_id=? AND revoked_at IS NULL)`)
       .bind(session.user_id,session.device_id,token,token,session.user_id,session.device_id),
   ]);
@@ -122,7 +122,7 @@ export async function claimPurchasePush(env,session,token,account=null) {
   if(!out)return false;
   const old="SELECT token FROM account_push_claims WHERE user_id=? AND token<>? AND revoked_at IS NULL";
   await db.batch([
-    ...["rules","deferred","watches","webpush","devices"].map(table=>db.prepare(`DELETE FROM ${table} WHERE token IN(${old})`).bind(session.user_id,token)),
+    ...["rules","deferred","watches","webpush","fcm","devices"].map(table=>db.prepare(`DELETE FROM ${table} WHERE token IN(${old})`).bind(session.user_id,token)),
     db.prepare(`UPDATE account_push_claims SET revoked_at=? WHERE token IN(${old})`).bind(t,session.user_id,token),
   ]);
   return true;

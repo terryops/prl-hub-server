@@ -166,6 +166,14 @@ export function parseStats(pool, replies, t = now()) {
     s.windows = ["m30", "h3", "day"];
     s.workers = withRates(rows(o.results), (w) => ({ m30: n(w.avg_hashrate_30m), h3: n(w.avg_hashrate_3h), day: n(w.avg_hashrate_24h) }));
 
+  } else if (pool === "Jetski") {
+    if (identities.missing) return { missing: true };
+    s.windows = ["live", "hour", "h6"];
+    s.rates = { live: n(o.hashrate_5m), hour: n(o.hashrate_1h), h6: n(o.hashrate_6h) };
+    const confirming = n(o.pending_balance_grains) || n(o.estimated_pending_balance_grains);
+    s.pending = (n(o.current_balance_grains) + confirming) / 1e8;
+    s.paid = n(o.total_paid_grains) / 1e8;
+    s.workers = withRates(rows(o.workers), (w) => ({ live: n(w.hashrate_5m), hour: n(w.hashrate_1h), h6: n(w.hashrate_6h) }));
   } else if (pool === "F2Pool") {
     const d = o.originData;
     if (!d) return { missing: true };
@@ -244,7 +252,7 @@ export async function poolStats(env, body, ctx, ip = "?") {
             )
               return { missing: true };
             if (r.status !== 200) throw new Error("upstream");
-            const text = await readCapped(r, MAX_BODY);
+            const text = await readCapped(r, SOURCES[pool].maxBody || MAX_BODY);
             return html ? text : JSON.parse(text);
           }),
         );

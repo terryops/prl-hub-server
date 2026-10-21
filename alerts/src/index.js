@@ -14,10 +14,19 @@
 //   GET    /v1/pools                      public comparison and network yield
 //   POST   /v1/pool/stats, /v1/address    read-only pool / chain queries (body identifiers)
 //   POST   /v1/address/income             chain receipts excluding monitored self-transfers
+//   POST   /v1/tx                         one transaction by txid (status, fee, inputs/outputs);
+//                                         5 lookups per IP a minute, 60 Blockbook fetches a minute in all
+//   POST   /v1/tx/send                    broadcast a signed raw transaction { hex } through our own
+//                                         Blockbook (node.pearlhub.net) and the official one at once,
+//                                         or rebroadcast { txid } from an indexer's copy;
+//                                         5 per IP a minute, 60 a minute in all
 //   GET    /v1/me, /v1/orders/:id        anonymous web Pro / order status
 //   POST   /v1/orders                   exact-amount PRL checkout
-//   GET    /v1/web/status               public feature availability (no identity creation)
-//   PUT    /v1/web/push                 Pro browser subscription and alert settings
+//   GET    /v1/web/status               public feature availability (no identity creation;
+//                                       `vapid_key` for browsers, `fcm` for the Android app)
+//   PUT    /v1/web/push                 Pro push channel and alert settings: a browser's
+//                                       `subscription` (Web Push) or the Android app's
+//                                       `fcm: { token }` (FCM registration token; fcm.js)
 //   GET/PUT /v1/me/config               encrypted cross-device configuration
 //   POST   /v1/me/apple                  link a verified StoreKit Pro receipt
 //   GET    /v1/admin/payments           unmatched payments (ADMIN_TOKEN)
@@ -30,13 +39,15 @@
 //                                         watches + when each was last checked
 //   DELETE /v1/devices/:token             forget the device
 //   POST   /v1/devices/:token/test        send a test notification (1/min)
-//   PUT    /v1/live/:token                register a 锁屏盯盘 Live Activity push token
+//   PUT    /v1/live/:token                register a 锁屏盯盘 Live Activity push token, or (topic
+//                                         'android') an Android phone's FCM registration for its ticker
 //   DELETE /v1/live/:token                forget it (activity ended)
 //   POST   /v1/ingest/safetrade           SafeTrade ticker from the push script
 //                                         (bearer INGEST_TOKEN; see price.js)
 //   POST   /v1/asn/:secret                App Store Server Notifications V2 (refund / revoke)
 //
-// A device is identified only by its APNs token (which only that device knows).
+// A device is identified only by its APNs token (which only that device knows); a
+// browser or Android device by a hash of its Web Push endpoint or FCM token.
 // Price alerts send nothing about the user's wallet. 掉线提醒 is opt-in per
 // monitor and does send what the pool needs to be asked about it: the payout
 // address (F2Pool: the account's read-only page key) — never keys or balances.
@@ -54,18 +65,19 @@
 import { fetchQuotes, combine, parseSafeTrade, ST_MAX_AGE } from "./price.js";
 import { evaluate, sanitizeRule, upsertRule, pctChange, WINDOWS, sanitizeWindow, windowOpen, localHM } from "./rules.js";
 import { send, apnsConfigured } from "./apns.js";
-import { payloadFor, deferredPayloadFor, offlinePayloadFor, onlinePayloadFor, LANGS } from "./i18n.js";
+import { payloadFor, deferredPayloadFor, offlinePayloadFor, onlinePayloadFor, stillPayloadFor, LANGS } from "./i18n.js";
 import { fetchMiner, POOLS } from "./pools.js";
 import { fold, due as outages, tell, unpack, pack, sanitizeWatch, upsertWatch, POLL_EVERY, RECHECK } from "./watch.js";
 import { jwsPayload, notificationFields, PRO } from "./sales.js";
 import { verifyAppleJWS } from "./jws.js";
 import { poolStats } from "./poolstats.js";
 import { overview } from "./overview.js";
-import { address, priceHistory } from "./chain.js";
+import { address, priceHistory, tx, sendTx, SEND_MAX_BYTES } from "./chain.js";
 import { me } from "./groups.js";
 import { createOrder, getOrder, checkPayments, admin, paymentSettings } from "./orders.js";
 import { deliver, channelConfigured, accountPushAllowed } from "./push.js";
 import { configured as webpushConfigured, validateSubscription } from "./webpush.js";
+import { fcmConfigured, sendData as fcmSend, liveData } from "./fcm.js";
 import { sha256, json, now, cached } from "./http.js";
 import { pruneGroups, pruneEmptyGroups } from "./groupstore.js";
 import { logError } from "./log.js";
@@ -103,6 +115,7 @@ const SENT_KEEP = 7 * 86400;        // how long a tick's push outcomes stay read
 const LIVE_PUSH_FOR = 8 * 3600;     // iOS ends a Live Activity after 8 h…
 const LIVE_KEEP = 12 * 3600;        // …and removes it from the Lock Screen by 12 h
 const LIVE_HEARTBEAT = 10 * 60;     // re-push an unchanged price this often (stale date)
+const LIVE_ANDROID = "android";     // live.topic of an Android phone's ticker (FCM; putAndroidLive)
 const HISTORY_KEEP = 26 * 3600;
 const DEFERRED_KEEP = 48 * 3600;    // a queued alert older than this is dropped
 const DEVICE_KEEP = 90 * 86400;     // a device not seen for this long is forgotten
@@ -118,6 +131,8 @@ const MAX_DEVICE_BODY = 16384;
 const MAX_LIVE_BODY = 8192;
 const MAX_INGEST_BODY = 16384;
 const MAX_ASN_BODY = 65536;
+// A raw transaction as hex, inside { "hex": … }.
+const MAX_SEND_BODY = 2 * SEND_MAX_BYTES + 4096;
 
 const topicsOf = (env) => (env.APNS_TOPICS || "").split(",").map((s) => s.trim()).filter(Boolean);
 
@@ -186,7 +201,7 @@ async function tick(env) {
   const alerts = await pushAlerts(env, db, t, px.usd, change, dead);
   // Each stage stands alone: a failure in one must never stop the others.
   let delivered = 0;
-  if (apnsConfigured(env) || webpushConfigured(env)) {
+  if (apnsConfigured(env) || webpushConfigured(env) || fcmConfigured(env)) {
     try { delivered = await pushDeferred(env, db, t, px.usd, dead); }
     catch (e) { console.error("deferred", e && e.stack ? e.stack : String(e)); }
   }
@@ -338,17 +353,22 @@ async function pushDeferred(env, db, t, usd, dead) {
 /// heartbeat goes at low priority: nothing changed on screen, so it needn't
 /// spend the activity's high-priority update budget.
 async function pushLive(env, db, t, usd, change) {
-  if (!apnsConfigured(env)) return;
+  const apns = apnsConfigured(env), fcm = fcmConfigured(env);
+  if (!apns && !fcm) return;
   const { results } = await db
-    .prepare("SELECT token, env, topic, last_usd, last_push FROM live WHERE started_at > ?")
+    .prepare("SELECT token, env, topic, reg, last_usd, last_push FROM live WHERE started_at > ?")
     .bind(t - LIVE_PUSH_FOR)
     .all();
-  const due = results.filter((r) => r.last_usd !== usd || !r.last_push || t - r.last_push >= LIVE_HEARTBEAT);
+  // Android tickers (topic 'android') go over FCM, Live Activities over APNs; each only when configured.
+  const due = results.filter((r) => (r.topic === LIVE_ANDROID ? fcm : apns) &&
+    (r.last_usd !== usd || !r.last_push || t - r.last_push >= LIVE_HEARTBEAT));
   const state = { usd, change1h: change[3600], change24h: change[86400], at: t };
   const payload = { aps: { timestamp: t, event: "update", "content-state": state, "stale-date": t + 15 * 60 } };
+  const deliverLive = (r) => r.topic === LIVE_ANDROID
+    ? r.reg ? fcmSend(env, r.reg, liveData(state), { priority: r.last_usd === usd ? 5 : 10, ttl: 300 }) : { ok: false, drop: true, reason: "no registration" }
+    : send(env, db, { token: r.token, env: r.env, topic: r.topic }, payload, { pushType: "liveactivity", priority: r.last_usd === usd ? 5 : 10, ttl: 300 });
   const sent = await Promise.allSettled(due.map(async (r) =>
-    await accountPushAllowed(db, r.token) ? send(env, db, { token: r.token, env: r.env, topic: r.topic }, payload,
-         { pushType: "liveactivity", priority: r.last_usd === usd ? 5 : 10, ttl: 300 }) : { ok:false, drop:true, reason:"account device revoked" }));
+    await accountPushAllowed(db, r.token) ? deliverLive(r) : { ok:false, drop:true, reason:"account device revoked" }));
   const writes = [db.prepare("DELETE FROM live WHERE started_at < ?").bind(t - LIVE_KEEP)];
   sent.forEach((s, i) => {
     const r = due[i];
@@ -363,18 +383,23 @@ async function pushLive(env, db, t, usd, change) {
 
 /// Hourly, before the prune: 掉线提醒 is for people who do NOT open the app, so "not
 /// seen for 90 days" can't be what forgets them. A device with watches that hasn't
-/// checked in for IDLE_CHECK gets a silent push instead: if APNs takes it the token
-/// is alive and counts as seen; if APNs says the token is gone, so is the device.
+/// checked in for IDLE_CHECK gets a silent push instead: if APNs / FCM takes it the token
+/// is alive and counts as seen; if it says the token is gone, so is the device. On Android
+/// the push is a data message with neither title nor body, which the app drops unshown
+/// (prl-hub-android PushPayload.from).
 async function checkIdle(env, db, t) {
-  if (!apnsConfigured(env)) return;
+  const chans = [...(apnsConfigured(env) ? ["apns"] : []), ...(fcmConfigured(env) ? ["fcm"] : [])];
+  if (!chans.length) return;
   const { results } = await db
-    .prepare(`SELECT d.token, d.env, d.topic FROM devices d
-               WHERE d.chan = 'apns' AND COALESCE(d.seen_at, d.updated_at) < ? AND EXISTS (SELECT 1 FROM watches w WHERE w.token = d.token)
+    .prepare(`SELECT d.token, d.env, d.topic, d.chan, f.reg FROM devices d LEFT JOIN fcm f ON f.token = d.token
+               WHERE d.chan IN (SELECT value FROM json_each(?)) AND COALESCE(d.seen_at, d.updated_at) < ?
+                 AND EXISTS (SELECT 1 FROM watches w WHERE w.token = d.token)
                ORDER BY COALESCE(d.seen_at, d.updated_at) LIMIT ?`)
-    .bind(t - IDLE_CHECK, IDLE_CHECKS)
+    .bind(JSON.stringify(chans), t - IDLE_CHECK, IDLE_CHECKS)
     .all();
-  const sent = await Promise.allSettled(results.map((d) =>
-    send(env, db, d, { aps: { "content-available": 1 } }, { pushType: "background", priority: 5, ttl: 60 })));
+  const sent = await Promise.allSettled(results.map((d) => d.chan === "fcm"
+    ? d.reg ? fcmSend(env, d.reg, { kind: "ping" }, { priority: 5, ttl: 60 }) : { ok: false, drop: true, reason: "subscription gone" }
+    : send(env, db, d, { aps: { "content-available": 1 } }, { pushType: "background", priority: 5, ttl: 60 })));
   const writes = [];
   sent.forEach((r, i) => {
     const out = r.status === "fulfilled" ? r.value : { ok: false, retry: true };
@@ -394,6 +419,7 @@ async function prune(db, t) {
     db.prepare(`DELETE FROM deferred WHERE token IN (${gone})`).bind(t - DEVICE_KEEP),
     db.prepare(`DELETE FROM watches WHERE token IN (${gone})`).bind(t - DEVICE_KEEP),
     db.prepare(`DELETE FROM webpush WHERE token IN (${gone})`).bind(t - DEVICE_KEEP),
+    db.prepare(`DELETE FROM fcm WHERE token IN (${gone})`).bind(t - DEVICE_KEEP),
     db.prepare("DELETE FROM devices WHERE COALESCE(seen_at, updated_at) < ?").bind(t - DEVICE_KEEP),
     db.prepare("DELETE FROM kv WHERE k LIKE 'test:%' AND ts < ?").bind(t - 3600),
     db.prepare("DELETE FROM kv WHERE k LIKE 'rest:%' AND ts < ?").bind(t),
@@ -404,6 +430,7 @@ async function prune(db, t) {
 
 const forget = (db, token) => [
   db.prepare("DELETE FROM webpush WHERE token = ?").bind(token),
+  db.prepare("DELETE FROM fcm WHERE token = ?").bind(token),
   db.prepare("DELETE FROM rules WHERE token = ?").bind(token),
   db.prepare("DELETE FROM devices WHERE token = ?").bind(token),
   db.prepare("DELETE FROM deferred WHERE token = ?").bind(token),
@@ -428,6 +455,35 @@ const pushActive = (session) => session?.client === "purchase" ? `EXISTS(SELECT 
     JOIN account_devices a ON a.user_id=s.user_id AND a.id=s.device_id WHERE s.id=?
     AND s.revoked_at IS NULL AND u.deleted_at IS NULL AND a.revoked_at IS NULL)` : ""}` : PUSH_ACTIVE;
 const pushActiveArgs = (session, token) => [session.id, token, ...(session.client === "purchase" && session.sync_account ? [session.sync_account.id] : [])];
+
+/// 锁屏盯盘 on Android (prl-hub-android LiveTicker.kt; web/src/android-live.ts in prl-hub-web). The path
+/// token is the one /v1/web/push files the phone's FCM registration under, hex sha256("fcm:" + reg), so
+/// the same claims and revocations cover it; the registration itself rides in the body and is kept on
+/// the row (live.reg). The phone always registers signed in: with its account, or in the website APK
+/// with the purchase credential its PRL-bought Pro belongs to — the session /v1/web/push uses too, so
+/// the two registrations of one phone share their claim. Unlike an iOS push token (one per Live Activity,
+/// hence MIN below in putLive), this token is the phone's: each registration carries the start of the
+/// ticker running now (LiveTicker startedAt), so a ticker started again later gets its own 8 hours.
+async function putAndroidLive(env, token, body, session) {
+  if (!fcmConfigured(env)) return json({ error: "push_off" }, 503);
+  const reg = body.fcm?.token;
+  if (typeof reg !== "string" || !FCM_TOKEN_RE.test(reg) || await sha256(`fcm:${reg}`) !== token) return json({ error: "bad subscription" }, 400);
+  if (!session) return json({ error: "unauthorized" }, 401);
+  const db = env.DB, t = now();
+  const purchase = session.client === "purchase";
+  if (purchase ? !await refreshPurchase(env, session) : !await registrationPro(env, null, session)) return json({ error: "not pro" }, 403);
+  if (!(purchase ? await claimPurchasePush(env, session, token, session.sync_account || null) : await claimPush(env, session, token, "live"))) return json({ error: "device_conflict" }, 409);
+  const started = Number.isFinite(body.started_at) && body.started_at > t - LIVE_KEEP && body.started_at <= t + 300
+    ? Math.floor(body.started_at) : t;
+  const written = await db.prepare(
+    `INSERT INTO live (token, env, topic, started_at, account_pro, reg) SELECT ?, 'production', ?, ?, ?, ?
+     WHERE ${pushActive(session)}${purchase ? "" : " AND EXISTS(SELECT 1 FROM groups g JOIN sessions s ON s.user_id=g.gid WHERE s.id=? AND g.pro_at IS NOT NULL)"}
+     ON CONFLICT(token) DO UPDATE SET env = excluded.env, topic = excluded.topic, reg = excluded.reg,
+                                      started_at = excluded.started_at, account_pro = excluded.account_pro`
+  ).bind(token, LIVE_ANDROID, started, purchase ? 0 : 1, reg, ...pushActiveArgs(session, token), ...(purchase ? [] : [session.id])).run();
+  if (!written.meta.changes) return json({ error: "unauthorized" }, 401);
+  return json({ ok: true });
+}
 
 async function putLive(env, token, body, session = null) {
   if (session?.client === "purchase") return json({ error: "not pro" }, 403);
@@ -508,8 +564,9 @@ async function registrationPro(env, jws, session) {
 
 /// Poll the miners that are due, fold each pool's answer into the miner's state
 /// (watch.js), then tell every subscription the outages that have now lasted its
-/// threshold — one push per monitor, naming the workers — and, in a push of their
-/// own, the workers it was told about that are back and have stayed online. A miner
+/// threshold — one push per monitor, naming the workers — and, in pushes of their
+/// own, the workers it was told about that are back and have stayed online, and
+/// (where the user asked for a reminder) the ones that are still offline. A miner
 /// with a worker just back is polled again in a minute rather than in 3, to see
 /// whether it stays.
 ///
@@ -584,7 +641,7 @@ async function pollWatches(env) {
   // Every subscription of a miner that answered just now.
   const { results: subs } = await db
     .prepare(
-      `SELECT w.token, w.id, w.pool, w.addr, w.label, w.after, w.told, w.base, m.workers,
+      `SELECT w.token, w.id, w.pool, w.addr, w.label, w.after, w.again, w.again_at, w.told, w.base, m.workers,
               d.chan, d.env, d.topic, d.lang, d.win_start, d.win_end, d.tz, d.retry_after, d.verified_at
          FROM watches w JOIN miners m ON m.pool = w.pool AND m.addr = w.addr
                         JOIN devices d ON d.token = w.token
@@ -610,12 +667,14 @@ async function pollWatches(env) {
   };
   const oldestFirst = (a, b) => a.since - b.since || (a.name < b.name ? -1 : 1);
   for (const s of subs) {
-    const res = outages(unpack(s.workers), unpack(s.told), s.after, t, !s.base);
+    const res = outages(unpack(s.workers), unpack(s.told), s.after, t, !s.base, s.again, s.again_at);
     if (res.wait) soon.set(`${s.pool}\n${s.addr}`, s);
+    // A reminder comes last: what is news goes first when a device is at its share.
     const down = res.push.length && admit(s) ? res.push.sort(oldestFirst) : [];
     const back = res.back.length && admit(s) ? res.back.sort(oldestFirst) : [];
-    const claimed = pack(tell(res.told, down, back, t));
-    if (claimed !== s.told || !s.base) jobs.push({ s, told: res.told, down, back, claimed });
+    const still = res.still.length && admit(s) ? res.still.sort(oldestFirst) : [];
+    const claimed = pack(tell(res.told, down, back, t, still));
+    if (claimed !== s.told || !s.base) jobs.push({ s, told: res.told, down, back, still, claimed });
   }
   // The claim matches the row exactly as read: it loses to a PUT that re-pointed
   // the watch and to another tick that already told it.
@@ -629,12 +688,14 @@ async function pollWatches(env) {
   }
   const res = [];
   for (let i = 0; i < claims.length; i += BATCH) res.push(...await db.batch(claims.slice(i, i + BATCH)));
-  const wanted = jobs.filter((j) => j.down.length + j.back.length);
+  const wanted = jobs.filter((j) => j.down.length + j.back.length + j.still.length);
   const mine = wanted.filter((j) => changed(res[jobs.indexOf(j)]));
-  // One push per monitor for what went down, another for what came back.
+  // One push per monitor for what went down, another for what came back, a third for
+  // what is still down.
   const mail = mine.flatMap((job) => [
     job.down.length ? { job, n: job.down.length, payload: offlinePayloadFor(job.s.lang, job.s, job.down, t) } : null,
     job.back.length ? { job, n: job.back.length, back: true, payload: onlinePayloadFor(job.s.lang, job.s, job.back) } : null,
+    job.still.length ? { job, n: job.still.length, still: true, payload: stillPayloadFor(job.s.lang, job.s, job.still, t) } : null,
   ].filter(Boolean));
 
   const sent = await Promise.allSettled(mail.map(({ job: { s }, payload }) =>
@@ -647,11 +708,11 @@ async function pollWatches(env) {
   const outcomes = [];
   let pushed = 0;
   sent.forEach((r, i) => {
-    const { job, n, back } = mail[i];
+    const { job, n, back, still } = mail[i];
     const { s } = job;
     const out = r.status === "fulfilled" ? r.value : { ok: false, retry: true, reason: String(r.reason) };
     outcomes.push({
-      tok: s.token.slice(0, 8), watch: s.id.slice(0, 8), n, ...(back ? { back: true } : {}),
+      tok: s.token.slice(0, 8), watch: s.id.slice(0, 8), n, ...(back ? { back: true } : {}), ...(still ? { still: true } : {}),
       ...(out.ok ? { ok: true, env: out.env }
                  : { ok: false, status: out.status ?? null, reason: out.reason ?? null,
                      verdict: out.drop ? "drop" : out.retry ? "retry" : "refused" }),
@@ -665,7 +726,7 @@ async function pollWatches(env) {
       dead.add(s.token);
     } else if (out.retry) {
       // Not delivered: this push's part of the claim is taken back below, for the next poll.
-      (job.undone ||= {})[back ? "back" : "down"] = true;
+      (job.undone ||= {})[back ? "back" : still ? "still" : "down"] = true;
       if (out.backoff) after.push(db.prepare("UPDATE devices SET retry_after = ? WHERE token = ?").bind(t + out.backoff, s.token));
       console.log("watch apns retry", s.token.slice(0, 8), out.status, out.reason);
     } else {
@@ -673,10 +734,10 @@ async function pollWatches(env) {
     }
   });
   // …if the claim is still ours: `told` as it stands with only what did go out.
-  for (const { s, told, down, back, claimed, undone } of mine) {
+  for (const { s, told, down, back, still, claimed, undone } of mine) {
     if (!undone) continue;
     after.push(db.prepare("UPDATE watches SET told = ? WHERE token = ? AND id = ? AND told = ?")
-      .bind(pack(tell(told, undone.down ? [] : down, undone.back ? [] : back, t)), s.token, s.id, claimed));
+      .bind(pack(tell(told, undone.down ? [] : down, undone.back ? [] : back, t, undone.still ? [] : still)), s.token, s.id, claimed));
   }
   for (const token of dead) after.push(...forget(db, token));
   // Claimed here but not ours to send: another tick's claim got there first.
@@ -866,7 +927,7 @@ async function putDevice(env, token, body, ip, web = null, session = null) {
                                          account_pro = excluded.account_pro,
                                          verified_at = COALESCE(devices.verified_at, excluded.verified_at)`
     ).bind(token, apnsEnv, topic, lang, oneshot, w ? w.start : null, w ? w.end : null, w ? w.tz : null, t,
-           pro.otid ?? null, verified, t, web ? "webpush" : "apns", web?.gid ?? null, pro.account ? 1 : 0, ...guardArgs),
+           pro.otid ?? null, verified, t, web ? web.chan : "apns", web?.gid ?? null, pro.account ? 1 : 0, ...guardArgs),
     db.prepare(`DELETE FROM rules WHERE token = ?${notIn(ids)} AND ${active}`).bind(token, ...ids, ...guardArgs),
     ...rules.map((r) => db.prepare(upsertRule(active)).bind(token, r.id, r.kind, r.value, r.window, r.enabled, oneshot, r.seen_fired, r.repeating, ...guardArgs)),
     // A queued alert survives only while its rule is still there, unchanged.
@@ -878,7 +939,7 @@ async function putDevice(env, token, body, ip, web = null, session = null) {
     const wids = watches.map((x) => x.id);
     stmts.push(
       db.prepare(`DELETE FROM watches WHERE token = ?${notIn(wids)} AND ${active}`).bind(token, ...wids, ...guardArgs),
-      ...watches.map((x) => db.prepare(upsertWatch(active)).bind(token, x.id, x.pool, x.addr, x.label, x.after, ...guardArgs)),
+      ...watches.map((x) => db.prepare(upsertWatch(active)).bind(token, x.id, x.pool, x.addr, x.label, x.after, x.again, t, ...guardArgs)),
       // A miner someone newly watches is due at once (tried_at NULL)…
       ...watches.map((x) => db.prepare(`INSERT OR IGNORE INTO miners (pool, addr) SELECT ?, ? WHERE ${active}`).bind(x.pool, x.addr, ...guardArgs)),
       // …and one this PUT stopped watching is no longer polled: a device can keep at
@@ -892,34 +953,50 @@ async function putDevice(env, token, body, ip, web = null, session = null) {
   return getDevice(env, token);
 }
 
-/// Subscription storage claims the device slot atomically, before sharing APNs settings writes.
+const FCM_TOKEN_RE = /^[A-Za-z0-9_:-]{32,4096}$/;
+
+/// The Android app's FCM registration token, alone (never with a browser subscription).
+const fcmRegistration = (body) => {
+  const reg = body.fcm?.token;
+  return body.subscription == null && typeof reg === "string" && FCM_TOKEN_RE.test(reg) ? { reg } : null;
+};
+
+/// A browser's Web Push `subscription`, or (`fcm: { token }`) the Android app's FCM
+/// registration — one push channel, same rules either way. Subscription storage
+/// claims the device slot atomically, before sharing APNs settings writes.
 async function putWebPush(env, gid, body, ip, session, account = null) {
   const db = env.DB, t = now();
   const g = await db.prepare("SELECT pro_at FROM groups WHERE gid = ?").bind(gid).first();
   if (g?.pro_at == null) return json({ error: "not_pro" }, 403);
-  if (!webpushConfigured(env)) return json({ error: "push_off" }, 503);
+  const chan = body?.fcm != null ? "fcm" : "webpush";
+  if (!(chan === "fcm" ? fcmConfigured(env) : webpushConfigured(env))) return json({ error: "push_off" }, 503);
   if (!body || typeof body !== "object") return json({ error: "bad body" }, 400);
   const settings = sanitizeSettings(body);
   if (settings.bad) return settings.bad;
-  const sub = await validateSubscription(body.subscription);
+  const sub = chan === "fcm" ? fcmRegistration(body) : await validateSubscription(body.subscription);
   if (!sub) return json({ error: "bad subscription" }, 400);
-  const token = await sha256(sub.endpoint);
+  const token = await sha256(chan === "fcm" ? `fcm:${sub.reg}` : sub.endpoint);
+  const topic = chan === "fcm" ? "android" : "web";
   if (!session || !(session.client === "purchase" ? await claimPurchasePush(env,session,token,account) : await claimPush(env,session,token))) return json({ error: "device_conflict" }, 409);
   const old = await db.prepare("SELECT gid, chan FROM devices WHERE token = ?").bind(token).first();
-  if (old && (old.gid !== gid || old.chan !== "webpush")) return json({ error: "device conflict" }, 409);
+  if (old && (old.gid !== gid || old.chan !== chan)) return json({ error: "device conflict" }, 409);
   const scope = account?.user_id || gid;
   const slot = await db.prepare(`INSERT INTO devices (token, env, topic, updated_at, chan, gid, verified_at, seen_at, sync_gid, sync_device_id)
-    SELECT ?, 'production', 'web', ?, 'webpush', ?, ?, ?, ?, ? WHERE
+    SELECT ?, 'production', ?, ?, ?, ?, ?, ?, ?, ? WHERE
       ((SELECT COUNT(*) FROM account_push_claims p LEFT JOIN devices d ON d.token=p.token
         WHERE COALESCE(d.sync_gid,p.user_id)=? AND p.token<>? AND p.kind='notification' AND p.revoked_at IS NULL) < 10 OR
-       EXISTS (SELECT 1 FROM devices WHERE token = ? AND COALESCE(sync_gid,gid) = ? AND chan = 'webpush')) AND ${pushActive(session)}
+       EXISTS (SELECT 1 FROM devices WHERE token = ? AND COALESCE(sync_gid,gid) = ? AND chan = ?)) AND ${pushActive(session)}
     ON CONFLICT(token) DO UPDATE SET seen_at = excluded.seen_at, sync_gid=excluded.sync_gid, sync_device_id=excluded.sync_device_id WHERE devices.gid = excluded.gid
-    RETURNING token`).bind(token, t, gid, t, t, account?.user_id||null, account?.device_id||null, scope, token, token, scope, ...pushActiveArgs(session, token)).first();
+    RETURNING token`).bind(token, topic, t, chan, gid, t, t, account?.user_id||null, account?.device_id||null, scope, token, token, scope, chan, ...pushActiveArgs(session, token)).first();
   if (!slot) return json({ error: "too_many_devices" }, 409);
-  await db.prepare(`INSERT INTO webpush (token, endpoint, p256dh, auth) SELECT ?, ?, ?, ? WHERE ${pushActive(session)}
-    ON CONFLICT(token) DO UPDATE SET endpoint = excluded.endpoint, p256dh = excluded.p256dh, auth = excluded.auth`)
-    .bind(token, sub.endpoint, sub.p256dh, sub.auth, ...pushActiveArgs(session, token)).run();
-  const r = await putDevice(env, token, { ...body, topic: "web", env: "production", oneshot: true }, ip, { gid }, session);
+  await (chan === "fcm"
+    ? db.prepare(`INSERT INTO fcm (token, reg) SELECT ?, ? WHERE ${pushActive(session)}
+        ON CONFLICT(token) DO UPDATE SET reg = excluded.reg`)
+      .bind(token, sub.reg, ...pushActiveArgs(session, token))
+    : db.prepare(`INSERT INTO webpush (token, endpoint, p256dh, auth) SELECT ?, ?, ?, ? WHERE ${pushActive(session)}
+        ON CONFLICT(token) DO UPDATE SET endpoint = excluded.endpoint, p256dh = excluded.p256dh, auth = excluded.auth`)
+      .bind(token, sub.endpoint, sub.p256dh, sub.auth, ...pushActiveArgs(session, token))).run();
+  const r = await putDevice(env, token, { ...body, topic, env: "production", oneshot: true }, ip, { gid, chan }, session);
   if (r.ok) await db.prepare(`UPDATE devices SET sync_gid=?,sync_device_id=? WHERE token=? AND ${pushActive(session)}`)
     .bind(account?.user_id||null,account?.device_id||null,token,...pushActiveArgs(session, token)).run();
   const result = await r.json();
@@ -993,7 +1070,7 @@ async function testPush(env, token) {
   const db = env.DB;
   const d = await db.prepare("SELECT token, chan, env, topic, lang FROM devices WHERE token = ?").bind(token).first();
   if (!d) return json({ error: "unknown device" }, 404);
-  if (!channelConfigured(env, d)) return json({ error: d.chan === "webpush" ? "webpush not configured" : "apns not configured" }, 503);
+  if (!channelConfigured(env, d)) return json({ error: `${["webpush", "fcm"].includes(d.chan) ? d.chan : "apns"} not configured` }, 503);
   const t = now();
   const last = await db.prepare("SELECT ts FROM kv WHERE k = ?").bind(`test:${token}`).first();
   if (last && t - last.ts < 60) return json({ error: "too many" }, 429);
@@ -1001,7 +1078,7 @@ async function testPush(env, token) {
   const p = await lastPrice(db);
   const res = await deliver(env, db, d, payloadFor(d.lang, null, p ? p.usd : 0));
   if (res.ok && res.env !== d.env) await db.prepare("UPDATE devices SET env = ? WHERE token = ?").bind(res.env, token).run();
-  if (res.drop && d.chan === "webpush") await db.batch(forget(db, token));
+  if (res.drop && (d.chan === "webpush" || d.chan === "fcm")) await db.batch(forget(db, token));
   return json(res, res.ok ? 200 : 502);
 }
 
@@ -1024,15 +1101,29 @@ async function getPrice(env, req, ctx) {
   });
 }
 
+// The first domain. Its pages moved to pearlhub.net (2026-10-20); its /v1 API stays, because apps
+// before 2.0 and the App Store Server Notifications URL still call it.
+const OLD_HOST = "prl.tools.video";
+
+/// A page on the old domain: the same path and query on pearlhub.net (the browser keeps the #hash).
+/// An hour's cache, so the move can still be undone.
+function movedPage(url) {
+  return new Response(null, { status: 301, headers: { location: "https://pearlhub.net" + url.pathname + url.search, "cache-control": "public, max-age=3600" } });
+}
+
 async function route(req, env, ctx) {
   const url = new URL(req.url);
   const parts = url.pathname.split("/").filter(Boolean);
-  if (parts[0] !== "v1") return env.ASSETS ? env.ASSETS.fetch(req) : json({ error: "not found" }, 404);
+  if (parts[0] !== "v1") {
+    // wrangler.toml's run_worker_first sends "/" and "*.html" here so the old domain's pages can move.
+    if (url.hostname === OLD_HOST) return movedPage(url);
+    return env.ASSETS ? env.ASSETS.fetch(req) : json({ error: "not found" }, 404);
+  }
   const ip = req.headers.get("cf-connecting-ip") || "?";
 
   const path = url.pathname;
   if (path === "/v1/web/status" && req.method === "GET") return Response.json({ pay: paymentSettings(env), vapid_key: webpushConfigured(env) ? env.VAPID_PUBLIC : null,
-    auth: { enabled: accountsEnabled(env), site_key: env.TURNSTILE_SITE_KEY || null } }, { headers: { "cache-control": "no-store" } });
+    fcm: fcmConfigured(env), auth: { enabled: accountsEnabled(env), site_key: env.TURNSTILE_SITE_KEY || null } }, { headers: { "cache-control": "no-store" } });
   if (path === "/v1/gpus" && req.method === "GET") return json(gpuCatalog, 200, { "cache-control": "public, max-age=3600" });
   const authReply = await authRoutes(req, env);
   if (authReply) return authReply;
@@ -1040,15 +1131,20 @@ async function route(req, env, ctx) {
   if (purchaseReply) return purchaseReply;
   const accountReply = await accountRoutes(req, env);
   if (accountReply) return accountReply;
-  if ((["/v1/price/history", "/v1/pools", "/v1/pool-fees", "/v1/fx", "/v1/network/history"].includes(path) && req.method === "GET") || (["/v1/pool/stats", "/v1/address", "/v1/address/income"].includes(path) && req.method === "POST")) {
+  if (path === "/v1/tx/send" && req.method === "POST") {
     if (env.RL_READ && !(await env.RL_READ.limit({ key: ip })).success) return json({ ok: false, error: "rate limited" }, 429);
-    if (path === "/v1/fx") return fx(env);
-    if (path === "/v1/price/history") return url.searchParams.has("span") ? longPriceHistory(env, url.searchParams.get("span")) : priceHistory(env, ctx);
-    if (path === "/v1/network/history") return networkHistory(env, url.searchParams.get("span") || "7d");
+    const [body, bad] = await readJSON(req, MAX_SEND_BODY);
+    return bad || sendTx(env, body, ip);
+  }
+  if ((["/v1/price/history", "/v1/pools", "/v1/pool-fees", "/v1/fx", "/v1/network/history"].includes(path) && req.method === "GET") || (["/v1/pool/stats", "/v1/address", "/v1/address/income", "/v1/tx"].includes(path) && req.method === "POST")) {
+    if (env.RL_READ && !(await env.RL_READ.limit({ key: ip })).success) return json({ ok: false, error: "rate limited" }, 429);
+    if (path === "/v1/fx") return fx(env, ctx);
+    if (path === "/v1/price/history") return url.searchParams.has("span") ? longPriceHistory(env, url.searchParams.get("span"), ctx) : priceHistory(env, ctx);
+    if (path === "/v1/network/history") return networkHistory(env, url.searchParams.get("span") || "7d", ctx);
     if (path === "/v1/pools") return overview(env, ctx);
     if (path === "/v1/pool-fees") return realFees(env);
     const [body, bad] = await readJSON(req, MAX_DEVICE_BODY);
-    return bad || (path === "/v1/address/income" ? income(env, body, ctx) : path === "/v1/address" ? address(env, body, ctx) : poolStats(env, body, ctx, ip));
+    return bad || (path === "/v1/address/income" ? income(env, body, ctx) : path === "/v1/address" ? address(env, body, ctx) : path === "/v1/tx" ? tx(env, body, ctx, ip) : poolStats(env, body, ctx, ip));
   }
   if (parts[1] === "admin") {
     if (!env.ADMIN_TOKEN || !(await bearerOK(req, env.ADMIN_TOKEN))) return json({ error: "not found" }, 404);
@@ -1113,6 +1209,12 @@ async function route(req, env, ctx) {
     if (req.method === "PUT") {
       const [body, bad] = await readJSON(req, MAX_LIVE_BODY);
       if (bad) return bad;
+      if (body?.topic === LIVE_ANDROID) {
+        // As /v1/web/push: a local purchase credential, if any, owns the phone's push channel.
+        const contexts = await buyerContexts(req, env);
+        if (contexts.purchase && contexts.account) await associatePurchase(env, contexts.account, contexts.purchase);
+        return putAndroidLive(env, token, body, contexts.purchase ? { ...contexts.purchase, sync_account: contexts.account } : contexts.account);
+      }
       const session = owner.session || await authenticate(req, env);
       return putLive(env, token, body, session);
     }
@@ -1134,7 +1236,8 @@ async function route(req, env, ctx) {
     if (parts.length === 3) {
       if (req.method === "PUT") {
         const [body, bad] = await readJSON(req, MAX_DEVICE_BODY);
-        if ((await env.DB.prepare("SELECT chan FROM devices WHERE token = ?").bind(token).first())?.chan === "webpush") return json({ error: "web device" }, 409);
+        const chan = (await env.DB.prepare("SELECT chan FROM devices WHERE token = ?").bind(token).first())?.chan;
+        if (chan === "webpush" || chan === "fcm") return json({ error: "web device" }, 409);
         if (bad) return bad;
         const session = owner.session || await authenticate(req, env);
         const reply = await putDevice(env, token, body, ip, null, session);
@@ -1175,7 +1278,13 @@ export default {
       try { await refreshRealFees(env); } catch { console.error("real-fee refresh unavailable"); }
       // Public PPLNS windows grow continuously even when no client opens the pool page.
       if (Math.floor(now() / 60) % 5 === 0) {
-        try { await overview(env, { waitUntil(p) { p.catch(() => {}); } }); }
+        // Work the overview hands to waitUntil (the luck bookkeeping) is awaited here: a cron run
+        // ends with its handler.
+        try {
+          const pending = [];
+          await overview(env, { waitUntil(p) { pending.push(Promise.resolve(p).catch(() => {})); } });
+          await Promise.all(pending);
+        }
         catch { console.warn("public PPLNS overview unavailable"); }
       }
       // Web housekeeping also runs when every price source is down.

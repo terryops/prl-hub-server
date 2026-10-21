@@ -3,19 +3,23 @@
 import { readCapped, MAX_BODY, UA, SOURCES, sanitizeTarget } from "./pools.js";
 import { reserveBudget } from "./poolstats.js";
 import { now, webJson as json } from "./http.js";
-import { validPPLNSMeasurement } from "./pplns.js";
+import { validPPLNSMeasurement, costEstimated } from "./pplns.js";
 
 const DAY = 86400, DAYS = 5, WORK = 2 ** 48, EMISSION = 650226n;
 const POOLS = { "Pearl Fortune": "PPS", Kryptex: "PPS+", F2Pool: "PPS" };
 const key = (pool) => `public:realfees:${pool}`;
 const number = (v) => (typeof v === "number" || typeof v === "string") && v !== "" && Number.isFinite(Number(v)) ? Number(v) : null;
 const unwrap = (v) => v?.data || v;
+// A window ends at the latest 00:00 UTC, or the one before while pools still settle
+// yesterday. Anything older is history: never served, never searched for.
+const oldestEnd = (t) => Math.floor(t / DAY) * DAY - DAY;
+const current = (end, t) => end <= t && end >= oldestEnd(t);
 
 export function validMeasurement(o, t = now()) {
   return !!o && POOLS[o.pool] === o.scheme && o.theoryBasis === "hashrate_chain" &&
     Number.isFinite(o.netPRL) && o.netPRL >= 0 && Number.isFinite(o.expectedPRL) && o.expectedPRL > 0 &&
     Number.isSafeInteger(o.start) && o.start > 0 && Number.isSafeInteger(o.end) &&
-    o.end - o.start === DAYS * DAY && o.start % DAY === 0 && o.end <= t && o.end > t - 31 * DAY &&
+    o.end - o.start === DAYS * DAY && o.start % DAY === 0 && current(o.end, t) &&
     Number.isFinite(o.measuredAt) && o.measuredAt >= o.end && o.measuredAt <= t + 60 &&
     o.sampleCount === DAYS && typeof o.estimated === "boolean";
 }
@@ -35,9 +39,10 @@ export async function realFees(env) {
 }
 
 function pplnsEstimate(row, payout, measurements) {
-  if (row.solo || payout.solo || payout.scheme?.trim().toUpperCase() !== "PPLNS") return null;
+  if (!costEstimated(row, payout)) return null;
   const sample = measurements.find((o) => o.id === row.id && o.pool === row.name && validPPLNSMeasurement(o));
-  return sample ? { percent: (1 - sample.netPRL / sample.expectedPRL) * 100, start: sample.start, end: sample.end } : null;
+  // Luck taken out: the fee and the work the pool loses (see pplnsMeasurement).
+  return sample ? { percent: (1 - sample.ratio) * 100, start: sample.start, end: sample.end } : null;
 }
 
 export function attachRealFees(snapshot, measurements, pplnsMeasurements = []) {
@@ -73,6 +78,7 @@ export function chainRate(points, t) {
 export function expectedEarnings(points, interval) {
   const { start, end, hashrate } = interval;
   if (!Number.isFinite(hashrate) || hashrate < 0 || end <= start) throw new Error("hashrate_data");
+  if (hashrate === 0) return 0;
   const steps = Math.ceil((end - start) / 300), dt = (end - start) / steps;
   let total = 0;
   for (let i = 0; i < steps; i++) total += chainRate(points, start + (i + .5) * dt) * hashrate * dt;
@@ -114,22 +120,30 @@ export function fortuneDays(raw, t = now()) {
 export function kryptexDays(chart, rewards, t = now()) {
   if (!Array.isArray(chart) || !Array.isArray(rewards)) throw new Error("source_data");
   return rewards.flatMap((r) => {
-    const start = number(r.timestamp) / 1000, net = number(r.reward_transferred);
-    if (!Number.isSafeInteger(start) || start % DAY || start + DAY > t || number(r.reward) !== 0 || net == null || net < 0) return [];
+    const start = number(r.timestamp) / 1000;
+    if (!Number.isSafeInteger(start) || start % DAY || start + DAY > t || number(r.reward) !== 0) return [];
     const samples = chart.filter((p) => start < p.timestamp / 1000 && p.timestamp / 1000 <= start + DAY).sort((a, b) => a.timestamp - b.timestamp);
     if (samples.length !== 144 || samples.some((p, i) => p.timestamp / 1000 !== start + (i + 1) * 600 || number(p.hashrate) == null || number(p.hashrate) < 0)) return [];
+    // An idle day has no transfer at all; a day with work and no transfer is unsettled.
+    const net = number(r.reward_transferred) ?? (samples.every((p) => number(p.hashrate) === 0) ? 0 : null);
+    if (net == null || net < 0) return [];
     return [{ start, end: start + DAY, net, intervals: samples.map((p) => ({ start: p.timestamp / 1000 - 600, end: p.timestamp / 1000, hashrate: number(p.hashrate) })) }];
   });
 }
 
 export function f2poolDays(income, chart, t = now()) {
   const rates = new Map((chart?.data?.hashrate_history?.values || []).map((p) => [p[0] / 1000, number(p[1])]));
-  return (income?.data?.income_data || []).flatMap((r) => {
+  const paid = (income?.data?.income_data || []).flatMap((r) => {
     const end = number(r.created_at), start = end - DAY, net = number(r.amount), rate = rates.get(start);
     if (r.type !== "revenue" || !String(r.comment || "").includes("PPS") || !Number.isSafeInteger(end) || end % DAY || end > t ||
         net == null || net < 0 || !(rate >= 100)) return []; // Discard tiny residual days, as in the audit.
     return [{ start, end, net, intervals: [{ start, end, hashrate: rate * 1e12 }] }];
   });
+  // Below that residual threshold a finished day is idle: complete, nothing earned or expected.
+  const idle = [...rates].flatMap(([start, rate]) =>
+    Number.isSafeInteger(start) && start % DAY === 0 && start + DAY <= t && rate != null && rate >= 0 && rate < 100
+      ? [{ start, end: start + DAY, net: 0, intervals: [{ start, end: start + DAY, hashrate: 0 }] }] : []);
+  return [...paid, ...idle];
 }
 
 export function calculateMeasurement(pool, cohorts, points, t = now()) {
@@ -137,21 +151,25 @@ export function calculateMeasurement(pool, cohorts, points, t = now()) {
   const computed = cohorts.map((days) => new Map(days.flatMap((d) => {
     try {
       const expected = d.intervals.reduce((sum, interval) => sum + expectedEarnings(points, interval), 0);
-      return expected > 0 && Number.isFinite(d.net) && d.net >= 0 ? [[d.start, { ...d, expected }]] : [];
+      // An idle day (no work, no pay) is complete and adds nothing to either side, so the
+      // latest five days still measure whatever was mined in them.
+      return Number.isFinite(d.net) && d.net >= 0 && (expected > 0 || expected === 0 && d.net === 0) ? [[d.start, { ...d, expected }]] : [];
     } catch { return []; }
   })));
   const starts = [...computed[0].keys()].sort((a, b) => b - a);
   for (const last of starts) {
     const start = last - (DAYS - 1) * DAY, end = last + DAY;
-    if (end > t || end <= t - 31 * DAY) continue;
-    let netPRL = 0, expectedPRL = 0, valid = true;
-    for (let day = start; day < end; day += DAY) for (const cohort of computed) {
-      const value = cohort.get(day);
-      if (!value) { valid = false; break; }
-      netPRL += value.net; expectedPRL += value.expected;
+    if (!current(end, t)) continue;
+    let netPRL = 0, expectedPRL = 0, activeDays = 0, valid = true;
+    for (let day = start; valid && day < end; day += DAY) {
+      const values = computed.map((cohort) => cohort.get(day));
+      if (values.some((v) => !v)) { valid = false; break; }
+      for (const v of values) { netPRL += v.net; expectedPRL += v.expected; }
+      if (values.some((v) => v.expected > 0)) activeDays++;
     }
+    // Five idle days leave expectedPRL at 0, which validMeasurement rejects.
     const result = { pool, scheme: POOLS[pool], netPRL, expectedPRL, start, end,
-      measuredAt: t, estimated: true, sampleCount: DAYS, theoryBasis: "hashrate_chain" };
+      measuredAt: t, estimated: true, sampleCount: DAYS, activeDays, theoryBasis: "hashrate_chain" };
     if (valid && validMeasurement(result, t)) return result;
   }
   throw new Error("no_complete_window");
@@ -191,8 +209,29 @@ async function collect(env, { pool, target }, t) {
   return f2poolDays(income, chart, t);
 }
 
+// Public lists of active miners, for when the configured samples have not mined all of the
+// latest five days. Pearl Fortune masks block finders, but its latest block's share snapshot
+// names every contributor in full, largest first here; a PPLNS miner there has no PPS income,
+// so its days never validate. Kryptex labels each block's scheme. F2Pool has no public
+// per-account data.
+const DISCOVER = {
+  "Pearl Fortune": async (env) => {
+    const base = "https://pearlfortune.org/api/v1/blocks";
+    const hash = (await getJSON(env, "Pearl Fortune", `${base}?page=1&page_size=1`))?.data?.blocks?.[0]?.block_hash;
+    if (!/^[0-9a-f]{64}$/.test(hash || "")) return [];
+    const extra = JSON.parse((await getJSON(env, "Pearl Fortune", `${base}/${hash}`))?.data?.extra_data || "{}");
+    const shares = extra?.pearl_payment_snapshot?.shares_by_address || {};
+    return Object.keys(shares).sort((a, b) => (number(shares[b]) ?? 0) - (number(shares[a]) ?? 0));
+  },
+  Kryptex: async (env) => (await getJSON(env, "Kryptex", "https://prl-api.kryptex.network/api/v1/pool/blocks"))
+    ?.results?.filter((b) => String(b?.scheme).toLowerCase() === "pps").map((b) => b.miner) || [],
+};
+const TRIES = 3; // new candidates per pool per hour
+const autoKey = (pool) => `realfees:auto:${pool}`;
+
 // Called by the existing minute cron. Per-pool atomic leases make work hourly,
-// independent of clients or edge regions; failures retain the last dated result.
+// independent of clients or edge regions; a failure keeps the last result only
+// while it is still current, and deletes it once it is history.
 export async function refreshRealFees(env) {
   const samples = configuration(env), t = now();
   for (const pool of Object.keys(POOLS)) {
@@ -204,22 +243,51 @@ export async function refreshRealFees(env) {
       .bind(leaseKey, token, t, t - 3600).run();
     if (!lease.meta.changes) continue;
     try {
-      const cohorts = [];
-      for (const sample of group) cohorts.push(await collect(env, sample, t));
-      const days = cohorts.flat(), start = Math.min(...days.map((d) => d.start));
-      if (!days.length) throw new Error("no_samples");
+      // Only days that can fall in a current window need chain history.
       const { results: points } = await env.DB.prepare("SELECT height,ts,difficulty FROM network_samples WHERE ts>=? ORDER BY ts,height")
-        .bind(start - 3 * DAY).all();
+        .bind(oldestEnd(t) - (DAYS + 3) * DAY).all();
       const distinct = points.filter((p, i) => !i || p.ts > points[i - 1].ts);
-      const observation = calculateMeasurement(pool, cohorts, distinct, t);
+      // The window with the most mined days wins; the configured samples win ties.
+      let best = null, bestAuto = null;
+      const consider = async (targets, auto = null) => {
+        try {
+          const cohorts = [];
+          for (const target of targets) cohorts.push(await collect(env, { pool, target }, t));
+          const o = calculateMeasurement(pool, cohorts, distinct, t);
+          if (!best || o.activeDays > best.activeDays) { best = o; bestAuto = auto; }
+        } catch {}
+      };
+      await consider(group.map((s) => s.target));
+      let stored = null;
+      if (DISCOVER[pool] && !(best?.activeDays >= DAYS)) {
+        stored = (await env.DB.prepare("SELECT v FROM kv WHERE k=?").bind(autoKey(pool)).first())?.v ?? null;
+        const tried = new Set(group.map((s) => s.target));
+        if (stored && !tried.has(stored)) { tried.add(stored); await consider([stored], stored); }
+        if (!(best?.activeDays >= DAYS)) {
+          let found = [];
+          try { found = await DISCOVER[pool](env); } catch {}
+          const fresh = [...new Set(found.map((a) => sanitizeTarget(pool, a)).filter((a) => a && !tried.has(a)))];
+          for (const target of fresh.slice(0, TRIES)) {
+            await consider([target], target);
+            if (best?.activeDays >= DAYS) break;
+          }
+        }
+      }
+      if (!best) throw new Error("no_complete_window");
       await env.DB.batch([
-        env.DB.prepare("INSERT OR REPLACE INTO kv (k,v,ts) VALUES (?,?,?)").bind(key(pool), JSON.stringify(observation), t),
+        env.DB.prepare("INSERT OR REPLACE INTO kv (k,v,ts) VALUES (?,?,?)").bind(key(pool), JSON.stringify(best), t),
         env.DB.prepare("INSERT OR REPLACE INTO kv (k,v,ts) VALUES (?,?,?)").bind(`realfees:last-success:${pool}`, "1", t),
+        ...(bestAuto && bestAuto !== stored ? [env.DB.prepare("INSERT OR REPLACE INTO kv (k,v,ts) VALUES (?,?,?)").bind(autoKey(pool), bestAuto, t)] : []),
       ]);
     } catch {
       // Never log an upstream URL, credential, account identifier or response.
       console.warn("real-fee sample unavailable", pool);
-      await env.DB.prepare("UPDATE kv SET ts=? WHERE k=? AND v=?").bind(t - 3300, leaseKey, token).run();
+      await env.DB.batch([
+        env.DB.prepare("UPDATE kv SET ts=? WHERE k=? AND v=?").bind(t - 3300, leaseKey, token),
+        // CASE evaluates lazily, so a malformed value is deleted instead of failing json_extract.
+        env.DB.prepare(`DELETE FROM kv WHERE k=? AND CASE WHEN json_valid(v)
+          THEN coalesce(json_extract(v, '$.end'), 0) < ? ELSE 1 END`).bind(key(pool), oldestEnd(t)),
+      ]);
     }
   }
 }

@@ -37,8 +37,10 @@ export function validateConfig(value) {
   if (o.autoRefresh != null && typeof o.autoRefresh !== "boolean") throw new Error("invalid_config");
   if (o.theme != null && !["system", "light", "dark"].includes(o.theme)) throw new Error("invalid_config");
   if (o.secondary != null && !/^(?:|__auto__|[A-Z]{3})$/.test(o.secondary)) throw new Error("invalid_config");
-  o.monitors = list(o.monitors, 20, ["pool", "addr", "acct", "label", "alert", "after", "paused"], (x) => !!sanitizeWatch(x) &&
-    typeof x.alert === "boolean" && text(x.label, 40) && (x.paused == null || typeof x.paused === "boolean"));
+  // `again` (掉线提醒's reminder, s): as with `after`, a value this worker doesn't offer reads as its default.
+  o.monitors = list(o.monitors, 20, ["pool", "addr", "acct", "label", "alert", "after", "again", "paused"], (x) => !!sanitizeWatch(x) &&
+    typeof x.alert === "boolean" && text(x.label, 40) && (x.paused == null || typeof x.paused === "boolean") &&
+    (x.again == null || (Number.isSafeInteger(x.again) && x.again >= 0)));
   o.wallets = list(o.wallets, 10, ["addr", "label"], (x) => address(x.addr) && text(x.label, 40));
   o.rules = list(o.rules, 20, ["kind", "value", "window", "enabled", "seen_fired", "repeat"], (x) => !!sanitizeRule(x) &&
     typeof x.enabled === "boolean" && Number.isSafeInteger(x.seen_fired) && x.seen_fired >= 0 && x.seen_fired <= now() + 300);
@@ -132,7 +134,7 @@ export async function projection(env, uid, config, commit) {
       ...rules.map((r) => db.prepare(conditional(UPSERT_RULE)).bind(d.token, r.id, r.kind, r.value, r.window, r.enabled, d.oneshot, r.seen_fired, r.repeating)),
       db.prepare(`DELETE FROM deferred WHERE token=? AND ${guard} AND NOT EXISTS(SELECT 1 FROM rules r WHERE r.token=deferred.token AND r.id=deferred.rule_id AND r.kind=deferred.kind AND r.value=deferred.value AND r.window=deferred.window)`).bind(d.token),
       remove("watches", d.token, watches.map((w) => w.id)),
-      ...watches.map((w) => db.prepare(conditional(UPSERT_WATCH)).bind(d.token, w.id, w.pool, w.addr, w.label, w.after)),
+      ...watches.map((w) => db.prepare(conditional(UPSERT_WATCH)).bind(d.token, w.id, w.pool, w.addr, w.label, w.after, w.again, now())),
       ...watches.map((w) => db.prepare(`INSERT OR IGNORE INTO miners(pool, addr) SELECT ?, ? WHERE ${guard}`).bind(w.pool, w.addr)));
     guard = baseGuard;
   }

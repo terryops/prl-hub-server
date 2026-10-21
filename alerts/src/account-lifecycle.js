@@ -5,6 +5,6 @@ export function revokeDevice(db, uid, id, t = now()) {
     db.prepare("UPDATE sessions SET revoked_at=? WHERE user_id=? AND device_id=?").bind(t, uid, id),
     db.prepare("UPDATE account_devices SET revoked_at=? WHERE user_id=? AND id=?").bind(t, uid, id),
     db.prepare(`UPDATE account_push_claims SET revoked_at=? WHERE token IN(${tokens})`).bind(t,uid,id,uid,id),
-    ...["rules", "deferred", "watches", "webpush", "devices", "live"].map((table) => db.prepare(`DELETE FROM ${table} WHERE token IN (${tokens})`).bind(uid, id,uid,id)),
+    ...["rules", "deferred", "watches", "webpush", "fcm", "devices", "live"].map((table) => db.prepare(`DELETE FROM ${table} WHERE token IN (${tokens})`).bind(uid, id,uid,id)),
   ];
 }

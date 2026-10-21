@@ -67,8 +67,8 @@ export async function revokeAccountApple(env, ref) {
     await db.batch([
       db.prepare("UPDATE entitlements SET revoked_at=? WHERE source='apple' AND ref=?").bind(now(), ref),
       recalculate(db, uid),
-      ...["rules", "deferred", "watches", "webpush", "devices"].map((table) => db.prepare(`DELETE FROM ${table} WHERE token IN
-        (SELECT token FROM devices WHERE gid=? AND (chan='webpush' OR account_pro=1)) AND EXISTS(SELECT 1 FROM groups WHERE gid=? AND pro_at IS NULL)`).bind(uid, uid)),
+      ...["rules", "deferred", "watches", "webpush", "fcm", "devices"].map((table) => db.prepare(`DELETE FROM ${table} WHERE token IN
+        (SELECT token FROM devices WHERE gid=? AND (chan IN ('webpush','fcm') OR account_pro=1)) AND EXISTS(SELECT 1 FROM groups WHERE gid=? AND pro_at IS NULL)`).bind(uid, uid)),
       db.prepare(`DELETE FROM live WHERE account_pro=1 AND token IN(SELECT token FROM account_push_claims WHERE user_id=?)
         AND EXISTS(SELECT 1 FROM groups WHERE gid=? AND pro_at IS NULL)`).bind(uid, uid),
     ]);

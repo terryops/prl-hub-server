@@ -3,7 +3,7 @@ import { readCapped, MAX_BODY } from "./pools.js";
 import { cached, webJson as json, now } from "./http.js";
 import { reserveBudget } from "./poolstats.js";
 import { attachRealFees, readRealFees } from "./realfees.js";
-import { recordPPLNSSnapshot, readPPLNSMeasurements } from "./pplns.js";
+import { recordPPLNSSnapshot, readPoolLuck, attachLuck } from "./pplns.js";
 
 export const WORK = 2 ** 48;
 const num = (v) =>
@@ -69,7 +69,15 @@ const names = {
   "kryptex.com": "Kryptex",
   "2miners.com": "2Miners",
   "akoyapool.com": "AkoyaPool",
+  "jetskipool.ai": "Jetski",
 };
+/// Payout addresses the explorer leaves unlabeled, each checked against the pool's own
+/// block list (every block it reports pays this address). Never inferred from volume.
+const POOL_ADDRESSES = {
+  // pearl.jetskipool.ai/api/stats recent_blocks_found ↔ the explorer's block miners, 2026-10-16.
+  prl1pgr2znrzz8nwu2lrw4phrzaqqa8ukt76qsqc29wxgcwgalanur7zsk8w070: "https://pearl.jetskipool.ai/",
+};
+const poolURL = (entry, address) => entry?.pool?.url || (Object.hasOwn(POOL_ADDRESSES, address || "") ? POOL_ADDRESSES[address] : null);
 const pretty = (url, fallback) => {
   try {
     const h = new URL(url).hostname.toLowerCase();
@@ -134,12 +142,12 @@ export function chainPoolRows(chain) {
       !String(board.window_unit || "hours").startsWith("hour")) return [];
   const pools = new Map();
   for (const entry of board.top) {
-    const url = safeURL(entry?.pool?.url), blocks = count(entry?.blocks);
+    const url = safeURL(poolURL(entry, entry?.address)), blocks = count(entry?.blocks);
     if (!url || blocks == null) continue;
     const key = new URL(url).hostname.toLowerCase();
     const existing = pools.get(key);
     if (existing) existing.blocks += blocks;
-    else pools.set(key, { name: pretty(url, entry.pool.name || key), url, blocks,
+    else pools.set(key, { name: pretty(url, entry.pool?.name || key), url, blocks,
       hashrate: null, fee: null, scheme: null, miners: null });
   }
   return [...pools.values()];
@@ -311,6 +319,14 @@ export function buildOverview(
         }
         feeFromPoolAPI = true;
       }
+      // HeroMiners' own config names its scheme and fee: "prop" and 0 on 2026-10-20, while the
+      // pool table said PPLNS. A SOLO row keeps its own terms.
+      if (r.name === "HeroMiners" && !solo && hero?.config) {
+        const own = typeof hero.config.rewardScheme === "string" ? scheme(hero.config.rewardScheme.trim().toUpperCase()) : null;
+        const ownFee = num(hero.config.fee);
+        if (own) payout = own;
+        if (ownFee != null && ownFee >= 0 && ownFee <= 100) { fee = ownFee; feeFromPoolAPI = true; }
+      }
       if (r.name === "PearlHash") fee = 1;
       const isFortune = r.name === "Pearl Fortune" && !solo;
       if (isFortune) {
@@ -355,9 +371,9 @@ export function buildOverview(
       const mpsRow = (Array.isArray(mps?.data) ? mps.data : []).find((p) =>
         samePool(p?.url, r.url) && ((p.url || "").toLowerCase().includes("solo") === solo));
       const recent = (Array.isArray(chain?.leaderboard?.recent_blocks) ? chain.leaderboard.recent_blocks : [])
-        .filter((b) => samePool(b?.pool?.url, r.url)).map((b) => positive(b.time)).filter(Boolean);
+        .filter((b) => samePool(poolURL(b, b?.miner), r.url)).map((b) => positive(b.time)).filter(Boolean);
       const lifetime = (Array.isArray(chain?.lifetime?.top) ? chain.lifetime.top : [])
-        .filter((b) => samePool(b?.pool?.url, r.url)).map((b) => count(b.blocks)).filter((v) => v != null);
+        .filter((b) => samePool(poolURL(b, b?.address), r.url)).map((b) => count(b.blocks)).filter((v) => v != null);
       const lastTimes = [positive(mpsRow?.lastblocktime), ...recent].filter(Boolean);
       return {
         id: r.url || r.name,
@@ -439,8 +455,24 @@ async function get(url, db, budget) {
     redirect: "manual",
     signal: AbortSignal.timeout(8000),
   });
-  if (r.status !== 200) throw new Error("upstream");
+  if (r.status !== 200) throw Object.assign(new Error("upstream"), { status: r.status });
   return readCapped(r, MAX_BODY);
+}
+// Every failed feed is logged with what went wrong, and a pool's own API gets one more try a second later:
+// on 2026-10-21 about one snapshot in twenty lost Pearl Fortune's summary while the same six reads, run from
+// seven regions for 90 minutes, never failed.
+export const FEED_RETRY_MS = 1000;
+async function feed(name, read, retry = false) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await read();
+    } catch (e) {
+      const detail = e?.status != null ? `HTTP ${e.status}` : `${e?.name || "Error"}: ${e?.message || e}`;
+      console.warn(`overview feed failed: ${name}, attempt ${attempt}, ${detail.slice(0, 160)}`);
+      if (!retry || attempt > 1) throw e;
+      await new Promise((resolve) => setTimeout(resolve, FEED_RETRY_MS));
+    }
+  }
 }
 async function fetchMPS(db) {
   const page = await get(
@@ -458,31 +490,34 @@ async function fetchMPS(db) {
     ),
   );
 }
+const LOP_PUBLIC = "https://lordofpearls.xyz/api/public";
+const HERO_STATS = "https://pearl.herominers.com/api/stats";
+const fetchJSONFor = (db) => (url, budget) => get(url, db, budget).then(JSON.parse);
 export async function overview(env, ctx) {
   try {
+    // What this snapshot read that the luck bookkeeping reads too, so it isn't fetched twice.
+    let prefetched = null;
+    // The bookkeeping reads more block lists and doesn't hold up this reply: handed to waitUntil
+    // (its windows reach readers from the next request on).
+    const record = (value) => {
+      const work = recordPPLNSSnapshot(env.DB, value, fetchJSONFor(env.DB), prefetched)
+        .catch(() => console.warn("public PPLNS sample unavailable"));
+      if (ctx?.waitUntil) ctx.waitUntil(work); else return work;
+    };
     const response = await cached("pools/overview-v3", 30, ctx, () => sharedSnapshot(env.DB, async () => {
       const replies = await Promise.allSettled([
-        get("https://lordofpearls.xyz/pools", env.DB, "overview-lop"),
-        get("https://lordofpearls.xyz/api/public", env.DB, "overview-lop").then(
-          JSON.parse,
-        ),
-        fetchMPS(env.DB),
-        get(
-          "https://prl-api.kryptex.network/api/v1/pool/stats",
-          env.DB,
-          "Kryptex",
-        ).then(JSON.parse),
-        get(
-          "https://pearl.herominers.com/api/stats",
-          env.DB,
-          "HeroMiners",
-        ).then(JSON.parse),
-        get("https://pearlfortune.org/api/v1/summary", env.DB, "Pearl Fortune")
-          .then(JSON.parse).then((o) => o?.data || null),
+        feed("lordofpearls pools", () => get("https://lordofpearls.xyz/pools", env.DB, "overview-lop")),
+        feed("lordofpearls api", () => get(LOP_PUBLIC, env.DB, "overview-lop").then(JSON.parse)),
+        feed("miningpoolstats", () => fetchMPS(env.DB)),
+        feed("Kryptex", () => get("https://prl-api.kryptex.network/api/v1/pool/stats", env.DB, "Kryptex").then(JSON.parse), true),
+        feed("HeroMiners", () => get(HERO_STATS, env.DB, "HeroMiners").then(JSON.parse), true),
+        feed("Pearl Fortune", () => get("https://pearlfortune.org/api/v1/summary", env.DB, "Pearl Fortune")
+          .then(JSON.parse).then((o) => o?.data || null), true),
       ]);
       const [html, chain, mps, kryptex, hero, fortune] = replies.map((r) =>
         r.status === "fulfilled" ? r.value : null,
       );
+      prefetched = { [LOP_PUBLIC]: chain, [HERO_STATS]: hero };
       const network = parseNetwork(chain) || mpsNetwork(mps, kryptex);
       const table = parseTable(html || "");
       const rows = buildOverview(table.length ? table : chainPoolRows(chain), network, {
@@ -508,13 +543,13 @@ export async function overview(env, ctx) {
           !rows.length,
         stale: !!network && now() - network.ts > 900,
       };
-    }));
+    }, record));
     if (!response.ok) return response;
     const snapshot = await response.json();
-    let measurements = [], pplns = [];
+    let measurements = [], luck = { pplns: [], luck: new Map() };
     try { measurements = await readRealFees(env.DB); } catch {}
-    try { pplns = await readPPLNSMeasurements(env.DB, snapshot.rows); } catch {}
-    return json(attachRealFees(snapshot, measurements, pplns));
+    try { luck = await readPoolLuck(env.DB); } catch {}
+    return json(attachLuck(attachRealFees(snapshot, measurements, luck.pplns), luck.luck));
   } catch {
     return json({ ok: false, error: "upstream" }, 502);
   }
@@ -528,7 +563,9 @@ const LEASE_KEY = "public:overview:lease:v1";
 const FRESH_SECONDS = 300;
 const FALLBACK_SECONDS = 1800;
 const LEASE_SECONDS = 30;
-export async function sharedSnapshot(db, build) {
+/// `record(value)` runs after a new snapshot is stored (the luck bookkeeping); it may hand its
+/// work to waitUntil and return at once.
+export async function sharedSnapshot(db, build, record = (value) => recordPPLNSSnapshot(db, value, fetchJSONFor(db))) {
   const read = async () => {
     const stored = await db.prepare("SELECT v FROM kv WHERE k = ?").bind(SNAPSHOT_KEY).first();
     try {
@@ -568,7 +605,9 @@ export async function sharedSnapshot(db, build) {
     if (previous?.rows.length && !value.rows.length) throw new Error("upstream");
     await db.prepare("INSERT OR REPLACE INTO kv (k, v, ts) VALUES (?, ?, ?)")
       .bind(SNAPSHOT_KEY, JSON.stringify(value), value.ts).run();
-    try { await recordPPLNSSnapshot(db, value); } catch { console.warn("public PPLNS sample unavailable"); }
+    // The pools' own block lists (each block's effort) take luck out of the cost estimate.
+    try { await record(value); }
+    catch { console.warn("public PPLNS sample unavailable"); }
     return value;
   } catch (error) {
     if (previous && now() - previous.ts <= FALLBACK_SECONDS) return json(reply(previous, true));

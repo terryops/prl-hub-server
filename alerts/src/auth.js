@@ -300,13 +300,46 @@ export async function exchangeClient(env, body) {
   if (!row) return error("invalid_authorization", 401);
   return sessionResponse(await makeSession(env, row.user_id, { device_id: row.device_id, device_name: row.name, platform: row.platform }, "native", row.email_verified_at), "native");
 }
+// Sign in once, on every device: a signed-in iOS / macOS app leaves a ticket in the user's
+// iCloud Keychain, and their other devices trade it for sessions of their own. A ticket only
+// ever opens a NEW installation's session, lives no longer than the session that issued it,
+// and never counts as a fresh email check (linking a new purchase still asks for one).
+const TICKET_TTL = 30 * 86400;
+export async function issueTicket(env, session) {
+  if (session.client !== "native" || !["ios", "macos"].includes(session.platform)) return error("unsupported_client", 403);
+  const ticket = random(), t = now(), db = env.DB;
+  const out = await db.batch([
+    // One live ticket per session: a refreshed one replaces the last.
+    db.prepare("UPDATE device_tickets SET revoked_at=? WHERE source_session_id=? AND revoked_at IS NULL").bind(t, session.id),
+    db.prepare(`INSERT INTO device_tickets(hash, user_id, source_session_id, created_at, expires_at)
+      SELECT ?, ?, ?, ?, ? WHERE EXISTS(SELECT 1 FROM sessions WHERE id=? AND user_id=? AND revoked_at IS NULL)`)
+      .bind(await sha256(ticket), session.user_id, session.id, t, t + TICKET_TTL, session.id, session.user_id),
+  ]);
+  if (!out[1].meta.changes) return error("unauthorized", 401);
+  return json({ ticket, expires_in: TICKET_TTL });
+}
+export async function redeemTicket(env, body) {
+  if (!TOKEN.test(body.ticket || "") || !ID.test(body.device_id || "") || !["ios", "macos"].includes(body.platform)) return error("bad_ticket");
+  const t = now();
+  const row = await env.DB.prepare(`SELECT k.user_id, s.device_id AS source_device FROM device_tickets k
+    JOIN sessions s ON s.id=k.source_session_id AND s.user_id=k.user_id
+    JOIN account_devices d ON d.user_id=s.user_id AND d.id=s.device_id
+    JOIN users u ON u.id=k.user_id
+    WHERE k.hash=? AND k.revoked_at IS NULL AND k.expires_at>? AND s.revoked_at IS NULL AND d.revoked_at IS NULL
+    AND u.deleted_at IS NULL AND s.idle_expires>? AND s.max_expires>?`).bind(await sha256(body.ticket), t, t, t).first();
+  // The issuing installation can't trade its own ticket: the new session would end the one
+  // the ticket hangs on.
+  if (!row || row.source_device === body.device_id) return error("invalid_ticket", 401);
+  return sessionResponse(await makeSession(env, row.user_id,
+    { device_id: body.device_id, device_name: body.device_name, platform: body.platform }, "native", 0), "native");
+}
 export const clearCookie = (res) => {
   res.headers.set("set-cookie", `${COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`); return res;
 };
 export async function authRoutes(req, env) {
   const path = new URL(req.url).pathname;
   if (!path.startsWith("/v1/auth/")) return null;
-  if (!["/v1/auth/email/start", "/v1/auth/email/verify", "/v1/auth/refresh", "/v1/auth/exchange", "/v1/auth/authorize"].includes(path)) return null;
+  if (!["/v1/auth/email/start", "/v1/auth/email/verify", "/v1/auth/refresh", "/v1/auth/exchange", "/v1/auth/authorize", "/v1/auth/ticket"].includes(path)) return null;
   if (req.method !== "POST") return error("not_found", 404);
   if (path !== "/v1/auth/refresh" && !enabled(env)) return error("accounts_unavailable", 503);
   if (!originOK(req, env)) return error("bad_origin", 403);
@@ -315,6 +348,7 @@ export async function authRoutes(req, env) {
   if (path === "/v1/auth/email/verify") return verifyEmail(req, env, body);
   if (path === "/v1/auth/refresh") return refreshSession(env, body);
   if (path === "/v1/auth/exchange") return exchangeClient(env, body);
+  if (path === "/v1/auth/ticket") return redeemTicket(env, body);
   if (path === "/v1/auth/authorize") {
     const session = await authenticate(req, env);
     return session ? authorizeClient(env, session, body) : error("unauthorized", 401);
@@ -326,6 +360,7 @@ export function authCleanup(db, t) {
     db.prepare("DELETE FROM auth_challenges WHERE expires_at < ?").bind(t - 86400),
     db.prepare("DELETE FROM auth_budgets WHERE expires_at < ?").bind(t),
     db.prepare("DELETE FROM auth_codes WHERE expires_at < ?").bind(t),
+    db.prepare("DELETE FROM device_tickets WHERE expires_at < ? OR revoked_at < ?").bind(t, t - 86400),
     db.prepare("DELETE FROM refresh_history WHERE expires_at < ?").bind(t),
     db.prepare("DELETE FROM sessions WHERE max_expires < ? OR idle_expires < ? OR revoked_at < ?").bind(t, t, t - 86400),
   ];

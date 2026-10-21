@@ -13,6 +13,7 @@ import {
   WORK,
 } from "../src/overview.js";
 import { makeEnv, call, setNow, restoreNow, T0 } from "./helpers.js";
+import worker from "../src/index.js";
 const fixture = (n) =>
   readFileSync(new URL(`../../Tests/Fixtures/${n}`, import.meta.url), "utf8");
 const realFetch = globalThis.fetch;
@@ -39,6 +40,21 @@ test("chain fallback: only attributed 24h pool blocks are joined; missing hashra
   assert.equal(rows[0].blocks, 34);
   assert.equal(rows[0].hashrate, null);
   assert.deepEqual(chainPoolRows({ leaderboard: { window: 168, top: [] } }), []);
+});
+test("chain identity: a verified payout address names Jetski's blocks; other bare addresses stay unattributed", () => {
+  const pearlski = "prl1pgr2znrzz8nwu2lrw4phrzaqqa8ukt76qsqc29wxgcwgalanur7zsk8w070";
+  const rows = chainPoolRows({ leaderboard: { window: 24, window_unit: "hours", top: [
+    { blocks: 12, address: pearlski }, { blocks: 11, address: "prl1punknown" }, { blocks: 3, address: "__proto__" }] } });
+  assert.deepEqual(rows.map((r) => [r.name, r.url, r.blocks]), [["Jetski", "https://pearl.jetskipool.ai/", 12]]);
+  // The miningpoolstats row for the same pool gains the chain's lifetime count and last block.
+  const [pool] = buildOverview([], { hashrate: 1000, reward: 1, prlPerTHDay: .02 }, {
+    mps: { block_time_average: 180, data: [{ pool_id: "jetskipool.ai", url: "https://pearl.jetskipool.ai/", hashrate: 30, blocks_1000: 25, fee: 1, feetype: "PPLNS" }] },
+    chain: { leaderboard: { recent_blocks: [{ time: 1400, miner: pearlski }, { time: 1500, miner: "prl1punknown" }] },
+      lifetime: { top: [{ blocks: 1032, address: pearlski }, { blocks: 5000, address: "prl1punknown" }] } },
+  });
+  assert.equal(pool.name, "Jetski");
+  assert.equal(pool.lifetimeBlocks, 1032);
+  assert.equal(pool.lastBlockTime, 1400);
 });
 test("history: delta decoding preserves gaps without resetting the running value", () => {
   const points = decodePoolHistory({ history_start: "1000", history_interval: 3600, history: [100, 10, -20, "x", 50, -5] });
@@ -176,6 +192,22 @@ test("comparison: HeroMiners bit shift, Kryptex authoritative PPS fee, low sampl
   )[0];
   assert.equal(zero.earningsPerPH, 0);
 });
+test("comparison: HeroMiners takes its scheme and fee from its own config; SOLO and bad values keep the table's", () => {
+  const network = { hashrate: 10e18, reward: 2000, prlPerTHDay: 0.02 };
+  const hero = (scheme = "PPLNS", extra = {}) => ({ name: "HeroMiners", url: "https://pearl.herominers.com", scheme,
+    hashrate: 1e18, fee: 1, blocks: 40, miners: null, ...extra });
+  const row = (config, input = hero()) => buildOverview([input], network, { hero: { config, pool: {} } })[0];
+  const prop = row({ rewardScheme: "prop", fee: 0 });
+  assert.equal(prop.scheme, "PROP"); assert.equal(prop.fee, 0); assert.equal(prop.feeFromPoolAPI, true);
+  assert.deepEqual([prop.payouts[0].scheme, prop.payouts[0].fee], ["PROP", 0]);
+  assert.equal(prop.pps, false);
+  for (const config of [undefined, {}, { rewardScheme: "", fee: "x" }, { rewardScheme: 7, fee: -1 }, { fee: 101 }]) {
+    const kept = row(config);
+    assert.deepEqual([kept.scheme, kept.fee, kept.feeFromPoolAPI], ["PPLNS", 1, false]);
+  }
+  const solo = row({ rewardScheme: "prop", fee: 0 }, hero("SOLO", { url: "https://pearl.herominers.com/solo" }));
+  assert.deepEqual([solo.scheme, solo.fee], ["SOLO", 1]);
+});
 test("comparison: unlisted and SOLO pools merged without duplicates or mixed-window winners", () => {
   const rows = buildOverview(
     [
@@ -267,13 +299,27 @@ test("overview API: public no-store, capped budgets, full comparison and no pers
   assert.equal(r.status, 200);
   assert.equal(r.headers.get("cache-control"), "no-store");
   assert.ok(r.body.rows.length >= 5);
-  assert.equal(urls.length, 7);
+  // Seven feeds for the table, then the newest blocks of each pool whose luck is taken out of Real Cost.
+  // The explorer's orphans and HeroMiners' blocks come from the table's own reads, not a second fetch.
+  assert.equal(urls.length, 9);
+  assert.deepEqual(urls.slice(7).sort(), ["https://pearl.luckypool.io/api/stats", "https://pearlfortune.org/api/v1/blocks?page=1"]);
   const pplns = r.body.rows.find((row) => row.scheme === "PPLNS" && row.earningsPerPH != null && row.fee != null);
   assert.ok(pplns);
   assert.equal(pplns.payouts[0].realFeePercent, null); // A 24h snapshot cannot supply a five-day PPLNS estimate.
   assert.equal(pplns.payouts[0].realFeeEstimated, null);
   assert.equal(pplns.payouts[0].realFeePeriod, null);
   assert.equal(env.DB.rows("SELECT * FROM groups").length, 0);
+  assert.ok(env.DB.rows("SELECT * FROM kv WHERE k LIKE 'pb:%'").length >= 4);
+});
+test("overview API: the luck bookkeeping is handed to waitUntil, not awaited by the reply", async () => {
+  setNow(T0);
+  const env = makeEnv();
+  mock(env);
+  const tasks = [];
+  const res = await worker.fetch(new Request("https://prl.test/v1/pools"), env, { waitUntil: (t) => tasks.push(t) });
+  assert.equal(res.status, 200);
+  assert.ok(tasks.length >= 1);
+  await Promise.all(tasks);
   assert.ok(env.DB.rows("SELECT * FROM kv WHERE k LIKE 'pb:%'").length >= 4);
 });
 test("overview fallback: missing emission never treated as negative reward; own API supplies reward", async () => {
@@ -295,6 +341,51 @@ test("overview API: upstream failure and read limiter cannot fabricate successfu
   assert.equal((await call(env, "GET", "/v1/pools")).status, 429);
 });
 
+// Pearl Fortune's summary fails `failures` times, then answers; every other feed answers as in mock().
+const flakyFortune = (env, failures) => {
+  const urls = mock(env), base = globalThis.fetch, warnings = [], warn = console.warn;
+  console.warn = (...a) => warnings.push(a.join(" "));
+  let calls = 0;
+  globalThis.fetch = async (url, init) => {
+    if (String(url) !== "https://pearlfortune.org/api/v1/summary") return base(url, init);
+    urls.push(String(url));
+    return ++calls <= failures ? new Response("down", { status: 503 })
+      : Response.json({ data: { pool_stats: { pool_fee_rate: 0.02, rolling_stats: [] } } });
+  };
+  return { urls, warnings, restore: () => { console.warn = warn; } };
+};
+test("overview feeds: a pool's own API that fails once is read again a second later and the snapshot stays whole", async () => {
+  setNow(T0);
+  const env = makeEnv(), f = flakyFortune(env, 1);
+  try {
+    const r = await call(env, "GET", "/v1/pools");
+    assert.equal(r.status, 200);
+    assert.equal(r.body.partial, false);
+    assert.equal(r.body.rows.find((row) => row.name === "Pearl Fortune").feeFromPoolAPI, true);
+    assert.equal(f.urls.filter((u) => u === "https://pearlfortune.org/api/v1/summary").length, 2);
+    assert.deepEqual(f.warnings, ["overview feed failed: Pearl Fortune, attempt 1, HTTP 503"]);
+  } finally { f.restore(); }
+});
+test("overview feeds: a second failure leaves the snapshot partial; the pool table's own feeds are not retried", async () => {
+  setNow(T0);
+  const env = makeEnv(), f = flakyFortune(env, 2);
+  try {
+    const r = await call(env, "GET", "/v1/pools");
+    assert.equal(r.status, 200);
+    assert.equal(r.body.partial, true);
+    assert.equal(r.body.rows.find((row) => row.name === "Pearl Fortune").feeFromPoolAPI, false);
+    assert.equal(f.urls.filter((u) => u === "https://pearlfortune.org/api/v1/summary").length, 2);
+    assert.deepEqual(f.warnings, ["overview feed failed: Pearl Fortune, attempt 1, HTTP 503", "overview feed failed: Pearl Fortune, attempt 2, HTTP 503"]);
+  } finally { f.restore(); }
+  const env2 = makeEnv(), urls = mock(env2, { fallback: true }), warnings = [], warn = console.warn;
+  console.warn = (...a) => warnings.push(a.join(" "));
+  try {
+    assert.equal((await call(env2, "GET", "/v1/pools")).body.partial, true);
+    assert.equal(urls.filter((u) => u === "https://lordofpearls.xyz/pools").length, 1);
+    assert.ok(warnings.includes("overview feed failed: lordofpearls pools, attempt 1, HTTP 503"), warnings.join(" | "));
+    assert.ok(warnings.includes("overview feed failed: lordofpearls api, attempt 1, HTTP 503"), warnings.join(" | "));
+  } finally { console.warn = warn; }
+});
 test("shared source: API callers reuse the durable snapshot and refresh after five minutes", async () => {
   setNow(T0);
   const env = makeEnv(), urls = mock(env);
@@ -303,11 +394,11 @@ test("shared source: API callers reuse the durable snapshot and refresh after fi
   setNow(T0 + 200);
   const next = await call(env, "GET", "/v1/pools");
   assert.equal(next.body.ts, first.body.ts);
-  assert.equal(urls.length, 7);
+  assert.equal(urls.length, 9);
   setNow(T0 + 301);
   const refreshed = await call(env, "GET", "/v1/pools");
   assert.equal(refreshed.body.ts, T0 + 301);
-  assert.equal(urls.length, 14);
+  assert.equal(urls.length, 18);
 });
 test("shared source: an upstream outage retains timestamped data, then expires it", async () => {
   setNow(T0);

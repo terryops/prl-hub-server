@@ -277,6 +277,24 @@ test("account: settings project to closed notification devices atomically withou
   assert.equal(saved.data.data.rules[0].repeat, true);
 });
 
+test("account: monitors project with their offline threshold and reminder (掉线提醒)", async () => {
+  const f=boot(),a=await login(f),d=await makeSession(f.env,a.user_id,{device_id:random(24),platform:"ios"},"native"),s=f.env.DB.one("SELECT * FROM sessions WHERE access_hash=?",await sha256(d.access_token)),token=tok(3);
+  await claimPush(f.env,s,token);
+  grantPro(f.env.DB,a.user_id);
+  f.env.DB.raw.prepare("INSERT INTO devices(token,env,topic,oneshot,updated_at,gid,account_device_id) VALUES(?,'production','com.prl.wizard',1,?,?,?)").run(token,T0,a.user_id,d.device_id);
+  const addr=(c)=>"prl1p"+c.repeat(40);
+  const data=configFixture();data.monitors=[
+    {id:"m1",updated:Date.now(),pool:"Kryptex",addr:addr("q"),label:"Garage",alert:true,after:7200,again:3600,paused:false},
+    {id:"m2",updated:Date.now(),pool:"Kryptex",addr:addr("z"),label:"",alert:true,after:600,again:999},
+    {id:"m3",updated:Date.now(),pool:"Kryptex",addr:addr("x"),label:"",alert:true,after:5400}];
+  assert.equal((await request(f.env,"PUT","/v1/account/config",{schema_version:1,rev:0,data},a.credentials)).status,200);
+  assert.deepEqual(f.env.DB.rows("SELECT id, after, again, again_at FROM watches WHERE token=? ORDER BY id",token),[
+    {id:"m1",after:7200,again:3600,again_at:T0},{id:"m2",after:600,again:0,again_at:T0},{id:"m3",after:5400,again:0,again_at:T0}]);
+  const saved=await request(f.env,"GET","/v1/account/config",undefined,a.credentials);
+  assert.equal(saved.data.data.monitors[0].again,3600,"kept in the configuration as sent");
+  data.monitors[0].again=-1;
+  assert.equal((await request(f.env,"PUT","/v1/account/config",{schema_version:1,rev:1,data},a.credentials)).status,400);
+});
 test("account: switching a browser email revokes its previous account device", async () => {
   const f=boot(),a=await login(f),token=tok(88),s=f.env.DB.one("SELECT * FROM sessions WHERE user_id=?",a.user_id);
   await claimPush(f.env,s,token);

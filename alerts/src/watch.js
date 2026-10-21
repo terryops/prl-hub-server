@@ -1,8 +1,9 @@
 // 掉线提醒 — pure, no I/O, so it is unit-testable in plain Node.
 //
 // A device subscribes a pool monitor ("watch") to offline pushes: tell me when a
-// worker has been offline for `after` seconds (10, 15, 30 or 60 min) — and, once it
-// has been told that, when the worker is back. The worker polls each distinct
+// worker has been offline for `after` seconds (10 min to 2 h) — and, once it has been
+// told that, when the worker is back; optionally (`again`) remind me once if it is
+// still offline that long after the first push. The worker polls each distinct
 // (pool, miner) every POLL_EVERY and keeps two things:
 //
 //   miners.workers   what the pool last showed, per worker name:
@@ -12,10 +13,11 @@
 //                      < 0  offline since -value, but never seen online by us (it was
 //                           already dead when first listed): never worth a push
 //   watches.told     per subscription, the outages it already heard about:
-//                      { name: [since, pushedAt, backAt?, backPushedAt?] }
+//                      { name: [since, pushedAt, backAt?, backPushedAt?, remindedAt?] }
 //                    pushedAt 0 = noted at the first look, never pushed; backAt = the
 //                    poll that found the worker online again; backPushedAt = when the
-//                    device was told so.
+//                    device was told so; remindedAt = when it was reminded the worker
+//                    was still offline (backAt and backPushedAt are 0 until then).
 //
 // A push goes out once per outage, when it has lasted `after`. A worker that
 // comes back and drops again is a new outage, but the same worker is not pushed
@@ -27,11 +29,18 @@
 // again is not news to it. The worker counts as back once it is still online at a
 // poll STEADY after the one that first found it so — one that only flickers is not
 // announced — and the caller polls its miner again RECHECK later to find out.
+//
+// The reminder ("still offline") goes out at most once per outage, `again` after the
+// first push, and only for outages first pushed since the reminder was switched on
+// (`againFrom`): turning it on must not ring about workers the user already knew were
+// down. A worker that flickers in between is still the same outage to the device.
 
 import { POOLS, sanitizeTarget } from "./pools.js";
 
 export const POLL_EVERY = 180;
-export const AFTER = [600, 900, 1800, 3600];
+export const AFTER = [600, 900, 1800, 3600, 5400, 7200];
+/// The reminder's delay after the first push (0 = no reminder).
+export const AGAIN = [1800, 3600, 7200, 14400];
 export const COOLDOWN = 1800;
 /// How soon a miner with a worker just back is polled again, and how long that worker
 /// must then have stayed online: cron ticks land a few seconds either side of the
@@ -81,32 +90,39 @@ export function fold(prev, seen, t, partial = false) {
 }
 
 /// What one subscription should hear now.
-/// state: the miner's { name: since }; told: { name: [since, pushedAt, backAt?, backPushedAt?] };
-/// after: its threshold (s); fresh: this is its first look (nothing is news yet).
+/// state: the miner's { name: since }; told: { name: [since, pushedAt, backAt?, backPushedAt?, remindedAt?] };
+/// after: its threshold (s); fresh: this is its first look (nothing is news yet);
+/// again: the reminder's delay (s, 0 = none), for outages first pushed at or after againFrom.
 /// → { push: [{ name, since }]       outages to announce
 ///     back: [{ name, since, at }]   workers to announce as back (offline since → at)
+///     still: [{ name, since }]      workers to remind about: still offline since then
 ///     wait: a worker is back but not for STEADY yet — poll the miner again soon
 ///     told } — `told` as it stands if nothing is sent: the caller folds in what it
 ///   does send (`tell`).
-export function due(state, told, after, t, fresh = false) {
+export function due(state, told, after, t, fresh = false, again = 0, againFrom = 0) {
   const next = bag();
   const push = [];
   const back = [];
+  const still = [];
   let wait = false;
   for (const [name, since] of Object.entries(state)) {
     const old = Array.isArray(told[name]) ? told[name] : null;
     const cooling = old && t - old[1] < COOLDOWN;
-    // Pushed as offline, not yet as back: all this device can still hear is "back online".
+    // Pushed as offline, not yet as back: all this device can still hear is "back online"
+    // — and, once, that it is still offline.
     const owed = old && old[1] > 0 && !old[3];
+    const reminded = (owed && old[4]) || 0;
     if (since === 0 && owed) {
       const at = old[2] || t;
-      next[name] = [old[0], old[1], at];
+      next[name] = reminded ? [old[0], old[1], at, 0, reminded] : [old[0], old[1], at];
       if (t - at >= STEADY) back.push({ name, since: old[0], at });
       else wait = true;
     } else if (since <= 0) {
       if (cooling) next[name] = old;
     } else if (owed) {
-      next[name] = [old[0], old[1]];                         // down again (or still): its return starts over
+      // Down again (or still): its return starts over.
+      next[name] = reminded ? [old[0], old[1], 0, 0, reminded] : [old[0], old[1]];
+      if (!reminded && again > 0 && old[1] >= againFrom && t - old[1] >= again) still.push({ name, since: old[0] });
     } else if (old && (cooling || (old[0] === since && !old[3]))) {
       // It rang just now, or this outage is known — unless the device has since been
       // told the worker was back: then the same last share is a new outage all the same.
@@ -116,14 +132,15 @@ export function due(state, told, after, t, fresh = false) {
       else push.push({ name, since });
     }
   }
-  return { push, back, wait, told: next };
+  return { push, back, still, wait, told: next };
 }
 
 /// `told` once these have gone out at t. A worker announced as back stays on record
 /// only while its cool-down runs: dropping again must not ring before that is over.
-export function tell(told, push, back, t) {
+export function tell(told, push, back, t, still = []) {
   const next = Object.assign(bag(), told);
   for (const p of push) next[p.name] = [p.since, t];
+  for (const s of still) next[s.name] = [next[s.name][0], next[s.name][1], 0, 0, t];
   for (const b of back) {
     const [since, pushedAt] = next[b.name];
     if (t - pushedAt < COOLDOWN) next[b.name] = [since, pushedAt, b.at, t];
@@ -133,7 +150,7 @@ export function tell(told, push, back, t) {
 }
 
 /// Validate one client-supplied watch; returns a normalized one or null.
-/// { id, pool, addr, acct?, label?, after? } — acct: F2Pool's account name.
+/// { id, pool, addr, acct?, label?, after?, again? } — acct: F2Pool's account name.
 export function sanitizeWatch(w) {
   if (!w || typeof w !== "object") return null;
   const id = typeof w.id === "string" && /^[A-Za-z0-9-]{1,64}$/.test(w.id) ? w.id : null;
@@ -141,17 +158,19 @@ export function sanitizeWatch(w) {
   const addr = sanitizeTarget(w.pool, w.addr, w.acct);
   if (!addr) return null;
   const label = typeof w.label === "string" ? w.label.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 40) : "";
-  return { id, pool: w.pool, addr, label, after: AFTER.includes(w.after) ? w.after : AFTER[0] };
+  return { id, pool: w.pool, addr, label, after: AFTER.includes(w.after) ? w.after : AFTER[0],
+           again: AGAIN.includes(w.again) ? w.again : 0 };
 }
 
 /// Insert or update one watch. A watch pointed at another miner starts over: what it
-/// heard about the old one says nothing about the new. Binds: token, id, pool, addr,
-/// label, after.
+/// heard about the old one says nothing about the new. A reminder switched on (from
+/// off) dates from now: see `due`. Binds: token, id, pool, addr, label, after, again, now.
 export const upsertWatch = (guard = null) => `
-  INSERT INTO watches (token, id, pool, addr, label, after)
-  ${guard == null ? "VALUES (?1, ?2, ?3, ?4, ?5, ?6)" : `SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE ${guard}`}
+  INSERT INTO watches (token, id, pool, addr, label, after, again, again_at)
+  ${guard == null ? "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)" : `SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 WHERE ${guard}`}
   ON CONFLICT(token, id) DO UPDATE SET
     told = CASE WHEN watches.pool = excluded.pool AND watches.addr = excluded.addr THEN watches.told ELSE '{}' END,
     base = CASE WHEN watches.pool = excluded.pool AND watches.addr = excluded.addr THEN watches.base ELSE 0 END,
-    pool = excluded.pool, addr = excluded.addr, label = excluded.label, after = excluded.after`;
+    again_at = CASE WHEN watches.again > 0 AND excluded.again > 0 THEN watches.again_at ELSE excluded.again_at END,
+    pool = excluded.pool, addr = excluded.addr, label = excluded.label, after = excluded.after, again = excluded.again`;
 export const UPSERT_WATCH = upsertWatch();

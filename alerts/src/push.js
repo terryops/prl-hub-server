@@ -1,8 +1,9 @@
 import { send as apns, apnsConfigured } from "./apns.js";
 import { send as webpush, configured } from "./webpush.js";
+import { send as fcm, fcmConfigured } from "./fcm.js";
 import { purchaseProSQL } from "./purchases.js";
 export const channelConfigured = (env, device) =>
-  device.chan === "webpush" ? configured(env) : apnsConfigured(env);
+  device.chan === "webpush" ? configured(env) : device.chan === "fcm" ? fcmConfigured(env) : apnsConfigured(env);
 export async function accountPushAllowed(db, token) {
   const claim = await db.prepare(`SELECT p.token, p.revoked_at, a.id, a.revoked_at AS device_revoked, u.id AS user_id, u.deleted_at,
     (COALESCE(d.account_pro,0)=1 OR COALESCE(l.account_pro,0)=1) AS needs_pro, g.pro_at,
@@ -23,6 +24,10 @@ export async function accountPushAllowed(db, token) {
 export async function deliver(env, db, device, payload, opts) {
   if (!await accountPushAllowed(db, device.token))
     return { ok: false, drop: true, reason: "account device revoked" };
+  if (device.chan === "fcm") {
+    const row = await db.prepare("SELECT reg FROM fcm WHERE token = ?").bind(device.token).first();
+    return row ? fcm(env, row.reg, payload, opts) : { ok: false, drop: true, reason: "subscription gone" };
+  }
   if (device.chan !== "webpush") return apns(env, db, device, payload, opts);
   const sub = await db
     .prepare("SELECT endpoint, p256dh, auth FROM webpush WHERE token = ?")

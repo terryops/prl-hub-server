@@ -17,8 +17,9 @@ name = "prl-alerts"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
 
-# All domains share this Worker and D1 database. Keep the original domain for
-# installed native apps, extensions, existing browser storage and Web Push.
+# All domains share this Worker and D1 database. Since 2026-10-20 the original domain's pages
+# redirect to pearlhub.net (route()); keep the domain itself for its /v1 API: apps before 2.0 and the
+# App Store Server Notifications URL still call it, and old Web Push subscriptions use its sw.js.
 routes = [
   { pattern = "pearlhub.net/*", zone_name = "pearlhub.net" },
   { pattern = "www.pearlhub.net/*", zone_name = "pearlhub.net" },
@@ -58,9 +59,14 @@ REQUIRE_PRO = "0"
 # has logged "asn: signature verified" in production; meanwhile an unverified one is
 # accepted, but a refund / revoke in it is not acted on.
 ASN_STRICT = "0"
-# Owner selected the existing donation address for Web Pro on 2026-10-10.
+# Owner moved Web Pro payments off the donation address (prl1pmky…9pyjv) to this one on 2026-10-16.
 # Orders use a unique exact amount; unrelated donations do not grant Pro.
-PAY_ADDRESS = "prl1pmkyxyht58rzhe7cj9ha7ncpm6r28x6g0htq93ffs5hsh7lqsxj7qw9pyjv"
+PAY_ADDRESS = "prl1pj9fxetszphfvrfgtd0xwz9227l55s620uk7ga2ph42csayk63gkqglluxt"
+# Orders store no address: one quoted before PAY_ADDRESS_SINCE (unix s; the switch went live between
+# 2026-10-15 16:52 and 10-16 01:49 UTC) may still be paid to the old one, so it is read too while such an
+# order is open (7 days).
+PAY_ADDRESS_PREVIOUS = "prl1pmkyxyht58rzhe7cj9ha7ncpm6r28x6g0htq93ffs5hsh7lqsxj7qw9pyjv"
+PAY_ADDRESS_SINCE = "1792116000"
 PRO_USD = "4.99"
 PAY_CONFIRMATIONS = "1"
 # VAPID_PRIVATE and ADMIN_TOKEN belong in secrets, never here.
@@ -77,7 +83,7 @@ ACCOUNT_CONFIG_KEY_VERSION = "1"
 EMAIL_DAILY_LIMIT = "100"
 EMAIL_FROM = "login@login.prl.tools.video"
 TURNSTILE_SITE_KEY = "0x4AAAAAAFT1cMjI81y5tCJ7"
-ACCOUNT_REDIRECTS = "prlhub://account,https://njnhepcaamfibhkfbfhlmknoldgjmefc.chromiumapp.org/account"
+ACCOUNT_REDIRECTS = "prlhub://account,https://njnhepcaamfibhkfbfhlmknoldgjmefc.chromiumapp.org/account,https://amomopjmejbdinidepgbhlkgknkonhah.chromiumapp.org/account"
 # AUTH_PEPPER, ACCOUNT_CONFIG_KEY and TURNSTILE_SECRET are Worker secrets.
 
 [[send_email]]
@@ -86,15 +92,24 @@ name = "EMAIL"
 [observability]
 enabled = true
 
-# Web assets share the API origin; /v1 paths always reach the Worker. The web app
+# Web assets share the API origin; /v1 paths always reach the Worker. The pages ("/", "*.html" and
+# the extensionless /privacy and /support) reach it too, so prl.tools.video's pages can move to
+# pearlhub.net; route() hands the other domains' pages to ASSETS. The web app
 # is its own repository (prl-hub-web), checked out next to this one.
 [assets]
 directory = "../../prl-hub-web/web/dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
-run_worker_first = ["/v1", "/v1/*", "/__scheduled"]
+run_worker_first = ["/v1", "/v1/*", "/__scheduled", "/", "/*.html", "/privacy", "/support"]
 
 [[ratelimits]]
 name = "RL_READ"
 namespace_id = "7303"
 simple = { limit = 120, period = 60 }
+
+# Per-IP limit on transaction lookups (/v1/tx) and broadcasts (/v1/tx/send), each keyed apart:
+# chain.js TX_PER_IP / SEND_PER_IP. Without this binding chain.js counts in D1 instead.
+[[ratelimits]]
+name = "RL_TX"
+namespace_id = "7304"
+simple = { limit = 5, period = 60 }

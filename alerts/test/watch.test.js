@@ -9,8 +9,8 @@ import { fileURLToPath } from "node:url";
 import * as H from "./helpers.js";
 import { installFetch, setNow, restoreNow, T0, tok, call, register, tick, makeChain, signJWS, proTx } from "./helpers.js";
 import { parseMiner, sanitizeTarget, POOLS, MAX_WORKERS, ANON } from "../src/pools.js";
-import { fold, due, tell, unpack, sanitizeWatch, COOLDOWN, STEADY, RECHECK } from "../src/watch.js";
-import { offlinePayloadFor, onlinePayloadFor, fmtAgo, LANGS } from "../src/i18n.js";
+import { fold, due, tell, unpack, sanitizeWatch, COOLDOWN, STEADY, RECHECK, AFTER, AGAIN } from "../src/watch.js";
+import { offlinePayloadFor, onlinePayloadFor, stillPayloadFor, fmtAgo, LANGS } from "../src/i18n.js";
 
 afterEach(restoreNow);
 
@@ -28,8 +28,22 @@ const plain = (o) => JSON.parse(JSON.stringify(o));
 
 // ── pools ────────────────────────────────────────────────────────────────────
 
-test("pools: the seven pools the app monitors, by the app's names", () => {
-  assert.deepEqual([...POOLS].sort(), ["AlphaPool", "F2Pool", "HeroMiners", "Kryptex", "Lucky Pool", "Pearl Fortune", "PearlHash"]);
+test("pools: the eight pools the app monitors, by the app's names", () => {
+  assert.deepEqual([...POOLS].sort(), ["AlphaPool", "F2Pool", "HeroMiners", "Jetski", "Kryptex", "Lucky Pool", "Pearl Fortune", "PearlHash"]);
+});
+
+test("pools: Jetski — the name after the address, online for 10 min after the last share; zeros are missing", () => {
+  const r = parseMiner("Jetski", 200, fx("jetski_miner.json"), 1792283530);
+  assert.deepEqual(r.workers.map((w) => [w.name, w.online, w.last]), [
+    ["AP201", true, 1792283526], ["C4000F", true, 1792283473], ["NZXTH3", true, 1792283473], ["P3630", false, 1792281619],
+  ]);
+  assert.deepEqual(parseMiner("Jetski", 200, fx("jetski_miner.json"), 1792284200).workers.map((w) => w.online), [false, false, false, false]);
+  assert.deepEqual(parseMiner("Jetski", 200, fx("jetski_miner_empty.json"), 0), { missing: true });
+  assert.throws(() => parseMiner("Jetski", 400, "", 0), /http 400/);
+  // Paid out, nothing connected: a known miner with no workers, not a stranger.
+  assert.deepEqual(parseMiner("Jetski", 200, '{"total_paid_grains":5,"workers":[]}', 0), { workers: [], partial: false });
+  const odd = JSON.stringify({ workers: [{ worker: "prl1pabc", last_share_time: null }, { worker: "prl1pabc.a.b" }, { worker: "prl1pabc." }, {}] });
+  assert.deepEqual(names(parseMiner("Jetski", 200, odd, 0)), ["prl1pabc", "a.b", "default"]);
 });
 
 test("pools: AlphaPool — the pool's own online flag, last share from `time`; a stranger is missing", () => {
@@ -184,7 +198,7 @@ test("fold: an offline worker the pool stopped listing is forgotten after a week
   assert.deepEqual(plain(fold(s, [], 1000 + 7 * day, true)), { on: 0 });
 });
 
-const quiet = { push: [], back: [], wait: false };
+const quiet = { push: [], back: [], still: [], wait: false };
 
 test("due: pushed once the outage has lasted the threshold, and only once", () => {
   const state = { a: 1000, b: 0, c: -500 };
@@ -258,11 +272,56 @@ test("due: raising the threshold doesn't re-announce an outage that was already 
   assert.deepEqual(plain(due({ a: 1000 }, told, 3600, 5000)), { ...quiet, told });
 });
 
+test("due: a reminder goes out once, `again` after the first push, while the worker is still offline", () => {
+  const told = { a: [1000, 1600] };
+  assert.deepEqual(plain(due({ a: 1000 }, told, 600, 1600 + 3599, false, 3600)), { ...quiet, told });
+  const r = due({ a: 1000 }, told, 600, 1600 + 3600, false, 3600);
+  assert.deepEqual(plain(r), { ...quiet, still: [{ name: "a", since: 1000 }], told });
+  // Sent: once is all.
+  const after = tell(r.told, [], [], 5200, r.still);
+  assert.deepEqual(plain(after), { a: [1000, 1600, 0, 0, 5200] });
+  assert.deepEqual(plain(due({ a: 1000 }, after, 600, 99_000, false, 3600)), { ...quiet, told: plain(after) });
+  // Not sent (quiet hours, say): still owed at the next poll, while the worker stays down.
+  assert.deepEqual(plain(due({ a: 1000 }, told, 600, 9000, false, 3600)).still, [{ name: "a", since: 1000 }]);
+  // …and the return is still told, timed from the first drop, and then forgotten.
+  const seen = due({ a: 0 }, after, 600, 6000, false, 3600);
+  assert.deepEqual(plain(seen), { ...quiet, wait: true, told: { a: [1000, 1600, 6000, 0, 5200] } });
+  const back = due({ a: 0 }, seen.told, 600, 6060, false, 3600);
+  assert.deepEqual(plain(back.back), [{ name: "a", since: 1000, at: 6000 }]);
+  assert.deepEqual(plain(tell(back.told, [], back.back, 6060)), {});
+  // Back before the reminder was due: nothing to remind about.
+  assert.deepEqual(plain(due({ a: 0 }, told, 600, 5200, false, 3600)).still, []);
+});
+
+test("due: a worker that flickers after the reminder is still the same outage — no second reminder", () => {
+  const told = { a: [1000, 1600, 0, 0, 5200] };
+  const seen = due({ a: 0 }, told, 600, 6000, false, 1800);
+  assert.deepEqual(plain(seen.told), { a: [1000, 1600, 6000, 0, 5200] });
+  const down = due({ a: 6020 }, seen.told, 600, 6060, false, 1800);
+  assert.deepEqual(plain(down), { ...quiet, told });
+  assert.deepEqual(plain(due({ a: 6020 }, down.told, 600, 50_000, false, 1800)), { ...quiet, told });
+  // Flickering before the reminder doesn't put it off: it counts from the first push.
+  const early = due({ a: 0 }, { a: [1000, 1600] }, 600, 2000, false, 1800);
+  assert.deepEqual(plain(due({ a: 2020 }, early.told, 600, 1600 + 1800, false, 1800)).still, [{ name: "a", since: 1000 }]);
+});
+
+test("due: no reminder when it is off, for an outage only noted, or for one pushed before it was switched on", () => {
+  const told = { a: [1000, 1600], b: [500, 0] };
+  assert.deepEqual(plain(due({ a: 1000, b: 500 }, told, 600, 90_000)).still, []);
+  assert.deepEqual(plain(due({ a: 1000, b: 500 }, told, 600, 90_000, false, 1800)).still, [{ name: "a", since: 1000 }]);
+  // Switched on at 2000, after the push at 1600: that outage was known.
+  assert.deepEqual(plain(due({ a: 1000 }, told, 600, 90_000, false, 1800, 2000)).still, []);
+  assert.deepEqual(plain(due({ a: 1000 }, told, 600, 90_000, false, 1800, 1600)).still, [{ name: "a", since: 1000 }]);
+  // An entry an older worker wrote (no reminder field) reads as not reminded.
+  assert.deepEqual(plain(due({ a: 1000 }, { a: [1000, 1600, 0, 0] }, 600, 90_000, false, 1800)).still, [{ name: "a", since: 1000 }]);
+});
+
 test("tell: an outage pushed is known from then on; a return is remembered only while the cool-down runs", () => {
   const told = { a: [1000, 1600, 1800], b: [1000, 1600, 9000], c: [500, 0] };
   const next = tell(told, [{ name: "d", since: 1700 }], [{ name: "a", since: 1000, at: 1800 }, { name: "b", since: 1000, at: 9000 }], 9060);
   assert.deepEqual(plain(next), { c: [500, 0], d: [1700, 9060] });
   assert.deepEqual(plain(tell(told, [], [{ name: "a", since: 1000, at: 1800 }], 1860)).a, [1000, 1600, 1800, 1860]);
+  assert.deepEqual(plain(tell({ e: [800, 1600] }, [], [], 9060, [{ name: "e", since: 800 }])), { e: [800, 1600, 0, 0, 9060] });
   assert.deepEqual(plain(told), { a: [1000, 1600, 1800], b: [1000, 1600, 9000], c: [500, 0] }, "the input is left alone");
   assert.deepEqual(plain(tell(unpack('{"__proto__":[1,2,3]}'), [{ name: "constructor", since: 5 }], [{ name: "__proto__", since: 1, at: 3 }], 4)),
                    plain(unpack('{"__proto__":[1,2,3,4],"constructor":[5,4]}')), "names are data here too");
@@ -305,9 +364,16 @@ test("state: worker names are data — __proto__ and constructor are tracked lik
 test("sanitizeWatch: id, pool, target, label and threshold", () => {
   const a = "prl1puv0gqv4x0wd0ylwz086y3sqrg4a6umza9r08aecehjrmdqq7mctsmqaqsh";
   assert.deepEqual(sanitizeWatch({ id: "W-1", pool: "Kryptex", addr: a, label: "  机房 A\n", after: 1800 }),
-                   { id: "W-1", pool: "Kryptex", addr: a, label: "机房 A", after: 1800 });
+                   { id: "W-1", pool: "Kryptex", addr: a, label: "机房 A", after: 1800, again: 0 });
   assert.equal(sanitizeWatch({ id: "w", pool: "Kryptex", addr: a }).after, 600);
   assert.equal(sanitizeWatch({ id: "w", pool: "Kryptex", addr: a, after: 60 }).after, 600, "no threshold under 10 min");
+  assert.deepEqual(AFTER, [600, 900, 1800, 3600, 5400, 7200], "10 min up to 2 h");
+  assert.equal(sanitizeWatch({ id: "w", pool: "Kryptex", addr: a, after: 7200 }).after, 7200);
+  assert.equal(sanitizeWatch({ id: "w", pool: "Kryptex", addr: a, after: 10800 }).after, 600, "nothing past 2 h");
+  // The reminder: one of the delays on offer, else none.
+  assert.deepEqual(AGAIN, [1800, 3600, 7200, 14400]);
+  assert.equal(sanitizeWatch({ id: "w", pool: "Kryptex", addr: a, again: 3600 }).again, 3600);
+  for (const v of [undefined, 0, 60, "3600", -3600, 86400]) assert.equal(sanitizeWatch({ id: "w", pool: "Kryptex", addr: a, again: v }).again, 0, String(v));
   assert.equal(sanitizeWatch({ id: "w", pool: "Kryptex", addr: a, label: "x".repeat(99) }).label.length, 40);
   for (const bad of [null, {}, { id: "w", pool: "Nope", addr: a }, { id: "a b", pool: "Kryptex", addr: a },
                      { id: "w", pool: "Kryptex", addr: "x" }, { id: "w", pool: ["Kryptex"], addr: a }]) {
@@ -378,6 +444,27 @@ test("i18n: back-online pushes in every language, with how long the outage laste
   assert.equal(titles.size, LANGS.length * 2, "every language has its own copy");
   assert.equal(onlinePayloadFor("xx", w, one).aps.alert.title, "🟢 rig-a back online");
   assert.equal(onlinePayloadFor("zh-Hant", w, [{ name: ANON, since: 1000, at: 1760 }]).aps.alert.title, "🟢 未命名 恢復上線");
+});
+
+test("i18n: still-offline reminders in every language, in the offline thread", () => {
+  const w = { id: "w1", pool: "Kryptex", label: "" };
+  assert.deepEqual(stillPayloadFor("en", w, [{ name: "rig-a", since: 1000 }], 1000 + 4500), {
+    aps: { alert: { title: "🔴 rig-a still offline", subtitle: "Kryptex", body: "Offline for 1 h 15 min" }, sound: "default", "thread-id": "worker-offline" },
+    watch: { id: "w1", n: 1, still: true },
+  });
+  assert.deepEqual(stillPayloadFor("zh-Hans", { ...w, label: "机房 A" }, [{ name: "a", since: 1000 }, { name: "b", since: 2000 }], 1000 + 7200).aps.alert,
+                   { title: "🔴 2 台矿机仍未恢复", subtitle: "机房 A", body: "a、b\n最长已离线 2 小时" });
+  const titles = new Set();
+  for (const lang of LANGS) {
+    for (const d of [[{ name: "node-7", since: 1000 }], [{ name: "a", since: 1000 }, { name: "b", since: 1500 }]]) {
+      const { title, body } = stillPayloadFor(lang, w, d, 9000).aps.alert;
+      assert.ok(title && body, lang);
+      assert.notEqual(title, offlinePayloadFor(lang, w, d, 9000).aps.alert.title, lang);
+      if (!lang.startsWith("zh")) assert.doesNotMatch(`${title} ${body}`, /\bmin(er|ing)\b|\brig\b/i, lang);
+      titles.add(title);
+    }
+  }
+  assert.equal(titles.size, LANGS.length * 2, "every language has its own copy");
 });
 
 // ── end to end ───────────────────────────────────────────────────────────────
@@ -1078,9 +1165,9 @@ test("routes: the request the app builds (the sample its own tests check) is tak
     ["A1B2C3D4-0000-4000-8000-000000000001", "above", 1.2, 0, true],
     ["A1B2C3D4-0000-4000-8000-000000000002", "move", 5, 3600, false],
   ]);
-  assert.deepEqual(env.DB.rows("SELECT id, pool, addr, label, after FROM watches ORDER BY rowid"), [
-    { id: "6F1B7C2A-1111-4C1C-9C43-000000000001", pool: "Kryptex", addr: "prl1p8wznc8tkhlkjaq7v8ycugz93rgs8uezq6px7873934kh35nk9q2qlz0q9m", label: "Garage", after: 900 },
-    { id: "6F1B7C2A-1111-4C1C-9C43-000000000002", pool: "F2Pool", addr: "0123456789abcdef0123456789abcdef/My Rig", label: "F2Pool", after: 3600 },
+  assert.deepEqual(env.DB.rows("SELECT id, pool, addr, label, after, again FROM watches ORDER BY rowid"), [
+    { id: "6F1B7C2A-1111-4C1C-9C43-000000000001", pool: "Kryptex", addr: "prl1p8wznc8tkhlkjaq7v8ycugz93rgs8uezq6px7873934kh35nk9q2qlz0q9m", label: "Garage", after: 900, again: 3600 },
+    { id: "6F1B7C2A-1111-4C1C-9C43-000000000002", pool: "F2Pool", addr: "0123456789abcdef0123456789abcdef/My Rig", label: "F2Pool", after: 3600, again: 0 },
   ]);
   assert.deepEqual(env.DB.one("SELECT lang, oneshot, win_start, win_end, tz, original_transaction_id AS otid FROM devices"),
                    { lang: "zh-Hans", oneshot: 1, win_start: 480, win_end: 1380, tz: "Asia/Shanghai", otid: "1000001" });
@@ -1151,4 +1238,84 @@ test("routes: re-sending a watch keeps what it was told; pointing it elsewhere s
   assert.deepEqual(env.DB.rows("SELECT addr FROM miners"), [{ addr: addr(3) }]);
   await watch(env, tok(1), []);
   assert.equal(env.DB.one("SELECT COUNT(*) AS n FROM miners").n, 0);
+});
+
+test("watch: still offline `again` after the push — one reminder; its return is still announced", async () => {
+  setNow(T0);
+  const net = installFetch();
+  const env = makeEnv();
+  let rigs = [["a", true, T0]];
+  net.pool = () => kx(rigs);
+  await watch(env, tok(1), [K("w1", { again: 1800 })]);
+  await tick(env);
+  rigs = [["a", false, T0 + 60]];
+  for (let t = T0 + 180; t <= T0 + 720; t += 180) await at(env, t);
+  assert.equal(net.alerts().length, 1);
+  assert.equal(net.alerts()[0].body.aps.alert.title, "🔴 a offline");
+  assert.equal(sub(env, tok(1)).told, JSON.stringify({ a: [T0 + 60, T0 + 720] }));
+  for (let t = T0 + 900; t < T0 + 720 + 1800; t += 180) await at(env, t);
+  assert.equal(net.alerts().length, 1, "not before 30 min after the push");
+  await at(env, T0 + 2520);
+  assert.equal(net.alerts().length, 2);
+  assert.deepEqual(net.alerts()[1].body.aps.alert, { title: "🔴 a still offline", subtitle: "Kryptex", body: "Offline for 41 min" });
+  assert.deepEqual(net.alerts()[1].body.watch, { id: "w1", n: 1, still: true });
+  assert.equal(sub(env, tok(1)).told, JSON.stringify({ a: [T0 + 60, T0 + 720, 0, 0, T0 + 2520] }));
+  assert.deepEqual(JSON.parse(env.DB.one("SELECT v FROM kv WHERE k = ?", `sent:${T0 + 2520}`).v).pushes[0],
+                   { tok: tok(1).slice(0, 8), watch: "w1", n: 1, still: true, ok: true, env: "production" });
+  for (let t = T0 + 2700; t <= T0 + 9000; t += 180) await at(env, t);
+  assert.equal(net.alerts().length, 2, "a reminder is said once");
+  rigs = [["a", true, T0 + 9100]];
+  await at(env, T0 + 9180);
+  await at(env, T0 + 9240);
+  assert.equal(net.alerts().length, 3);
+  assert.equal(net.alerts()[2].body.aps.alert.title, "🟢 a back online");
+});
+
+test("watch: switching the reminder on mid-outage doesn't ring about it; the next outage gets one", async () => {
+  setNow(T0);
+  const net = installFetch();
+  const env = makeEnv();
+  let rigs = [["a", true, T0]];
+  net.pool = () => kx(rigs);
+  await watch(env, tok(1), [K()]);
+  await tick(env);
+  rigs = [["a", false, T0 + 60]];
+  for (let t = T0 + 180; t <= T0 + 900; t += 180) await at(env, t);
+  assert.equal(net.alerts().length, 1);
+  setNow(T0 + 1000);
+  await watch(env, tok(1), [K("w1", { again: 1800 })]);
+  for (let t = T0 + 1080; t <= T0 + 6000; t += 180) await at(env, t);
+  assert.equal(net.alerts().length, 1, "that outage was already known");
+  // Back, told so; past the cool-down it drops again: this one is reminded about.
+  rigs = [["a", true, T0 + 6100]];
+  await at(env, T0 + 6120);
+  await at(env, T0 + 6180);
+  assert.equal(net.alerts().length, 2);
+  rigs = [["a", false, T0 + 6200]];
+  for (let t = T0 + 6300; t <= T0 + 7000; t += 180) await at(env, t);
+  assert.equal(net.alerts().length, 3);
+  const pushedAt = JSON.parse(sub(env, tok(1)).told).a[1];
+  for (let t = T0 + 7020; t <= pushedAt + 1800 + 180; t += 180) await at(env, t);
+  assert.equal(net.alerts().length, 4);
+  assert.equal(net.alerts()[3].body.aps.alert.title, "🔴 a still offline");
+});
+
+test("routes: the reminder is stored per watch, and dated from when it was switched on", async () => {
+  setNow(T0);
+  installFetch();
+  const env = makeEnv();
+  const row = () => env.DB.one("SELECT after, again, again_at FROM watches WHERE id = 'w1'");
+  await watch(env, tok(1), [K("w1", { after: 7200 })]);
+  assert.deepEqual(row(), { after: 7200, again: 0, again_at: T0 });
+  setNow(T0 + 100);
+  await watch(env, tok(1), [K("w1", { after: 7200, again: 3600 })]);
+  assert.deepEqual(row(), { after: 7200, again: 3600, again_at: T0 + 100 });
+  setNow(T0 + 200);
+  await watch(env, tok(1), [K("w1", { after: 7200, again: 14400 })]);
+  assert.deepEqual(row(), { after: 7200, again: 14400, again_at: T0 + 100 }, "another delay is the same reminder");
+  setNow(T0 + 300);
+  await watch(env, tok(1), [K("w1", { after: 7200 })]);
+  setNow(T0 + 400);
+  await watch(env, tok(1), [K("w1", { after: 7200, again: 1800 })]);
+  assert.deepEqual(row(), { after: 7200, again: 1800, again_at: T0 + 400 }, "off and on again starts afresh");
 });

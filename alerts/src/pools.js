@@ -27,6 +27,11 @@ const list = (v) => (Array.isArray(v) ? v.filter((x) => x && typeof x === "objec
 /// A unix-seconds stamp, or null when the pool gave none.
 const stamp = (s) => (s > 0 ? Math.floor(s) : null);
 const MISSING = { missing: true };
+/// Jetski's "<address>.<name>" → the name its page shows (JetskiSource.workerName).
+export const jetskiName = (v) => {
+  const s = text(v), dot = s.indexOf(".");
+  return dot < 0 ? s || "default" : s.slice(dot + 1) || "default";
+};
 
 // Each pool: `url(addr)` (+ `headers`), `gone` — the HTTP statuses that mean "no
 // such miner here" — and `parse(json, now)` → { workers, partial? } | MISSING.
@@ -118,6 +123,26 @@ export const SOURCES = {
           const solo = text(w.scheme).toLowerCase() === "solo";
           return { name: (text(w.worker) || "—") + (solo ? " (SOLO)" : ""), online: text(w.status).toLowerCase() === "online",
                    last: stamp(num(w.last_share) / 1000) };
+        }),
+      };
+    },
+  },
+  Jetski: {
+    // Jetski Pool. 200 with zeros and no workers for an address that never mined here;
+    // 400 for one it can't parse. A worker is "<address>.<name>", stale 10 min after its
+    // last share (the pool's own page). Every worker carries its share counters, so a
+    // big farm runs past MAX_BODY: ~1.4 KB a worker, 2 MB at about 1,450 workers.
+    url: (a) => `https://pearl.jetskipool.ai/api/stats/${a}`,
+    maxBody: 4_000_000,
+    parse(o, now) {
+      const rigs = list(o.workers);
+      const known = rigs.length > 0 || ["last_share_time", "current_balance_grains", "pending_balance_grains",
+        "total_paid_grains", "rolling_24h_mined_grains", "accepted_shares"].some((k) => num(o[k]) > 0);
+      if (!known) return MISSING;
+      return {
+        workers: rigs.map((w) => {
+          const last = stamp(num(w.last_share_time));
+          return { name: jetskiName(w.worker), online: last != null && now - last < STALE, last };
         }),
       };
     },
@@ -249,7 +274,7 @@ export async function fetchMiner(pool, addr, now) {
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     status = r.status;
-    return { ok: true, ...parseMiner(pool, status, await readCapped(r, MAX_BODY), now) };
+    return { ok: true, ...parseMiner(pool, status, await readCapped(r, src.maxBody || MAX_BODY), now) };
   } catch (e) {
     return { ok: false, status, reason: String(e && e.message ? e.message : e).slice(0, 80) };
   }

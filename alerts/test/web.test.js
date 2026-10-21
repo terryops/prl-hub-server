@@ -18,6 +18,7 @@ import { checkPayments, createOrder, orderSats } from "../src/orders.js";
 import { chainHeight } from "../src/chain.js";
 import worker from "../src/index.js";
 import { sha256 } from "../src/http.js";
+import { logError } from "../src/log.js";
 import {
   b64,
   unb64,
@@ -210,6 +211,20 @@ for (const [pool, files, pending, paid, window, count, online, total] of [
       near(s.workers.find((x) => x.name === "rig-b").rates.day, 1234.5e12);
     }
   });
+test("full stats: Jetski matches Swift fixtures — 5m live, 1h, 6h; grains to PRL", () => {
+  const s = parseStats("Jetski", [f("jetski_miner.json")], 1792283530);
+  assert.deepEqual(s.windows, ["live", "hour", "h6"]);
+  near(s.pending, 4.19832521);
+  near(s.paid, 348.29822081);
+  near(value(s, "live"), 658561652053333.4);
+  near(value(s, "hour"), 634700722631111.1);
+  near(value(s, "h6"), 659754698524444.5);
+  assert.deepEqual(s.workers.map((x) => [x.name, x.online]), [["AP201", true], ["C4000F", true], ["NZXTH3", true], ["P3630", false]]);
+  near(s.workers[3].rates.h6, 75957291994074.08);
+  assert.equal(s.workers[0].rates.day, undefined);
+  assert.equal(parseStats("Jetski", [f("jetski_miner_empty.json")]).missing, true);
+});
+
 test("full stats: definitive strangers and unconfirmed F2 estimate", () => {
   for (const [pool, file] of [
     ["AlphaPool", "alphapool_miner_empty.json"],
@@ -641,6 +656,32 @@ test("error logs retain a cause and source location while redacting credentials"
     assert.equal((await call(env, "GET", "/v1/price")).status, 500);
     assert.match(logs.join("\n"), /query exploded/); assert.match(logs.join("\n"), /web.test.js/);
     assert.ok(!logs.join("\n").includes(auth)); assert.ok(!logs.join("\n").includes("token=secret"));
+  } finally { console.error = original; }
+});
+test("error logs redact our indexer's key and the FCM service account, its key a line at a time", () => {
+  const line = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7";
+  const account = JSON.stringify({ type: "service_account", private_key_id: "k3y1d0123456789abcdef",
+    private_key: `-----BEGIN PRIVATE KEY-----\n${line}\nAnotherLineOfTheKeyThatIsLongEnough==\n-----END PRIVATE KEY-----\n`,
+    client_email: "push@prl-hub.iam.gserviceaccount.com" });
+  const original = console.error, logs = []; console.error = (...args) => logs.push(args.join(" "));
+  try {
+    logError("x", new Error(`own index said no to blockbook-app-key-0123456789 / ${line} / k3y1d0123456789abcdef / push@prl-hub.iam.gserviceaccount.com`),
+      { OWN_BLOCKBOOK_KEY: "blockbook-app-key-0123456789", FCM_SERVICE_ACCOUNT: account });
+    const out = logs.join("\n");
+    assert.match(out, /own index said no/);
+    for (const secret of ["blockbook-app-key-0123456789", line, "k3y1d0123456789abcdef", "push@prl-hub.iam.gserviceaccount.com"]) assert.ok(!out.includes(secret), secret);
+  } finally { console.error = original; }
+});
+
+test("error logs keep their numbers: short settings that share a secret's name are not redacted", () => {
+  const original = console.error, logs = []; console.error = (...args) => logs.push(args.join(" "));
+  try {
+    logError("tick", new Error("D1 timeout after 1500 ms at 1792116000 with key s3cr3t-config-key-v1"),
+      { ACCOUNT_CONFIG_KEY_VERSION: "1", PAY_ADDRESS_SINCE: "1792116000", ACCOUNT_CONFIG_KEY: "s3cr3t-config-key-v1", PRO_USD: "4.99" },
+      new Request("https://x.invalid/", { headers: { cookie: "a=1; session=abcdefgh12345678" } }));
+    const out = logs.join("\n");
+    assert.match(out, /D1 timeout after 1500 ms at 1792116000/);
+    assert.ok(!out.includes("s3cr3t-config-key-v1"));
   } finally { console.error = original; }
 });
 

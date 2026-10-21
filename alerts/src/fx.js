@@ -1,4 +1,4 @@
-import { now, webJson as json } from "./http.js";
+import { now, webJson as json, sharedCopy, ownCopy } from "./http.js";
 import { readCapped, UA } from "./pools.js";
 export const FX_CODES = ["CNY", "TWD", "HKD", "RUB", "VND", "IDR", "EUR", "JPY", "KRW", "GBP", "SGD", "AUD", "CAD", "BRL", "TRY", "INR", "THB"];
 const FX_TTL = 12 * 3600; // seconds
@@ -7,7 +7,8 @@ const inFlight = new WeakMap();
 const validRates = (rates) => rates && FX_CODES.every((code) => typeof rates[code] === "number" && Number.isFinite(rates[code]) && rates[code] > 0);
 
 /// D1 survives edge eviction; failed refreshes retain the last useful rate table.
-export async function fx(env) {
+/// `ctx` keeps the shared refresh alive if the request that started it goes away (see `cached`).
+export async function fx(env, ctx) {
   const db = env.DB;
   let work = inFlight.get(db);
   if (!work) {
@@ -28,9 +29,10 @@ export async function fx(env) {
         await db.prepare("INSERT OR REPLACE INTO kv (k, v, ts) VALUES ('fx:USD', ?, ?)").bind(JSON.stringify(data), data.ts).run();
         return json(data);
       } catch { return old ? json({ ...old, stale: true }) : json({ ok: false, error: "upstream" }, 503); }
-    })();
+    })().then(sharedCopy); // Requests share the result as data, never one Response (see http.js).
     inFlight.set(db, work);
+    if (ctx?.waitUntil) ctx.waitUntil(work.catch(() => {}));
   }
-  try { return (await work).clone(); }
+  try { return ownCopy(await work); }
   finally { if (inFlight.get(db) === work) inFlight.delete(db); }
 }

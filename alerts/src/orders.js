@@ -154,16 +154,27 @@ export async function getOrder(env, gid, id) {
   }
   return json(publicOrder(env, o));
 }
+/// The pay address shown before PAY_ADDRESS, and when it stopped being shown (PAY_ADDRESS_SINCE, unix
+/// seconds). Orders carry no address of their own, so one quoted before then may have been paid there
+/// (until 2026-10-16 that was the donation address). Null when unset.
+export function previousPayAddress(env) {
+  const address = env.PAY_ADDRESS_PREVIOUS, since = Number(env.PAY_ADDRESS_SINCE);
+  return ADDRESS_RE.test(address || "") && address !== env.PAY_ADDRESS && Number.isSafeInteger(since) && since > 0
+    ? { address, since } : null;
+}
+/// The orders still open to a payment (created before `before`, when given): the earliest one's time and,
+/// when they all have one, the lowest chain tip seen at their checkout.
+const openOrders = (db, t, before = null) => db
+  .prepare(
+    `SELECT MIN(created_at) AS earliest, CASE WHEN COUNT(*) = COUNT(start_height) THEN MIN(start_height) END AS height FROM orders WHERE (status = 'seen' OR (status = 'pending' AND created_at >= ?))${before == null ? "" : " AND created_at < ?"}`,
+  )
+  .bind(t - MATCH_FOR, ...(before == null ? [] : [before]))
+  .first();
 export async function checkPayments(env) {
   if (!paymentSettings(env).enabled) return;
   const db = env.DB,
     t = now();
-  const pending = await db
-    .prepare(
-      "SELECT MIN(created_at) AS earliest, CASE WHEN COUNT(*) = COUNT(start_height) THEN MIN(start_height) END AS height FROM orders WHERE status = 'seen' OR (status = 'pending' AND created_at >= ?)",
-    )
-    .bind(t - MATCH_FOR)
-    .first();
+  const pending = await openOrders(db, t);
   if (pending?.earliest == null) return;
   const lock = await db
     .prepare(
@@ -178,26 +189,35 @@ export async function checkPayments(env) {
     Number(env.PAY_CONFIRMATIONS) >= 0
       ? Number(env.PAY_CONFIRMATIONS)
       : 1;
-  // Bound new/changed payment work as well as pages. Already settled transactions
-  // cost a single page lookup; unchanged seen payments need no writes either.
-  let work = 0;
+  // Bound new/changed payment work as well as pages, across both addresses. Already settled
+  // transactions cost a single page lookup; unchanged seen payments need no writes either.
+  const budget = { work: 0 };
+  if (!await scanAddress(env, db, t, env.PAY_ADDRESS, pending, threshold, budget)) return;
+  const previous = previousPayAddress(env);
+  if (!previous) return;
+  const legacy = await openOrders(db, t, previous.since);
+  if (legacy?.earliest != null) await scanAddress(env, db, t, previous.address, legacy, threshold, budget, previous.since);
+}
+/// Match the payments to `address` against the open orders (`pending`); false once the work budget ran
+/// out. `before`: the previous address, which only orders created before then may be paid to.
+async function scanAddress(env, db, t, address, pending, threshold, budget, before = null) {
   for (let page = 1; page <= 10; page++) {
-    const o = await chainAddress(env, env.PAY_ADDRESS, 50, page);
+    const o = await chainAddress(env, address, 50, page);
     o.transactions = o.transactions.slice(0, 50);
     const ids = [...new Set(o.transactions.map((tx) => tx.txid).filter((id) => typeof id === "string" && /^[0-9a-f]{64}$/i.test(id)))];
     const known = new Map(ids.length ? (await db.prepare(`SELECT * FROM payments WHERE txid IN (${ids.map(() => "?").join(",")})`).bind(...ids).all()).results.map((p) => [p.txid, p]) : []);
     for (const tx of o.transactions) {
       if (typeof tx.txid !== "string" || !/^[0-9a-f]{64}$/i.test(tx.txid))
         continue;
-      if (tx.vin.some((x) => x.addresses?.includes(env.PAY_ADDRESS))) continue;
-      const value = totalTo(tx.vout, env.PAY_ADDRESS);
+      if (tx.vin.some((x) => x.addresses?.includes(address))) continue;
+      const value = totalTo(tx.vout, address);
       if (value <= 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) continue;
       const sats = Number(value),
         confirmed = Number(tx.confirmations || 0) >= threshold;
       let payment = known.get(tx.txid);
       if (payment && (payment.order_id || payment.told_owner) && (payment.confirmed || !confirmed)) continue;
-      if (work >= 5) return; // continue draining on the next check, below D1 Free's query limit
-      work++;
+      if (budget.work >= 5) return false; // continue draining on the next check, below D1 Free's query limit
+      budget.work++;
       if (!payment) {
         await db
           .prepare("INSERT OR IGNORE INTO payments (txid, sats, first_seen) VALUES (?, ?, ?)")
@@ -212,13 +232,14 @@ export async function checkPayments(env) {
             .first()
         : await db
             .prepare(
-              "SELECT * FROM orders WHERE sats = ? AND status <> 'paid' AND (status = 'seen' OR created_at >= ?) AND created_at <= ? AND (txid IS NULL OR txid = ?)",
+              `SELECT * FROM orders WHERE sats = ? AND status <> 'paid' AND (status = 'seen' OR created_at >= ?) AND created_at <= ? AND (txid IS NULL OR txid = ?)${before == null ? "" : " AND created_at < ?"}`,
             )
             .bind(
               sats,
               t - MATCH_FOR,
               payment.first_seen,
               tx.txid,
+              ...(before == null ? [] : [before]),
             )
             .first();
       // A confirmed transaction must be newer than the tip observed at checkout.
@@ -261,7 +282,8 @@ export async function checkPayments(env) {
           .prepare("UPDATE payments SET confirmed = ? WHERE txid = ?")
           .bind(confirmed ? 1 : 0, tx.txid)
           .run();
-        if (!tx.confirmations || (pending.height != null ? tx.blockHeight > pending.height : tx.blockTime > pending.earliest)) {
+        if (before != null) await db.prepare("UPDATE payments SET told_owner = 1 WHERE txid = ?").bind(tx.txid).run();
+        else if (!tx.confirmations || (pending.height != null ? tx.blockHeight > pending.height : tx.blockTime > pending.earliest)) {
           const claim = await db
             .prepare(
               "UPDATE payments SET told_owner = 1 WHERE txid = ? AND told_owner = 0",
@@ -280,6 +302,7 @@ export async function checkPayments(env) {
     )
       break;
   }
+  return true;
 }
 export async function admin(env, method, path, body) {
   const db = env.DB,

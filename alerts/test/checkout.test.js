@@ -267,3 +267,47 @@ test("admin restoration: order and gid grants rebuild deleted identities at the 
   assert.equal(env.DB.one("SELECT config_rev FROM groups WHERE gid = ?", gid).config_rev, 2);
   assert.equal(env.DB.one("SELECT COUNT(*) n FROM groups WHERE pro_at IS NOT NULL").n, 2);
 });
+
+test("payments: an order quoted before the pay address changed is matched on the previous one too", async () => {
+  const prev = "prl1" + "b".repeat(38);
+  const env = makeEnv({ PAY_ADDRESS: addr, PAY_ADDRESS_PREVIOUS: prev, PAY_ADDRESS_SINCE: String(T0 + 100) });
+  setNow(T0); chain(); price(env);
+  const old = await (await createOrder(env, gid, "ip", () => 3817)).json(); // quoted with the previous address
+  setNow(T0 + 200); price(env, T0 + 200);
+  const fresh = await (await createOrder(env, "b".repeat(64), "ip", () => 3818)).json(); // shown only the new one
+  const pay = (sats, txid) => ({ txid, confirmations: 1, blockHeight: 1001, blockTime: T0 + 300,
+    vin: [{ addresses: ["sender"], value: String(sats + 100) }], vout: [{ addresses: [prev], value: String(sats) }] });
+  // Both orders' amounts arrive at the previous address, and a donation (it was the donation address).
+  const txs = [pay(old.sats, "c".repeat(64)), pay(fresh.sats, "d".repeat(64)), pay(1_000_000_000, "e".repeat(64))];
+  const apns = installFetch(), base = globalThis.fetch, asked = [];
+  globalThis.fetch = async (url, init) => {
+    const u = new URL(url);
+    if (u.hostname === "blockbook.pearlresearch.ai" && u.pathname.startsWith("/api/v2/address/")) {
+      const a = u.pathname.split("/").at(-1);
+      asked.push(a);
+      return Response.json({ transactions: a === prev ? txs : [], totalPages: 1 });
+    }
+    return base(url, init);
+  };
+  setNow(T0 + 320); await checkPayments(env);
+  assert.deepEqual(asked, [addr, prev]);
+  assert.equal(env.DB.one("SELECT status FROM orders WHERE id = ?", old.id).status, "paid");
+  assert.equal(env.DB.one("SELECT pro_src FROM groups WHERE gid = ?", gid).pro_src, "prl");
+  assert.equal(env.DB.one("SELECT status FROM orders WHERE id = ?", fresh.id).status, "pending");
+  assert.equal(env.DB.one("SELECT COUNT(*) n FROM payments WHERE told_owner = 1").n, 2, "settled without a notice");
+  // With no order from before the switch still open, the previous address isn't read any more.
+  asked.length = 0;
+  setNow(T0 + 340); await checkPayments(env);
+  assert.deepEqual(asked, [addr]);
+  // Unset, or the same as the current one: never read.
+  for (const extra of [{}, { PAY_ADDRESS_PREVIOUS: addr, PAY_ADDRESS_SINCE: String(T0 + 100) }, { PAY_ADDRESS_PREVIOUS: prev }]) {
+    const e = makeEnv({ PAY_ADDRESS: addr, ...extra });
+    setNow(T0); chain(); price(e);
+    await createOrder(e, gid, "ip", () => 3817);
+    const seen = [];
+    const b = globalThis.fetch;
+    globalThis.fetch = async (url, init) => { if (String(url).includes("/api/v2/address/")) seen.push(String(url).split("/").at(-1).split("?")[0]); return b(url, init); };
+    setNow(T0 + 20); await checkPayments(e);
+    assert.deepEqual(seen, [addr], JSON.stringify(extra));
+  }
+});

@@ -1,6 +1,6 @@
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { sampleNetwork, measuredSeries } from "../src/network.js";
+import { sampleNetwork, rollingSeries } from "../src/network.js";
 import { parseCandles } from "../src/pricehistory.js";
 import { makeEnv, call, setNow, restoreNow, T0 } from "./helpers.js";
 const original = fetch;
@@ -18,19 +18,73 @@ test("network: cron samples at most two blocks; history reads D1 only and keeps 
   globalThis.fetch = async () => { throw new Error("HTTP reads must not fetch upstream"); };
   const r = await call(e, "GET", "/v1/network/history?span=24h");
   assert.equal(r.status, 200); assert.equal(r.body.points.length, 2); assert.equal(r.body.avgBlockTime, 235);
-  assert.ok(Math.abs(r.body.points[0].hashrate - 12000000 * 2 ** 48 / 235) < 1);
+  // Two samples 14 blocks apart are not 200 blocks of history: no estimate yet.
+  assert.deepEqual(r.body.points.map((p) => [p.hashrate, p.blockTime]), [[null, null], [null, null]]);
+  assert.equal(r.body.window, 200);
   assert.equal((await call(e, "GET", "/v1/network/history?span=bad")).status, 400);
   assert.equal((await call(makeEnv(), "GET", "/v1/network/history?span=all")).body.points.length, 0);
 });
-test("network: measured neighbourhood tracks changing block times, bounds response and includes newest", async () => {
-  const points = Array.from({ length: 12 }, (_, i) => ({ height: i * 10, ts: i < 6 ? i * 1000 : 5000 + (i - 5) * 2000, difficulty: 2 }));
-  const series = measuredSeries(points);
-  assert.ok(series[0].hashrate > series.at(-1).hashrate);
+test("network: each point is the work of the 200 blocks behind it over their time, bounded and with the newest", async () => {
+  // Block times of 100 s, then 50 s for the last 200 blocks; samples every 10 blocks.
+  const samples = Array.from({ length: 101 }, (_, i) => ({ height: i * 10, ts: i <= 80 ? i * 1000 : 80000 + (i - 80) * 500, difficulty: 4e6 }));
+  const series = rollingSeries(samples, samples), at = (h) => series.find((p) => p.height === h);
+  assert.equal(at(190).hashrate, null); assert.equal(at(190).blockTime, null);
+  assert.equal(at(800).blockTime, 100); assert.equal(at(800).hashrate, 4e6 * 2 ** 48 / 100);
+  assert.equal(at(1000).blockTime, 50); assert.equal(at(1000).hashrate, 4e6 * 2 ** 48 / 50);
+  assert.equal(at(900).blockTime, 75);
+  // Sparse samples are interpolated: the window stays 200 blocks.
+  const sparse = samples.filter((p) => p.height % 300 === 0);
+  assert.equal(rollingSeries([at(800)], sparse)[0].blockTime, 100);
   setNow(T0); const e = makeEnv();
   const insert = e.DB.raw.prepare("INSERT INTO network_samples VALUES (?, ?, 2, ?)");
   for (let i = 1; i <= 3000; i++) insert.run(i, T0 - (3000 - i) * 100, T0);
   const r = await call(e, "GET", "/v1/network/history?span=all");
   assert.ok(r.body.points.length <= 256); assert.equal(r.body.firstHeight, 1); assert.equal(r.body.lastHeight, 3000);
+  assert.ok(r.body.points.filter((p) => p.height > 200).every((p) => p.blockTime === 100 && p.hashrate === 2 * 2 ** 48 / 100));
+});
+test("network: spans start with estimates from the blocks before them and share the change anchors", async () => {
+  setNow(T0); const e = makeEnv();
+  const insert = e.DB.raw.prepare("INSERT INTO network_samples VALUES (?, ?, ?, ?)");
+  // One sample per block for 40 days at 150 s, faster (120 s) over the last 10 days.
+  const start = T0 - 40 * 86400, blocks = []; let ts = start;
+  for (let h = 1; ts <= T0; h++) { blocks.push({ h, ts }); ts += T0 - ts < 10 * 86400 ? 120 : 150; }
+  for (const b of blocks) insert.run(b.h, b.ts, 3e7, T0);
+  const tip = blocks.at(-1), spans = {};
+  for (const span of ["24h", "7d", "30d", "all"]) spans[span] = (await call(e, "GET", `/v1/network/history?span=${span}`)).body;
+  for (const [span, body] of Object.entries(spans)) {
+    assert.ok(body.points.length <= 256, span);
+    assert.equal(body.points.at(-1).height, tip.h, `${span} ends at the newest block`);
+    // The first point already has 200 blocks behind it (from before the span), except at the chain's start.
+    if (span !== "all") assert.ok(body.points[0].hashrate > 0, `${span} first estimate`);
+    assert.equal(body.points.at(-1).blockTime, 120);
+  }
+  // The sample nearest each anchor is in every span that reaches it, with the same estimate.
+  const nearest = (back) => blocks.reduce((a, b) => Math.abs(b.ts - (tip.ts - back)) < Math.abs(a.ts - (tip.ts - back)) ? b : a).h;
+  for (const [back, names] of [[86400, ["24h", "7d", "30d", "all"]], [3 * 86400, ["7d", "30d", "all"]], [7 * 86400, ["7d", "30d", "all"]], [30 * 86400, ["30d", "all"]]]) {
+    const found = names.map((n) => spans[n].points.find((p) => p.height === nearest(back)));
+    assert.ok(found.every(Boolean), `anchor ${back / 86400}d in ${names}`);
+    assert.ok(found.every((p) => p.hashrate === found[0].hashrate), `anchor ${back / 86400}d agrees`);
+  }
+  // Ten days ago blocks took 150 s: the 30d anchor's estimate is the slower rate.
+  assert.equal(spans["30d"].points.find((p) => p.height === nearest(30 * 86400)).blockTime, 150);
+});
+test("network: a span reads a few hundred samples however many D1 holds (\"all\" once spread the whole table into Math.min)", async () => {
+  setNow(T0); const e = makeEnv();
+  // 150,000 samples, about 80 days of the cron's one or two a minute: past the ~125,000 that overflowed.
+  const n = 150000, insert = e.DB.raw.prepare("INSERT INTO network_samples VALUES (?, ?, 3, ?)");
+  e.DB.raw.exec("BEGIN"); for (let i = 1; i <= n; i++) insert.run(i, T0 - (n - i) * 45, T0); e.DB.raw.exec("COMMIT");
+  let read = 0;
+  const all = e.DB.raw.prepare.bind(e.DB.raw);
+  e.DB.raw.prepare = (sql) => { const st = all(sql), get = st.all.bind(st), one = st.get.bind(st);
+    st.all = (...a) => { const r = get(...a); read += r.length; return r; }; st.get = (...a) => { const r = one(...a); read += r ? 1 : 0; return r; }; return st; };
+  for (const span of ["all", "30d", "7d", "24h"]) {
+    const r = await call(e, "GET", `/v1/network/history?span=${span}`);
+    assert.equal(r.status, 200, span);
+    assert.ok(r.body.points.length > 100 && r.body.points.length <= 256, `${span}: ${r.body.points.length} points`);
+    assert.equal(r.body.lastHeight, n);
+    assert.ok(r.body.points.filter((p) => p.height > 200).every((p) => p.blockTime === 45), span);
+  }
+  assert.ok(read < 4 * 1500, `rows handed back for four spans: ${read}`);
 });
 test("price: explicit spans use sorted BigONE daily close, share 1h D1 cache and retain old reply without span", async () => {
   setNow(T0); const e = makeEnv(); let requests = 0;

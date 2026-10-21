@@ -14,7 +14,7 @@ export function parseCandles(o) {
   }).sort((a, b) => a[0] - b[0]);
 }
 /// BigONE daily close in USDT; never spliced into the native same-source 24h series.
-export async function longPriceHistory(env, span) {
+export async function longPriceHistory(env, span, ctx) {
   if (!SPANS[span]) return json({ error: "bad span" }, 400);
   const db = env.DB;
   let work = building.get(db);
@@ -38,6 +38,8 @@ export async function longPriceHistory(env, span) {
       } catch { if (old) return { ...old, stale: true }; throw new Error("upstream"); }
     })();
     building.set(db, work);
+    // Finish the refresh for the requests waiting on it even if this one goes away first.
+    if (ctx?.waitUntil) ctx.waitUntil(work.catch(() => {}));
   }
   try { const data = await work; return json({ ...data, span, points: data.points.slice(-SPANS[span]) }); }
   catch { return json({ error: "upstream" }, 502); }

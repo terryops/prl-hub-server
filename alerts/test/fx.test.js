@@ -31,3 +31,16 @@ test("fx: concurrent reads share one fetch, malformed/base-mismatched rates neve
     assert.equal(e.DB.one("SELECT ts FROM kv WHERE k = 'fx:USD'").ts, T0);
   }
 });
+test("fx and the long price history: the shared refresh is handed to waitUntil, so a reader that leaves cannot strand the rest", async () => {
+  setNow(T0);
+  const { fx } = await import("../src/fx.js"), { longPriceHistory } = await import("../src/pricehistory.js");
+  const rates = Object.fromEntries(FX_CODES.map((c) => [c, 2]));
+  for (const [read, reply] of [[(env, ctx) => fx(env, ctx), () => Response.json({ rates })],
+    [(env, ctx) => longPriceHistory(env, "7d", ctx), () => Response.json({ code: 0, data: [{ open: "1", close: "1", high: "1", low: "1", volume: "1", time: new Date(T0 * 1000).toISOString() }] })]]) {
+    globalThis.fetch = async () => reply();
+    const kept = [], ctx = { waitUntil: (p) => kept.push(p) };
+    await read(makeEnv(), ctx);
+    assert.equal(kept.length, 1);
+    await kept[0];
+  }
+});

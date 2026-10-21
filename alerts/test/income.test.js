@@ -38,3 +38,32 @@ test("income: recent/lifetime caches have independent TTLs, deduplicate and hash
   await call(e, "POST", "/v1/address/income", { addr });
   assert.equal(requests, 2); assert.deepEqual(ttls.sort(), ["public, max-age=60", "public, max-age=600"]);
 });
+test("income: concurrent requests sharing cold addresses never read each other's Response", async () => {
+  // Model the Workers rule in Node: a Response may only be read by the request that created it.
+  // Before the fix the second request cloned the first one's Response and got 502.
+  const { AsyncLocalStorage } = await import("node:async_hooks");
+  const als = new AsyncLocalStorage(), owner = new WeakMap(), Base = globalThis.Response, proto = Base.prototype, saved = {};
+  for (const m of ["text", "json", "arrayBuffer", "clone"]) {
+    saved[m] = proto[m];
+    proto[m] = function (...args) {
+      const o = owner.get(this);
+      if (o !== undefined && o !== als.getStore()) throw new Error("Cannot perform I/O on behalf of a different request");
+      const r = saved[m].apply(this, args);
+      if (m === "clone") owner.set(r, o);
+      return r;
+    };
+  }
+  globalThis.Response = class extends Base {
+    constructor(...args) { super(...args); owner.set(this, als.getStore()); }
+    static json(...args) { const r = Base.json(...args); owner.set(r, als.getStore()); return r; }
+  };
+  try {
+    setNow(T0); const e = makeEnv(), own = [addr, other];
+    let requests = 0;
+    globalThis.fetch = async () => { requests++; await new Promise((r) => setTimeout(r, 20)); return Response.json([leg(T0 - 1, "100000000")]); };
+    const replies = await Promise.all(own.map((a, i) => als.run(i + 1, () => call(e, "POST", "/v1/address/income", { addr: a, own }))));
+    assert.deepEqual(replies.map((r) => r.status), [200, 200]);
+    assert.deepEqual(replies.map((r) => r.body.d7), [1, 1]);
+    assert.equal(requests, 4); // both recent histories are shared; each request adds its own lifetime total
+  } finally { globalThis.Response = Base; Object.assign(proto, saved); }
+});

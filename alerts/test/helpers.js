@@ -121,7 +121,7 @@ export function installFetch() {
 }
 
 const POOL_HOSTS = ["pearl.alphapool.tech", "pearl.luckypool.io", "pearl.herominers.com", "pearlfortune.org",
-                    "pearlhash.xyz", "prl-api.kryptex.network", "www.f2pool.com"];
+                    "pearlhash.xyz", "prl-api.kryptex.network", "www.f2pool.com", "pearl.jetskipool.ai"];
 
 // ── worker ───────────────────────────────────────────────────────────────────
 

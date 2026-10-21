@@ -13,6 +13,12 @@ export function clientCopy(res) {
   out.headers.set("cache-control", "no-store");
   return out;
 }
+// Concurrent requests may share one upstream fetch, but only as plain data. A Response and its
+// body belong to the request that made them: another request reading them fails ("Cannot perform
+// I/O on behalf of a different request"), and when that failure ends the request doing the fetch,
+// the others waiting on it hang. Each request builds its own Response from the shared copy.
+export const sharedCopy = async (res) => ({ status: res.status, headers: [...res.headers], text: await res.text() });
+export const ownCopy = (copy) => new Response(copy.text, { status: copy.status, headers: copy.headers });
 const building = new Map();
 export async function cached(key, ttl, ctx, build) {
   const cache = typeof caches !== "undefined" ? caches.default : null;
@@ -24,17 +30,19 @@ export async function cached(key, ttl, ctx, build) {
   if (!work) {
     work = (async () => {
       const body = await build();
-      if (body instanceof Response) return body;
+      if (body instanceof Response) return sharedCopy(body);
       const res = json(body, 200, { "cache-control": `public, max-age=${ttl}` });
       if (cache) {
         const put = cache.put(req, res.clone());
         if (ctx?.waitUntil) ctx.waitUntil(put);
         else await put;
       }
-      return res;
+      return sharedCopy(res);
     })();
     building.set(req.url, work);
+    // Finish the fetch for the requests waiting on it even if this request goes away first.
+    if (ctx?.waitUntil) ctx.waitUntil(work.catch(() => {}));
   }
-  try { const res = await work; return res.ok ? clientCopy(res.clone()) : res.clone(); }
+  try { const res = ownCopy(await work); return res.ok ? clientCopy(res) : res; }
   finally { if (building.get(req.url) === work) building.delete(req.url); }
 }

@@ -6,10 +6,10 @@ export async function revokeApple(env, ref) {
   const db = env.DB;
   await db.prepare("INSERT INTO apple_purchases(original_tx, revoked_at) VALUES(?,?) ON CONFLICT(original_tx) DO UPDATE SET revoked_at=excluded.revoked_at").bind(ref,now()).run();
   await revokeAccountApple(env, ref);
-  const owned = "SELECT token FROM devices WHERE chan = 'webpush' AND gid IN (SELECT gid FROM groups WHERE pro_src = 'apple' AND pro_ref = ?)";
+  const owned = "SELECT token FROM devices WHERE chan IN ('webpush', 'fcm') AND gid IN (SELECT gid FROM groups WHERE pro_src = 'apple' AND pro_ref = ?)";
   await db.batch([
     db.prepare("INSERT INTO apple_purchases (original_tx, revoked_at) VALUES (?, ?) ON CONFLICT(original_tx) DO UPDATE SET revoked_at = excluded.revoked_at").bind(ref, now()),
-    ...["rules", "deferred", "watches", "webpush", "devices"].map((table) => db.prepare(`DELETE FROM ${table} WHERE token IN (${owned})`).bind(ref)),
+    ...["rules", "deferred", "watches", "webpush", "fcm", "devices"].map((table) => db.prepare(`DELETE FROM ${table} WHERE token IN (${owned})`).bind(ref)),
     db.prepare("UPDATE groups SET pro_at = NULL, pro_src = NULL, pro_ref = NULL WHERE pro_src = 'apple' AND pro_ref = ?").bind(ref),
   ]);
   // A refunded receipt must not delete devices authorized by another account

@@ -185,6 +185,7 @@ export function deferredPayloadFor(lang, q, usd, hm) {
 // many(n, names, d)    several at once; d = the longest
 // back / backMany      the same two for workers that are online again; d = how
 //                      long the outage lasted
+// still / stillMany    the reminder for workers that are still offline; d = so far
 // more(n, rest)        the tail of a name list cut to NAMES_SHOWN
 // units, gap, join     minutes, hours, days, and how fmtAgo spaces them
 // Outside Chinese the copy says "worker", as the app does.
@@ -196,6 +197,8 @@ const W = {
     many: (n, names, d) => [`${n} workers offline`, `${names}\nLongest: ${d}`],
     back: (name, d) => [`${name} back online`, `Was offline for ${d}`],
     backMany: (n, names, d) => [`${n} workers back online`, `${names}\nLongest outage: ${d}`],
+    still: (name, d) => [`${name} still offline`, `Offline for ${d}`],
+    stillMany: (n, names, d) => [`${n} workers still offline`, `${names}\nLongest: ${d}`],
   },
   "zh-Hans": {
     units: ["分钟", "小时", "天"], sep: "、", more: (n) => ` 等 ${n} 台`, anon: "未命名",
@@ -203,6 +206,8 @@ const W = {
     many: (n, names, d) => [`${n} 台矿机掉线`, `${names}\n最长已离线 ${d}`],
     back: (name, d) => [`${name} 恢复上线`, `共离线 ${d}`],
     backMany: (n, names, d) => [`${n} 台矿机恢复上线`, `${names}\n最长离线 ${d}`],
+    still: (name, d) => [`${name} 仍未恢复`, `已离线 ${d}`],
+    stillMany: (n, names, d) => [`${n} 台矿机仍未恢复`, `${names}\n最长已离线 ${d}`],
   },
   "zh-Hant": {
     units: ["分鐘", "小時", "天"], sep: "、", more: (n) => ` 等 ${n} 台`, anon: "未命名",
@@ -210,6 +215,8 @@ const W = {
     many: (n, names, d) => [`${n} 台礦機離線`, `${names}\n最長已離線 ${d}`],
     back: (name, d) => [`${name} 恢復上線`, `共離線 ${d}`],
     backMany: (n, names, d) => [`${n} 台礦機恢復上線`, `${names}\n最長離線 ${d}`],
+    still: (name, d) => [`${name} 仍未恢復`, `已離線 ${d}`],
+    stillMany: (n, names, d) => [`${n} 台礦機仍未恢復`, `${names}\n最長已離線 ${d}`],
   },
   ru: {
     units: ["мин", "ч", "дн"], sep: ", ", more: (_n, rest) => ` +${rest}`, anon: "без имени",
@@ -217,6 +224,8 @@ const W = {
     many: (n, names, d) => [`Воркеров офлайн: ${n}`, `${names}\nДольше всех: ${d}`],
     back: (name, d) => [`${name} снова в сети`, `Был не в сети ${d}`],
     backMany: (n, names, d) => [`Воркеров снова в сети: ${n}`, `${names}\nДольше всех: ${d}`],
+    still: (name, d) => [`${name} всё ещё офлайн`, `Не в сети ${d}`],
+    stillMany: (n, names, d) => [`Воркеров всё ещё офлайн: ${n}`, `${names}\nДольше всех: ${d}`],
   },
   vi: {
     units: ["phút", "giờ", "ngày"], sep: ", ", more: (_n, rest) => ` +${rest}`, anon: "không tên",
@@ -224,6 +233,8 @@ const W = {
     many: (n, names, d) => [`${n} worker ngoại tuyến`, `${names}\nLâu nhất: ${d}`],
     back: (name, d) => [`${name} trực tuyến trở lại`, `Đã ngoại tuyến trong ${d}`],
     backMany: (n, names, d) => [`${n} worker trực tuyến trở lại`, `${names}\nLâu nhất: ${d}`],
+    still: (name, d) => [`${name} vẫn ngoại tuyến`, `Đã ngoại tuyến ${d}`],
+    stillMany: (n, names, d) => [`${n} worker vẫn ngoại tuyến`, `${names}\nLâu nhất: ${d}`],
   },
   id: {
     units: ["mnt", "jam", "hr"], sep: ", ", more: (_n, rest) => ` +${rest}`, anon: "tanpa nama",
@@ -231,6 +242,8 @@ const W = {
     many: (n, names, d) => [`${n} worker offline`, `${names}\nTerlama: ${d}`],
     back: (name, d) => [`${name} kembali online`, `Sempat offline selama ${d}`],
     backMany: (n, names, d) => [`${n} worker kembali online`, `${names}\nTerlama: ${d}`],
+    still: (name, d) => [`${name} masih offline`, `Offline selama ${d}`],
+    stillMany: (n, names, d) => [`${n} worker masih offline`, `${names}\nTerlama: ${d}`],
   },
   es: {
     units: ["min", "h", "d"], sep: ", ", more: (_n, rest) => ` +${rest}`, anon: "(sin nombre)",
@@ -238,6 +251,8 @@ const W = {
     many: (n, names, d) => [`${n} workers sin conexión`, `${names}\nTiempo máximo: ${d}`],
     back: (name, d) => [`${name} de nuevo en línea`, `Estuvo sin conexión ${d}`],
     backMany: (n, names, d) => [`${n} workers de nuevo en línea`, `${names}\nDesconexión más larga: ${d}`],
+    still: (name, d) => [`${name} sigue sin conexión`, `Sin conexión desde hace ${d}`],
+    stillMany: (n, names, d) => [`${n} workers siguen sin conexión`, `${names}\nTiempo máximo: ${d}`],
   },
   "pt-BR": {
     units: ["min", "h", "d"], sep: ", ", more: (_n, rest) => ` +${rest}`, anon: "sem nome",
@@ -245,6 +260,8 @@ const W = {
     many: (n, names, d) => [`${n} workers offline`, `${names}\nMaior tempo offline: ${d}`],
     back: (name, d) => [`${name} online de novo`, `Ficou offline por ${d}`],
     backMany: (n, names, d) => [`${n} workers online de novo`, `${names}\nMaior tempo offline: ${d}`],
+    still: (name, d) => [`${name} continua offline`, `Offline há ${d}`],
+    stillMany: (n, names, d) => [`${n} workers continuam offline`, `${names}\nMaior tempo offline: ${d}`],
   },
   fr: {
     units: ["min", "h", "j"], sep: ", ", more: (_n, rest) => ` +${rest}`, anon: "sans nom",
@@ -252,6 +269,8 @@ const W = {
     many: (n, names, d) => [`${n} workers hors ligne`, `${names}\nLe plus long : ${d}`],
     back: (name, d) => [`${name} de retour en ligne`, `Hors ligne pendant ${d}`],
     backMany: (n, names, d) => [`${n} workers de retour en ligne`, `${names}\nCoupure la plus longue : ${d}`],
+    still: (name, d) => [`${name} toujours hors ligne`, `Hors ligne depuis ${d}`],
+    stillMany: (n, names, d) => [`${n} workers toujours hors ligne`, `${names}\nLe plus long : ${d}`],
   },
   de: {
     units: ["Min.", "Std.", "Tg."], sep: ", ", more: (_n, rest) => ` +${rest}`, anon: "unbenannt",
@@ -259,6 +278,8 @@ const W = {
     many: (n, names, d) => [`${n} Worker offline`, `${names}\nAm längsten: ${d}`],
     back: (name, d) => [`${name} wieder online`, `War ${d} offline`],
     backMany: (n, names, d) => [`${n} Worker wieder online`, `${names}\nLängster Ausfall: ${d}`],
+    still: (name, d) => [`${name} immer noch offline`, `Seit ${d} offline`],
+    stillMany: (n, names, d) => [`${n} Worker immer noch offline`, `${names}\nAm längsten: ${d}`],
   },
   it: {
     units: ["min", "h", "gg"], sep: ", ", more: (_n, rest) => ` +${rest}`, anon: "senza nome",
@@ -266,6 +287,8 @@ const W = {
     many: (n, names, d) => [`${n} worker offline`, `${names}\nDurata massima: ${d}`],
     back: (name, d) => [`${name} di nuovo online`, `È rimasto offline per ${d}`],
     backMany: (n, names, d) => [`${n} worker di nuovo online`, `${names}\nInterruzione più lunga: ${d}`],
+    still: (name, d) => [`${name} ancora offline`, `Offline da ${d}`],
+    stillMany: (n, names, d) => [`${n} worker ancora offline`, `${names}\nDurata massima: ${d}`],
   },
   tr: {
     units: ["dk", "sa", "g"], sep: ", ", more: (_n, rest) => ` +${rest}`, anon: "adsız",
@@ -273,6 +296,8 @@ const W = {
     many: (n, names, d) => [`${n} worker çevrimdışı`, `${names}\nEn uzun: ${d}`],
     back: (name, d) => [`${name} yeniden çevrimiçi`, `Çevrimdışı kaldığı süre: ${d}`],
     backMany: (n, names, d) => [`${n} worker yeniden çevrimiçi`, `${names}\nEn uzun kesinti: ${d}`],
+    still: (name, d) => [`${name} hâlâ çevrimdışı`, `Çevrimdışı süresi: ${d}`],
+    stillMany: (n, names, d) => [`${n} worker hâlâ çevrimdışı`, `${names}\nEn uzun: ${d}`],
   },
   ja: {
     units: ["分", "時間", "日"], gap: "", join: "", sep: "、", more: (_n, rest) => ` ほか${rest}台`, anon: "名前なし",
@@ -280,6 +305,8 @@ const W = {
     many: (n, names, d) => [`ワーカー${n}台がオフライン`, `${names}\n最長：${d}`],
     back: (name, d) => [`${name}がオンラインに復帰`, `${d}間オフラインでした`],
     backMany: (n, names, d) => [`ワーカー${n}台がオンラインに復帰`, `${names}\n最長オフライン：${d}`],
+    still: (name, d) => [`${name}はまだオフライン`, `${d}間オフラインです`],
+    stillMany: (n, names, d) => [`ワーカー${n}台がまだオフライン`, `${names}\n最長：${d}`],
   },
   ko: {
     units: ["분", "시간", "일"], gap: "", sep: ", ", more: (_n, rest) => ` 외 ${rest}개`, anon: "이름 없음",
@@ -287,6 +314,8 @@ const W = {
     many: (n, names, d) => [`워커 ${n}개 오프라인`, `${names}\n최장: ${d}`],
     back: (name, d) => [`${name} 다시 온라인`, `${d} 동안 오프라인이었습니다`],
     backMany: (n, names, d) => [`워커 ${n}개 다시 온라인`, `${names}\n최장 오프라인: ${d}`],
+    still: (name, d) => [`${name} 아직 오프라인`, `${d}째 오프라인`],
+    stillMany: (n, names, d) => [`워커 ${n}개 아직 오프라인`, `${names}\n최장: ${d}`],
   },
   hi: {
     units: ["मिनट", "घंटे", "दिन"], sep: ", ", more: (_n, rest) => ` +${rest}`, anon: "बेनाम",
@@ -294,6 +323,8 @@ const W = {
     many: (n, names, d) => [`${n} वर्कर ऑफ़लाइन`, `${names}\nसबसे ज़्यादा: ${d} से`],
     back: (name, d) => [`${name} फिर ऑनलाइन`, `${d} तक ऑफ़लाइन रहा`],
     backMany: (n, names, d) => [`${n} वर्कर फिर ऑनलाइन`, `${names}\nसबसे लंबा आउटेज: ${d} का`],
+    still: (name, d) => [`${name} अब भी ऑफ़लाइन`, `${d} से ऑफ़लाइन`],
+    stillMany: (n, names, d) => [`${n} वर्कर अब भी ऑफ़लाइन`, `${names}\nसबसे ज़्यादा: ${d} से`],
   },
   th: {
     units: ["นาที", "ชม.", "วัน"], sep: ", ", more: (_n, rest) => ` +${rest}`, anon: "ไม่มีชื่อ",
@@ -301,6 +332,8 @@ const W = {
     many: (n, names, d) => [`เวิร์กเกอร์ออฟไลน์ ${n} เครื่อง`, `${names}\nนานที่สุด: ${d}`],
     back: (name, d) => [`${name} กลับมาออนไลน์`, `ออฟไลน์ไป ${d}`],
     backMany: (n, names, d) => [`เวิร์กเกอร์กลับมาออนไลน์ ${n} เครื่อง`, `${names}\nออฟไลน์นานที่สุด: ${d}`],
+    still: (name, d) => [`${name} ยังออฟไลน์อยู่`, `ออฟไลน์มาแล้ว ${d}`],
+    stillMany: (n, names, d) => [`เวิร์กเกอร์ยังออฟไลน์ ${n} เครื่อง`, `${names}\nนานที่สุด: ${d}`],
   },
 };
 
@@ -357,6 +390,16 @@ export function onlinePayloadFor(lang, watch, back) {
   return {
     aps: { alert, sound: "default", "thread-id": "worker-offline" },
     watch: { id: watch.id, n: back.length, back: true },
+  };
+}
+
+/// …and the one reminder, for workers still offline some time after that push.
+/// still: [{ name, since }] (at least one); t: now.
+export function stillPayloadFor(lang, watch, still, t) {
+  const alert = about(lang, watch, still, t - Math.min(...still.map((x) => x.since)), DOWN, "still", "stillMany");
+  return {
+    aps: { alert, sound: "default", "thread-id": "worker-offline" },
+    watch: { id: watch.id, n: still.length, still: true },
   };
 }
 

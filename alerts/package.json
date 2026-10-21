@@ -5,7 +5,7 @@
   "scripts": {
     "test": "node --test test/*.test.js",
     "dev": "wrangler dev --test-scheduled",
-    "deploy": "npm --prefix ../../prl-hub-web/extension ci && npm --prefix ../../prl-hub-web/web ci && npm --prefix ../../prl-hub-web/web run build && wrangler d1 migrations apply prl-alerts --remote && wrangler deploy"
+    "deploy": "npm --prefix ../../prl-hub-wallet ci && npm --prefix ../../prl-hub-web/web ci && npm --prefix ../../prl-hub-web/web run build && wrangler d1 migrations apply prl-alerts --remote && wrangler deploy"
   },
   "devDependencies": {
     "wrangler": "^4.134.0"
