@@ -3,6 +3,10 @@
 // Rule kinds:
 //   above  value = USD   fire when price >= value
 //   below  value = USD   fire when price <= value
+//   reach  value = USD   fire when price reaches value from either side (到达目标价:
+//                        涨破 or 跌破). `armed` also holds the side the price was on
+//                        when the rule armed (REACH_BELOW / REACH_ABOVE), so the
+//                        condition holds until delivered, like above/below do.
 //   move   value = %     fire when |change over `window` seconds| >= value
 //                        (window: 300 = 5 min, 3600 = 1h, 86400 = 24h)
 //
@@ -12,12 +16,16 @@
 // after the condition has clearly reset, so a price hovering on a threshold
 // cannot spam the phone:
 //   above/below  re-arm once price is back past the threshold by HYST (2%)
+//   reach        re-arm once price is HYST away from the target, on either side
 //   move         re-arm once |change| falls under half the threshold
 // plus a minimum COOLDOWN between two notifications of the same rule.
 
 export const HYST = 0.02;
 export const WINDOWS = [300, 3600, 86400];
-const COOLDOWN = { above: 1800, below: 1800 };
+const COOLDOWN = { above: 1800, below: 1800, reach: 1800 };
+/// A reach rule's `armed` once it knows which side of the target the price is on.
+/// 1 = armed, side not known yet (a new rule).
+export const REACH_BELOW = 2, REACH_ABOVE = 3;
 // 1h → 15 min, 24h → 6 h; never under 15 min, so a choppy 5-min window can't spam.
 const moveCooldown = (window) => Math.max(window / 4, 900);
 
@@ -26,9 +34,9 @@ export function pctChange(usd, ref) {
   return ref ? ((usd - ref) / ref) * 100 : null;
 }
 
-/// ctx: { usd, now, change: { 3600: pct|null, 86400: pct|null } }
+/// ctx: { usd, now, prev?: usd of the tick before, change: { 3600: pct|null, 86400: pct|null } }
 /// rule: { kind, value, window, armed, last_fired }
-/// → { fire: bool, armed: bool, change?: pct }
+/// → { fire: bool, armed: bool | number, change?: pct (move) or ±1 (reach: up or down) }
 export function evaluate(rule, ctx) {
   const { usd, now } = ctx;
   const armed = !!rule.armed;
@@ -42,6 +50,24 @@ export function evaluate(rule, ctx) {
     case "below": {
       if (armed) return { fire: usd <= rule.value && cooled, armed: !(usd <= rule.value && cooled) };
       return { fire: false, armed: usd > rule.value * (1 + HYST) };
+    }
+    case "reach": {
+      const v = rule.value;
+      if (!armed) {
+        const away = Math.abs(usd - v) > v * HYST;
+        return { fire: false, armed: away ? (usd > v ? REACH_ABOVE : REACH_BELOW) : 0 };
+      }
+      let side = rule.armed;
+      if (side !== REACH_BELOW && side !== REACH_ABOVE) {
+        // A new rule: the side the price was on at the tick before — the price the
+        // user saw when setting it up — so a crossing since then still counts.
+        const ref = ctx.prev ?? usd;
+        side = ref > v ? REACH_ABOVE : ref < v ? REACH_BELOW : 0;   // 0: right at the target
+      }
+      const hit = side === REACH_BELOW ? usd >= v : side === REACH_ABOVE ? usd <= v : true;
+      const dir = side === REACH_BELOW ? 1 : side === REACH_ABOVE ? -1 : usd >= v ? 1 : -1;
+      if (hit && cooled) return { fire: true, armed: 0, change: dir };
+      return { fire: false, armed: side || 1, change: dir };
     }
     case "move": {
       const ch = ctx.change[rule.window];
@@ -112,7 +138,7 @@ export function sanitizeRule(r) {
     ? Math.floor(r.seen_fired) : 0;
   // Thresholds are set to at most 2 decimals (cents / hundredths of a percent).
   const v = Math.round(value * 100) / 100;
-  if (r.kind === "above" || r.kind === "below") {
+  if (r.kind === "above" || r.kind === "below" || r.kind === "reach") {
     if (!(v >= 0.01 && v < 1e6)) return null;
     return { id, kind: r.kind, value: v, window: 0, enabled, seen_fired, repeating };
   }

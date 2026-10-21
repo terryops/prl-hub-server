@@ -198,7 +198,9 @@ async function tick(env) {
   await db.batch(writes);
 
   const dead = new Set();
-  const alerts = await pushAlerts(env, db, t, px.usd, change, dead);
+  // The price before this tick, for a reach rule that doesn't know its side yet.
+  const before = prev && t - prev.ts <= PREV_MAX_AGE ? prev.usd : null;
+  const alerts = await pushAlerts(env, db, t, px.usd, change, dead, before);
   // Each stage stands alone: a failure in one must never stop the others.
   let delivered = 0;
   if (apnsConfigured(env) || webpushConfigured(env) || fcmConfigured(env)) {
@@ -215,7 +217,7 @@ async function tick(env) {
 }
 
 /// Evaluate every enabled rule; queue what fires in quiet hours, push the rest.
-async function pushAlerts(env, db, t, usd, change, dead) {
+async function pushAlerts(env, db, t, usd, change, dead, prev = null) {
   const { results: rules } = await db
     .prepare(
       `SELECT r.token, r.id, r.kind, r.value, r.window, r.enabled, r.armed, r.last_fired, r.repeating,
@@ -226,16 +228,18 @@ async function pushAlerts(env, db, t, usd, change, dead) {
     )
     .all();
 
-  const ctx = { usd, now: t, change };
+  const ctx = { usd, now: t, prev, change };
   const rearm = [];
   let fired = [];
+  // armed is 0/1, or for a reach rule the side it armed on (rules.js REACH_*).
+  const armedOf = (a) => (typeof a === "number" ? a : a ? 1 : 0);
   for (const r of rules) {
     const res = evaluate(r, ctx);
     if (res.fire) fired.push({ r, change: res.change });
-    else if (!!res.armed !== !!r.armed) {
+    else if (armedOf(res.armed) !== armedOf(r.armed)) {
       // Only the rule as evaluated: not one a PUT has since replaced, nor one another tick fired.
       rearm.push(db.prepare("UPDATE rules SET armed = ? WHERE token = ? AND id = ? AND kind = ? AND value = ? AND window = ? AND armed = ? AND repeating IS ?")
-        .bind(res.armed ? 1 : 0, r.token, r.id, r.kind, r.value, r.window, r.armed ? 1 : 0, r.repeating));
+        .bind(armedOf(res.armed), r.token, r.id, r.kind, r.value, r.window, armedOf(r.armed), r.repeating));
     }
   }
   fired = fired.filter(({ r }) => channelConfigured(env, r));
@@ -263,8 +267,8 @@ async function pushAlerts(env, db, t, usd, change, dead) {
   // so it loses to a PUT that changed the rule and to a tick that already fired it.
   const claim = ({ r }) =>
     db.prepare(`UPDATE rules SET armed = 0, enabled = CASE WHEN ? THEN 0 ELSE enabled END, last_fired = ?
-                 WHERE token = ? AND id = ? AND kind = ? AND value = ? AND window = ? AND enabled = 1 AND armed = 1 AND repeating IS ?`)
-      .bind(r.oneshot ? 1 : 0, t, r.token, r.id, r.kind, r.value, r.window, r.repeating);
+                 WHERE token = ? AND id = ? AND kind = ? AND value = ? AND window = ? AND enabled = 1 AND armed = ? AND repeating IS ?`)
+      .bind(r.oneshot ? 1 : 0, t, r.token, r.id, r.kind, r.value, r.window, armedOf(r.armed), r.repeating);
   const queue = ({ r, change: ch }) =>
     db.prepare(`INSERT OR REPLACE INTO deferred (token, rule_id, kind, value, window, change, fired_at)
                 SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM rules WHERE token = ? AND id = ? AND last_fired = ? AND armed = 0)`)
@@ -290,9 +294,10 @@ async function pushAlerts(env, db, t, usd, change, dead) {
     } else if (out.retry) {
       // Not delivered: undo this tick's claim (still ours if last_fired is this
       // tick's) so the rule fires again next tick.
-      writes.push(db.prepare(`UPDATE rules SET armed = 1, enabled = CASE WHEN ? THEN 1 ELSE enabled END, last_fired = ?
+      // armed goes back to what it was (for a reach rule: the side it armed on).
+      writes.push(db.prepare(`UPDATE rules SET armed = ?, enabled = CASE WHEN ? THEN 1 ELSE enabled END, last_fired = ?
                                WHERE token = ? AND id = ? AND last_fired = ? AND repeating IS ?`)
-        .bind(r.oneshot ? 1 : 0, r.last_fired ?? null, r.token, r.id, t, r.repeating));
+        .bind(armedOf(r.armed) || 1, r.oneshot ? 1 : 0, r.last_fired ?? null, r.token, r.id, t, r.repeating));
       if (out.backoff) writes.push(db.prepare("UPDATE devices SET retry_after = ? WHERE token = ?").bind(t + out.backoff, r.token));
       console.log("apns retry", r.token.slice(0, 8), out.status, out.reason);
     } else {

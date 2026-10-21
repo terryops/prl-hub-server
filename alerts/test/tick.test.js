@@ -2,6 +2,7 @@ import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { makeEnv, installFetch, setNow, restoreNow, T0, tok, liveTok, call, register, tick } from "./helpers.js";
 import { BACKOFF_429, resetTokenCache } from "../src/apns.js";
+import { REACH_BELOW, REACH_ABOVE } from "../src/rules.js";
 
 afterEach(restoreNow);
 
@@ -58,12 +59,74 @@ test("tick: one-shot and repeating rules coexist, with reset and cooldown before
   assert.equal(ruleOf(env, tok(0), "once").enabled, 0);
 });
 
+test("tick: 到达目标价 fires rising and falling, and a failed push keeps the side it armed on", async () => {
+  setNow(T0);
+  const net = installFetch(), env = makeEnv();
+  const title = (i) => net.alerts()[i].body.aps.alert.title;
+  net.price = 0.55;
+  await tick(env);                                     // the price the user sees
+  await register(env, tok(0), [{ id: "r", kind: "reach", value: 0.6, repeat: true }]);
+  setNow(T0 + 60);
+  await tick(env);
+  assert.equal(net.alerts().length, 0);
+  assert.equal(ruleOf(env, tok(0)).armed, REACH_BELOW);
+  net.price = 0.61;
+  setNow(T0 + 120);
+  await tick(env);
+  assert.equal(net.alerts().length, 1);
+  assert.equal(title(0), "PRL above $0.60");
+  assert.deepEqual(ruleOf(env, tok(0)), { enabled: 1, armed: 0, last_fired: T0 + 120 });
+  net.price = 0.62;                                    // 2% over: armed again, from above
+  setNow(T0 + 180);
+  await tick(env);
+  assert.equal(ruleOf(env, tok(0)).armed, REACH_ABOVE);
+  net.price = 0.59;                                    // back through, but inside the cooldown
+  setNow(T0 + 240);
+  await tick(env);
+  assert.equal(net.alerts().length, 1);
+  setNow(T0 + 120 + 1800);
+  await tick(env);
+  assert.equal(net.alerts().length, 2);
+  assert.equal(title(1), "PRL below $0.60");
+  net.price = 0.5;
+  setNow(T0 + 2000);
+  await tick(env);
+  assert.equal(ruleOf(env, tok(0)).armed, REACH_BELOW);
+  // Not delivered: the rule goes back to waiting on its side, so the next tick still fires.
+  net.price = 0.65;
+  net.apns = () => ({ status: 500 });
+  setNow(T0 + 4000);
+  await tick(env);
+  assert.deepEqual(ruleOf(env, tok(0)), { enabled: 1, armed: REACH_BELOW, last_fired: T0 + 1920 });
+  net.apns = () => ({ status: 200 });
+  setNow(T0 + 4060);
+  await tick(env);
+  assert.equal(title(net.alerts().length - 1), "PRL above $0.60");
+  assert.equal(ruleOf(env, tok(0)).last_fired, T0 + 4060);
+});
+
+test("tick: a 到达目标价 rule set just before a crossing still fires; one-shot turns off", async () => {
+  setNow(T0);
+  const net = installFetch(), env = makeEnv();
+  net.price = 0.62;
+  await tick(env);
+  await register(env, tok(0), [{ id: "r", kind: "reach", value: 0.6 }]);
+  net.price = 0.58;                                    // crossed before the rule's first tick
+  setNow(T0 + 60);
+  await tick(env);
+  assert.equal(net.alerts().length, 1);
+  assert.equal(net.alerts()[0].body.aps.alert.title, "PRL below $0.60");
+  assert.deepEqual(ruleOf(env, tok(0)), { enabled: 0, armed: 0, last_fired: T0 + 60 });
+  const reply = (await call(env, "GET", `/v1/devices/${tok(0)}`)).body.rules[0];
+  assert.deepEqual([reply.kind, reply.value, reply.enabled, reply.last_fired], ["reach", 0.6, false, T0 + 60]);
+});
+
 test("tick: a frequency edit between evaluation and claim wins", async () => {
   setNow(T0);
   const net = installFetch();
   let editing = true;
   const env = makeEnv({}, { beforeBatch: async (stmts) => {
-    if (editing && stmts.some((s) => s.sql.includes("AND enabled = 1 AND armed = 1"))) {
+    if (editing && stmts.some((s) => s.sql.includes("AND enabled = 1 AND armed = ?"))) {
       editing = false;
       await register(env, tok(0), [{ ...above(), repeat: true }]);
     }
@@ -206,7 +269,7 @@ test("tick (#7): a rule edited between evaluation and claim is not pushed or dis
   const env = makeEnv({}, {
     beforeBatch: async (stmts) => {
       // Land the user's edit right before the tick commits its claims.
-      if (edit && stmts.some((s) => s.sql.includes("AND enabled = 1 AND armed = 1"))) {
+      if (edit && stmts.some((s) => s.sql.includes("AND enabled = 1 AND armed = ?"))) {
         edit = false;
         await register(env, tok(0), [above("r", 0.9)]);
       }

@@ -157,6 +157,8 @@ export function payloadFor(lang, rule, usd, change) {
   if (!rule) [title, body] = t.test(p);
   else if (rule.kind === "above") [title, body] = t.above(fmtUSD(rule.value), p);
   else if (rule.kind === "below") [title, body] = t.below(fmtUSD(rule.value), p);
+  // 到达目标价: `change` is +1 when it got there rising (涨破), -1 falling (跌破).
+  else if (rule.kind === "reach") [title, body] = (change >= 0 ? t.above : t.below)(fmtUSD(rule.value), p);
   else [title, body] = (change >= 0 ? t.up : t.down)(pct(change), rule.window, p);
   return wrap(title, body, rule, usd);
 }
@@ -170,6 +172,7 @@ export function deferredPayloadFor(lang, q, usd, hm) {
   let title;
   if (q.kind === "above") [title] = t.above(fmtUSD(q.value), p);
   else if (q.kind === "below") [title] = t.below(fmtUSD(q.value), p);
+  else if (q.kind === "reach") [title] = (q.change >= 0 ? t.above : t.below)(fmtUSD(q.value), p);
   else [title] = (q.change >= 0 ? t.up : t.down)(pct(q.change || 0), q.window, p);
   return wrap(title, t.later(hm, p), { id: q.rule_id, kind: q.kind }, usd);
 }

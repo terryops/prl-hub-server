@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { evaluate, sanitizeRule, mergeRule, UPSERT_RULE, pctChange, sanitizeWindow, windowOpen, localHM } from "../src/rules.js";
+import { evaluate, sanitizeRule, mergeRule, UPSERT_RULE, pctChange, sanitizeWindow, windowOpen, localHM, REACH_BELOW, REACH_ABOVE } from "../src/rules.js";
 import { makeD1 } from "./helpers.js";
 import { combine, median, parseSafeTrade } from "../src/price.js";
 import { readdirSync } from "node:fs";
@@ -33,6 +33,37 @@ test("below mirrors above", () => {
   const d = { ...r, armed: 0, last_fired: 1 };
   assert.equal(evaluate(d, ctx(0.71)).armed, false);
   assert.equal(evaluate(d, ctx(0.715)).armed, true);
+});
+
+test("reach: a new rule takes the side of the price before this tick, then fires either way", () => {
+  const r = { kind: "reach", value: 0.6, armed: 1, last_fired: null };
+  const at = (usd, prev, now = 100000) => evaluate(r, { ...ctx(usd, now), prev });
+  assert.deepEqual(at(0.58, 0.57), { fire: false, armed: REACH_BELOW, change: 1 });
+  assert.deepEqual(at(0.62, 0.63), { fire: false, armed: REACH_ABOVE, change: -1 });
+  assert.deepEqual(at(0.61, 0.59), { fire: true, armed: 0, change: 1 });       // crossed up since the tick before
+  assert.deepEqual(at(0.59, 0.61), { fire: true, armed: 0, change: -1 });      // crossed down
+  assert.deepEqual(at(0.6, 0.62), { fire: true, armed: 0, change: -1 });       // touching counts
+  assert.deepEqual(at(0.6, 0.6), { fire: true, armed: 0, change: 1 });         // already at the target
+  assert.deepEqual(at(0.62, null), { fire: false, armed: REACH_ABOVE, change: -1 }); // no earlier price: this one
+});
+
+test("reach: armed on a side, it waits for that side's crossing; re-arms on whichever side it leaves to", () => {
+  const below = { kind: "reach", value: 0.6, armed: REACH_BELOW, last_fired: null };
+  assert.equal(evaluate(below, { ...ctx(0.59), prev: 0.62 }).fire, false);      // still below: prev doesn't matter
+  assert.deepEqual(evaluate(below, ctx(0.6)), { fire: true, armed: 0, change: 1 });
+  const above = { ...below, armed: REACH_ABOVE };
+  assert.equal(evaluate(above, ctx(0.61)).fire, false);
+  assert.deepEqual(evaluate(above, ctx(0.55)), { fire: true, armed: 0, change: -1 });
+  // Fired: re-arms only 2% away, on the side it went to.
+  const d = { ...below, armed: 0, last_fired: 100000 };
+  assert.deepEqual(evaluate(d, ctx(0.61, 100060)), { fire: false, armed: 0 });
+  assert.deepEqual(evaluate(d, ctx(0.59, 100060)), { fire: false, armed: 0 });
+  assert.deepEqual(evaluate(d, ctx(0.613, 100060)), { fire: false, armed: REACH_ABOVE });
+  assert.deepEqual(evaluate(d, ctx(0.587, 100060)), { fire: false, armed: REACH_BELOW });
+  // Re-armed inside the 30 min cooldown: holds, and fires once cooled if still across.
+  const again = { ...above, last_fired: 100000 };
+  assert.deepEqual(evaluate(again, ctx(0.6, 100600)), { fire: false, armed: REACH_ABOVE, change: -1 });
+  assert.deepEqual(evaluate(again, ctx(0.6, 101800)), { fire: true, armed: 0, change: -1 });
 });
 
 test("move: |change| over its own window, both directions", () => {
@@ -117,6 +148,8 @@ test("sanitizeRule", () => {
   assert.equal(sanitizeRule({ id: "a", kind: "above", value: 0.87654 }).value, 0.88);   // 2 decimals max
   assert.equal(sanitizeRule({ id: "a", kind: "move", value: 12.345, window: 3600 }).value, 12.35);
   assert.equal(sanitizeRule({ id: "a", kind: "above", value: 0.004 }), null);           // rounds to $0.00
+  assert.deepEqual(sanitizeRule({ id: "a", kind: "reach", value: 0.604, window: 3600 }), { id: "a", kind: "reach", value: 0.6, window: 0, enabled: 1, seen_fired: 0, repeating: null });
+  assert.equal(sanitizeRule({ id: "a", kind: "reach", value: 0 }), null);
 });
 
 test("price: median of sources, lone outlier rejected", () => {
@@ -169,6 +202,13 @@ test("copy: USD formatting and localized payloads", () => {
   assert.equal(p.aps.alert.title, "PRL 5 分钟下跌 3.5%");
   p = payloadFor("en", { id: "x", kind: "move", value: 3, window: 300 }, 0.8, 3.5);
   assert.equal(p.aps.alert.title, "PRL up 3.5% in 5 min");
+  p = payloadFor("zh-Hans", { id: "x", kind: "reach", value: 0.6 }, 0.61, 1);
+  assert.deepEqual(p.aps.alert, { title: "PRL 涨破 $0.60", body: "现价 $0.61，已高于你设置的 $0.60。" });
+  assert.equal(p.alert.kind, "reach");
+  p = payloadFor("zh-Hans", { id: "x", kind: "reach", value: 0.6 }, 0.59, -1);
+  assert.deepEqual(p.aps.alert, { title: "PRL 跌破 $0.60", body: "现价 $0.59，已低于你设置的 $0.60。" });
+  assert.equal(deferredPayloadFor("en", { rule_id: "r", kind: "reach", value: 0.6, change: -1 }, 0.58, "03:12").aps.alert.title, "PRL below $0.60");
+  assert.equal(deferredPayloadFor("en", { rule_id: "r", kind: "reach", value: 0.6, change: 1 }, 0.62, "03:12").aps.alert.title, "PRL above $0.60");
   assert.equal(payloadFor("xx", null, 0.8).aps.alert.title, "Price alerts are on");
   assert.equal(payloadFor("zh-Hant", null, 0.8).alert.test, true);
 });
@@ -180,6 +220,8 @@ test("copy: every language the app ships has every price notification", () => {
     payloadFor(lang, null, 0.8),
     payloadFor(lang, rule("above"), 0.91),
     payloadFor(lang, rule("below"), 0.89),
+    payloadFor(lang, rule("reach"), 0.91, 1),
+    payloadFor(lang, rule("reach"), 0.89, -1),
     ...[300, 3600, 86400].flatMap((window) => [5.2, -12.345].map((ch) => payloadFor(lang, rule("move", { window }), 0.8, ch))),
     deferredPayloadFor(lang, { rule_id: "r", kind: "below", value: 0.9 }, 0.89, "03:12"),
   ].map((p) => p.aps.alert);
