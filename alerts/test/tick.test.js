@@ -121,6 +121,64 @@ test("tick: a 到达目标价 rule set just before a crossing still fires; one-s
   assert.deepEqual([reply.kind, reply.value, reply.enabled, reply.last_fired], ["reach", 0.6, false, T0 + 60]);
 });
 
+test("tick: a fired 到达目标价 alert switched back on near its target fires on the next arrival", async () => {
+  // 2026-10-24: 到达 $2.00 had fired; switched back on at $2.00, it then sat at or near $2.00
+  // for three hours without a push — it waited for the price to get 2% away first.
+  setNow(T0);
+  const net = installFetch(), env = makeEnv();
+  const rule = { id: "r", kind: "reach", value: 2 };
+  net.price = 2.1;
+  await tick(env);
+  await register(env, tok(0), [rule]);
+  net.price = 2;
+  setNow(T0 + 60);
+  await tick(env);
+  assert.equal(net.alerts().length, 1);
+  assert.deepEqual(ruleOf(env, tok(0)), { enabled: 0, armed: 0, last_fired: T0 + 60 });
+  // Hours later the user switches it back on, having seen that firing; the price is just under.
+  net.price = 1.99;
+  setNow(T0 + 3 * 3600);
+  await tick(env);
+  await register(env, tok(0), [{ ...rule, seen_fired: T0 + 60 }]);
+  assert.deepEqual(ruleOf(env, tok(0)), { enabled: 1, armed: 1, last_fired: T0 + 60 });
+  setNow(T0 + 3 * 3600 + 60);
+  await tick(env);
+  assert.equal(net.alerts().length, 1);
+  assert.equal(ruleOf(env, tok(0)).armed, REACH_BELOW);
+  net.price = 2;
+  setNow(T0 + 3 * 3600 + 120);
+  await tick(env);
+  assert.equal(net.alerts().length, 2);
+  assert.equal(net.alerts()[1].body.aps.alert.title, "PRL above $2.00");
+  assert.deepEqual(ruleOf(env, tok(0)), { enabled: 0, armed: 0, last_fired: T0 + 3 * 3600 + 120 });
+});
+
+test("tick: a 到达目标价 alert switched off, then on after the price crossed, doesn't fire on the old side", async () => {
+  setNow(T0);
+  const net = installFetch(), env = makeEnv();
+  const rule = { id: "r", kind: "reach", value: 2, repeat: true };
+  net.price = 1.9;
+  await tick(env);
+  await register(env, tok(0), [rule]);
+  setNow(T0 + 60);
+  await tick(env);
+  assert.equal(ruleOf(env, tok(0)).armed, REACH_BELOW);
+  await register(env, tok(0), [{ ...rule, enabled: false }]);
+  net.price = 2.2;                                     // crossed while off: nothing to tell
+  setNow(T0 + 120);
+  await tick(env);
+  await register(env, tok(0), [rule]);
+  setNow(T0 + 180);
+  await tick(env);
+  assert.equal(net.alerts().length, 0);
+  assert.equal(ruleOf(env, tok(0)).armed, REACH_ABOVE);
+  net.price = 1.99;                                    // back down through it: that one counts
+  setNow(T0 + 240);
+  await tick(env);
+  assert.equal(net.alerts().length, 1);
+  assert.equal(net.alerts()[0].body.aps.alert.title, "PRL below $2.00");
+});
+
 test("tick: a frequency edit between evaluation and claim wins", async () => {
   setNow(T0);
   const net = installFetch();

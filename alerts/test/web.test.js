@@ -1014,6 +1014,95 @@ test("address: an unused Blockbook address may omit transactions", async () => {
   assert.deepEqual(r.body.history, []);
 });
 
+// An exchange deposit address: received once, then swept with other addresses' coins.
+const sweepPage = () => {
+  const ids = ["1".repeat(64), "2".repeat(64), "3".repeat(64)];
+  const txs = {
+    // The sweep: this address put in 5 PRL next to another address's 100; all 104.9 went out.
+    [ids[0]]: { txid: ids[0], blockTime: T0 + 3, confirmations: 1, fees: "10000000",
+      vin: [{ addresses: [addr], value: "500000000" }, { addresses: ["other"], value: "10000000000" }],
+      vout: [{ addresses: ["hot"], value: "10490000000" }] },
+    [ids[1]]: { txid: ids[1], blockTime: T0 + 2, confirmations: 2, fees: "100",
+      vin: [{ addresses: ["sender"], value: "500000100" }], vout: [{ addresses: [addr], value: "500000000" }] },
+    // A coinbase payout: its input has no address or value.
+    [ids[2]]: { txid: ids[2], blockTime: T0 + 1, confirmations: 3, fees: "0",
+      vin: [{ coinbase: "03", n: 0, isAddress: false }], vout: [{ addresses: [addr], value: "200" }] },
+  };
+  const requests = [];
+  const fetcher = (failing) => async (url) => {
+    const u = String(url);
+    requests.push(u);
+    // Larger than MAX_BODY (2 MB), like SafeTrade's 10 MB page of sweeps.
+    if (u.includes("details=txs&")) return new Response("x".repeat(2_000_001));
+    if (u.includes("details=txids&"))
+      return Response.json({ page: 1, totalPages: 2, balance: "200", unconfirmedBalance: "-5", txs: 23, txids: ids });
+    const id = u.split("/api/v2/tx/")[1];
+    return id === failing ? new Response("busy", { status: 503 }) : Response.json(txs[id]);
+  };
+  return { ids, requests, fetcher };
+};
+test("address: a page too big to read whole is read one transaction at a time", async () => {
+  const env = makeEnv(), { ids, requests, fetcher } = sweepPage();
+  globalThis.fetch = fetcher();
+  const r = await call(env, "POST", "/v1/address", { addr });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.balance, "200");
+  assert.equal(r.body.unconfirmed, "-5");
+  assert.equal(r.body.txs, 23);
+  assert.equal(r.body.hasMore, true);
+  assert.deepEqual(r.body.history.map((tx) => tx.txid), ids);
+  // The sweep shows only this address's 5 PRL, not the 104.9 PRL that the sweep sent.
+  assert.deepEqual(
+    { sent: r.body.history[0].sent, amount: r.body.history[0].amount, delta: r.body.history[0].delta, address: r.body.history[0].address },
+    { sent: true, amount: "500000000", delta: "-500000000", address: "hot" },
+  );
+  assert.deepEqual([r.body.history[1].amount, r.body.history[1].address], ["500000000", "sender"]);
+  assert.deepEqual([r.body.history[2].amount, r.body.history[2].address, r.body.history[2].sent], ["200", "", false]);
+  assert.deepEqual(requests.map((u) => u.replace(/^https:\/\/[^/]+/, "")), [
+    `/api/v2/address/${addr}?details=txs&pageSize=20&page=1`,
+    `/api/v2/address/${addr}?details=txids&pageSize=20&page=1`,
+    ...ids.map((id) => `/api/v2/tx/${id}`),
+  ]);
+});
+test("address: a failed transaction read still returns the balance", async () => {
+  const env = makeEnv(), { ids, fetcher } = sweepPage();
+  globalThis.fetch = fetcher(ids[1]);
+  const r = await call(env, "POST", "/v1/address", { addr });
+  assert.equal(r.status, 502);
+  assert.deepEqual(r.body, { ok: false, error: "upstream", balance: "200", unconfirmed: "-5", txs: 23 });
+  // An indexer that is down is asked once, not again a transaction at a time.
+  const asked = [];
+  globalThis.fetch = async (url) => { asked.push(String(url)); return new Response("down", { status: 503 }); };
+  const down = await call(env, "POST", "/v1/address", { addr });
+  assert.deepEqual([down.status, down.body], [502, { ok: false, error: "upstream" }]);
+  assert.equal(asked.length, 1);
+  // A txid list with something other than txids is refused before any of them is requested.
+  const requests = [];
+  globalThis.fetch = async (url) => {
+    requests.push(String(url));
+    return String(url).includes("details=txids&")
+      ? Response.json({ balance: "1", txs: 1, txids: ["../../x"] })
+      : new Response("x".repeat(2_000_001));
+  };
+  assert.equal((await call(env, "POST", "/v1/address", { addr })).status, 502);
+  assert.equal(requests.length, 2);
+});
+test("address: an ordinary payment shows what went to others, not the change", async () => {
+  const env = makeEnv();
+  const tx = transaction(0, 1);
+  tx.vin = [{ addresses: [addr], value: "1000" }];
+  tx.vout = [{ addresses: ["payee"], value: "700" }, { addresses: [addr], value: "290" }];
+  blockbook([tx]);
+  const r = await call(env, "POST", "/v1/address", { addr });
+  assert.deepEqual([r.body.history[0].sent, r.body.history[0].amount, r.body.history[0].delta], [true, "700", "-710"]);
+  // Merging its coins with others' dust: a net gain, so what went to others is shown as before.
+  tx.vin = [{ addresses: [addr], value: "1000" }, { addresses: ["dust"], value: "8" }];
+  tx.vout = [{ addresses: [addr], value: "1006" }, { addresses: ["payee"], value: "1" }];
+  blockbook([tx]);
+  const merged = await call(env, "POST", "/v1/address", { addr });
+  assert.deepEqual([merged.body.history[0].sent, merged.body.history[0].amount, merged.body.history[0].delta], [true, "1", "6"]);
+});
+
 test("webpush: offline watches share the existing outage engine", async () => {
   const { env } = await pushEnv();
   setNow(T0);

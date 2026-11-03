@@ -67,6 +67,9 @@ export async function associatePurchase(env, account, purchase) {
     AND s.revoked_at IS NULL AND u.deleted_at IS NULL AND a.revoked_at IS NULL)
     AND EXISTS(SELECT 1 FROM purchase_visitors WHERE id=? AND revoked_at IS NULL)`;
   await db.batch([
+    // A Google Play purchase made on this device before signing in becomes the account's (play.js).
+    db.prepare(`UPDATE entitlements SET user_id=? WHERE source='google' AND user_id=? AND revoked_at IS NULL AND ${guard}`)
+      .bind(uid,id,account.id,uid,id),
     db.prepare(`INSERT OR IGNORE INTO entitlements(source,ref,user_id,product,platform,granted_at)
       SELECT 'prl',o.txid,?,'pro','web',o.paid_at FROM orders o WHERE o.gid=? AND o.status='paid' AND o.txid IS NOT NULL AND ${guard}`)
       .bind(uid,id,account.id,uid,id),
@@ -122,7 +125,7 @@ export async function claimPurchasePush(env,session,token,account=null) {
   if(!out)return false;
   const old="SELECT token FROM account_push_claims WHERE user_id=? AND token<>? AND revoked_at IS NULL";
   await db.batch([
-    ...["rules","deferred","watches","webpush","fcm","devices"].map(table=>db.prepare(`DELETE FROM ${table} WHERE token IN(${old})`).bind(session.user_id,token)),
+    ...["rules","deferred","watches","income_watches","webpush","fcm","devices"].map(table=>db.prepare(`DELETE FROM ${table} WHERE token IN(${old})`).bind(session.user_id,token)),
     db.prepare(`UPDATE account_push_claims SET revoked_at=? WHERE token IN(${old})`).bind(t,session.user_id,token),
   ]);
   return true;

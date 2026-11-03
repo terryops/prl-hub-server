@@ -6,7 +6,9 @@
 //                     `deferred` and pushed at the next window start)
 //                     then 掉线提醒: poll the pool miners that are due (each one every
 //                     3 min), push the workers that have been offline long enough,
-//                     and the ones a device was told about that are back online
+//                     and the ones a device was told about that are back online;
+//                     then 到账提醒: read the new blocks and push the devices whose
+//                     address they paid (income-watch.js)
 //   GET    /v1/price/history              24h same-source price history
 //          /v1/price/history?span=…       BigONE daily close (7d / 30d / 90d)
 //   GET    /v1/network/history?span=…     sampled D1 history (24h / 7d / 30d / all)
@@ -29,12 +31,14 @@
 //                                       `fcm: { token }` (FCM registration token; fcm.js)
 //   GET/PUT /v1/me/config               encrypted cross-device configuration
 //   POST   /v1/me/apple                  link a verified StoreKit Pro receipt
+//   POST   /v1/purchase/google           verify + acknowledge a Google Play Pro purchase (play.js)
 //   GET    /v1/admin/payments           unmatched payments (ADMIN_TOKEN)
 //   POST   /v1/admin/grant              manual Pro grants (ADMIN_TOKEN)
 //   GET    /v1/price                      current price, sources, 1h/24h change
 //   PUT    /v1/devices/:token             register/replace a device's rules and (1.20+,
 //                                         `watches`) the pool monitors it wants offline
-//                                         pushes for (watch.js)
+//                                         pushes for (watch.js), and (2.1.8+, `income`) the
+//                                         one address it wants payment pushes for
 //   GET    /v1/devices/:token             that device's rules + armed state, and its
 //                                         watches + when each was last checked
 //   DELETE /v1/devices/:token             forget the device
@@ -51,6 +55,7 @@
 // Price alerts send nothing about the user's wallet. 掉线提醒 is opt-in per
 // monitor and does send what the pool needs to be asked about it: the payout
 // address (F2Pool: the account's read-only page key) — never keys or balances.
+// 到账提醒 is opt-in too and sends the one address it is for.
 //
 // Pro: device and live registrations may carry `pro_jws`, the StoreKit 2 signed
 // transaction of the Pro purchase. It is verified against Apple's root (jws.js)
@@ -95,6 +100,9 @@ import { purchaseRoutes, buyerContexts, buyerMe, associatePurchase, refreshPurch
 import gpuCatalog from "../../Sources/PRLMonitor/gpus.json" with { type: "json" };
 import { getConfig as accountConfig, putConfig as saveAccountConfig } from "./account-config.js";
 import { syncPaid, bindApple } from "./entitlements.js";
+import { playConfigured, playPurchase, playHousekeeping } from "./play.js";
+// Last, so its own imports don't move other modules ahead in the bundle (esbuild names collisions by that order).
+import { scanIncome, sanitizeIncome, upsertIncome } from "./income-watch.js";
 
 const MAX_RULES = 20;
 const MAX_WATCHES = 20;
@@ -398,7 +406,8 @@ async function checkIdle(env, db, t) {
   const { results } = await db
     .prepare(`SELECT d.token, d.env, d.topic, d.chan, f.reg FROM devices d LEFT JOIN fcm f ON f.token = d.token
                WHERE d.chan IN (SELECT value FROM json_each(?)) AND COALESCE(d.seen_at, d.updated_at) < ?
-                 AND EXISTS (SELECT 1 FROM watches w WHERE w.token = d.token)
+                 AND (EXISTS (SELECT 1 FROM watches w WHERE w.token = d.token)
+                      OR EXISTS (SELECT 1 FROM income_watches i WHERE i.token = d.token))
                ORDER BY COALESCE(d.seen_at, d.updated_at) LIMIT ?`)
     .bind(JSON.stringify(chans), t - IDLE_CHECK, IDLE_CHECKS)
     .all();
@@ -423,6 +432,8 @@ async function prune(db, t) {
     db.prepare(`DELETE FROM rules WHERE token IN (${gone})`).bind(t - DEVICE_KEEP),
     db.prepare(`DELETE FROM deferred WHERE token IN (${gone})`).bind(t - DEVICE_KEEP),
     db.prepare(`DELETE FROM watches WHERE token IN (${gone})`).bind(t - DEVICE_KEEP),
+    // Also what a device removed some other way left behind (an account or refund clean-up).
+    db.prepare(`DELETE FROM income_watches WHERE token IN (${gone}) OR token NOT IN (SELECT token FROM devices)`).bind(t - DEVICE_KEEP),
     db.prepare(`DELETE FROM webpush WHERE token IN (${gone})`).bind(t - DEVICE_KEEP),
     db.prepare(`DELETE FROM fcm WHERE token IN (${gone})`).bind(t - DEVICE_KEEP),
     db.prepare("DELETE FROM devices WHERE COALESCE(seen_at, updated_at) < ?").bind(t - DEVICE_KEEP),
@@ -440,6 +451,7 @@ const forget = (db, token) => [
   db.prepare("DELETE FROM devices WHERE token = ?").bind(token),
   db.prepare("DELETE FROM deferred WHERE token = ?").bind(token),
   db.prepare("DELETE FROM watches WHERE token = ?").bind(token),
+  db.prepare("DELETE FROM income_watches WHERE token = ?").bind(token),
   // …and the miners only it watched: their address and worker names go with it now,
   // not at the next hourly prune. (Forgetting a device is rare; the scan is fine here.)
   db.prepare(UNWATCHED),
@@ -849,7 +861,14 @@ function sanitizeSettings(body) {
       return { bad: json({ error: "bad watches" }, 400) };
     }
   }
-  return { rules, watches };
+  // 2.1.8+: `income`, the one address this device wants 到账提醒 for ({ addr, label }), or
+  // null for none. undefined (an app that doesn't know it): whatever is stored stays.
+  let income = body.income === null ? null : undefined;
+  if (body.income != null) {
+    income = sanitizeIncome(body.income);
+    if (!income) return { bad: json({ error: "bad income" }, 400) };
+  }
+  return { rules, watches, income };
 }
 
 async function putDevice(env, token, body, ip, web = null, session = null) {
@@ -868,11 +887,11 @@ async function putDevice(env, token, body, ip, web = null, session = null) {
   if (apnsEnv !== "production" && apnsEnv !== "sandbox") return json({ error: "bad env" }, 400);
   const settings = sanitizeSettings(body);
   if (settings.bad) return settings.bad;
-  const { rules, watches } = settings;
-  const empty = !web && !rules.length && !(watches && watches.length);
+  const { rules, watches, income } = settings;
+  const empty = !web && !rules.length && !(watches && watches.length) && !income;
   // Validate and claim once, including an empty first sync after guest login.
   const pro = empty || web ? {} : await registrationPro(env, body.pro_jws, session);
-  if (!pro || (!web && !empty && watches && watches.length && !pro.otid && !pro.account)) return json({ error: "not pro" }, 403);
+  if (!pro || (!web && !empty && ((watches && watches.length) || income) && !pro.otid && !pro.account)) return json({ error: "not pro" }, 403);
   if (session) {
     if (!(session.client === "purchase" ? await claimPurchasePush(env, session, token) : await claimPush(env, session, token)))
       return json({ error: "device_conflict" }, 409);
@@ -904,7 +923,9 @@ async function putDevice(env, token, body, ip, web = null, session = null) {
       db.prepare(`DELETE FROM rules WHERE token = ? AND ${active}`).bind(token, ...guardArgs),
       db.prepare(`DELETE FROM deferred WHERE token = ? AND ${active}`).bind(token, ...guardArgs),
       ...dropWatches,
-      db.prepare(`DELETE FROM devices WHERE token = ? AND NOT EXISTS (SELECT 1 FROM watches WHERE token = ?) AND ${active}`).bind(token, token, ...guardArgs),
+      ...(income === null ? [db.prepare(`DELETE FROM income_watches WHERE token = ? AND ${active}`).bind(token, ...guardArgs)] : []),
+      db.prepare(`DELETE FROM devices WHERE token = ? AND NOT EXISTS (SELECT 1 FROM watches WHERE token = ?)
+                    AND NOT EXISTS (SELECT 1 FROM income_watches WHERE token = ?) AND ${active}`).bind(token, token, token, ...guardArgs),
     ]);
     if (session && !written[0].meta.changes) return json({ error: "unauthorized" }, 401);
     return json({ ok: true, rules: [], ...(watches ? { watches: [] } : {}) });
@@ -951,6 +972,11 @@ async function putDevice(env, token, body, ip, web = null, session = null) {
       // most MAX_WATCHES miners in the queue, however often it rewrites its list.
       ...unwatch,
     );
+  }
+  if (income !== undefined) {
+    stmts.push(income
+      ? db.prepare(upsertIncome(active)).bind(token, income.addr, income.label, t, ...guardArgs)
+      : db.prepare(`DELETE FROM income_watches WHERE token = ? AND ${active}`).bind(token, ...guardArgs));
   }
   if (session) stmts.push(db.prepare(`UPDATE devices SET gid=?, account_device_id=? WHERE token=? AND ${active}`).bind(session.user_id, session.device_id, token, ...guardArgs));
   const written = await db.batch(stmts);
@@ -1037,7 +1063,7 @@ async function admitToken(env, db, token, apnsEnv, topic, ip, t) {
 /// is not echoed back.
 async function getDevice(env, token) {
   const t = now();
-  const [{ results: rules }, { results: watches }] = await Promise.all([
+  const [{ results: rules }, { results: watches }, income] = await Promise.all([
     env.DB
       .prepare(`SELECT id, kind, value, window, enabled, armed, last_fired,
                        COALESCE(repeating, (SELECT 1 - oneshot FROM devices d WHERE d.token = r.token)) AS repeat,
@@ -1051,6 +1077,7 @@ async function getDevice(env, token) {
                  WHERE w.token = ? ORDER BY w.rowid`)
       .bind(token)
       .all(),
+    env.DB.prepare("SELECT since FROM income_watches WHERE token = ?").bind(token).first(),
   ]);
   return json({
     ok: true,
@@ -1060,6 +1087,8 @@ async function getDevice(env, token) {
       // Never answered counts once it has been tried; a miner not polled yet is just new.
       stale: !r.missing && (r.checked_at == null ? r.tried_at != null : t - r.checked_at > WATCH_STALE),
     })),
+    // 到账提醒: only when this device has an address on record (which is not echoed back).
+    ...(income ? { income: { since: income.since } } : {}),
   });
 }
 
@@ -1128,7 +1157,7 @@ async function route(req, env, ctx) {
 
   const path = url.pathname;
   if (path === "/v1/web/status" && req.method === "GET") return Response.json({ pay: paymentSettings(env), vapid_key: webpushConfigured(env) ? env.VAPID_PUBLIC : null,
-    fcm: fcmConfigured(env), auth: { enabled: accountsEnabled(env), site_key: env.TURNSTILE_SITE_KEY || null } }, { headers: { "cache-control": "no-store" } });
+    fcm: fcmConfigured(env), play: playConfigured(env), auth: { enabled: accountsEnabled(env), site_key: env.TURNSTILE_SITE_KEY || null } }, { headers: { "cache-control": "no-store" } });
   if (path === "/v1/gpus" && req.method === "GET") return json(gpuCatalog, 200, { "cache-control": "public, max-age=3600" });
   const authReply = await authRoutes(req, env);
   if (authReply) return authReply;
@@ -1156,7 +1185,7 @@ async function route(req, env, ctx) {
     const [body, bad] = req.method === "POST" ? await readJSON(req, MAX_DEVICE_BODY) : [null];
     return bad || admin(env, req.method, parts.length === 3 ? parts[2] : "", body);
   }
-  if (parts[1] === "me" || parts[1] === "orders" || path === "/v1/web/push") {
+  if (parts[1] === "me" || parts[1] === "orders" || path === "/v1/web/push" || path === "/v1/purchase/google") {
     const contexts = await buyerContexts(req,env);
     let session=contexts.account||contexts.purchase, gid=session?.user_id;
     if (!gid) return json({ error: "unauthorized" }, 401);
@@ -1167,6 +1196,11 @@ async function route(req, env, ctx) {
       if (env.RL_NEW && !(await env.RL_NEW.limit({ key: ip })).success) return json({ error: "rate limited" }, 429);
       const [body, bad] = await readJSON(req, MAX_DEVICE_BODY);
       return bad || bindApple(env, gid, body, session);
+    }
+    if (path === "/v1/purchase/google" && req.method === "POST") {
+      if (env.RL_NEW && !(await env.RL_NEW.limit({ key: ip })).success) return json({ error: "rate limited" }, 429);
+      const [body, bad] = await readJSON(req, MAX_DEVICE_BODY);
+      return bad || playPurchase(env, contexts, body);
     }
     if (path === "/v1/orders" && req.method === "POST") {
       const effective=await (await buyerMe(env,contexts)).json();
@@ -1280,6 +1314,8 @@ export default {
       try { await pollWatches(env); } catch (e) { console.error("watch", e && e.stack ? e.stack : String(e)); }
       try { await checkPayments(env); } catch (e) { logError("payment check failed", e, env); }
       try { await sampleNetwork(env); } catch (e) { logError("network sampling failed", e, env); }
+      // After the order check and the network sample: reading blocks can take a while.
+      try { await scanIncome(env, { forget }); } catch (e) { logError("income scan failed", e, env); }
       try { await refreshRealFees(env); } catch { console.error("real-fee refresh unavailable"); }
       // Public PPLNS windows grow continuously even when no client opens the pool page.
       if (Math.floor(now() / 60) % 5 === 0) {
@@ -1304,6 +1340,8 @@ export default {
           prunePurchases(env.DB,t),
           ...authCleanup(env.DB, t),
         ]); } catch (e) { logError("web prune failed", e, env); }
+        // Google Play refunds / chargebacks, and acknowledgements that failed at purchase time.
+        try { await playHousekeeping(env); } catch (e) { logError("play housekeeping failed", e, env); }
       }
     }
   },

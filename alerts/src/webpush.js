@@ -169,8 +169,9 @@ export async function send(env, subscription, payload, opts = {}) {
       title: alert.title || "Pearl Hub",
       // A browser notification has no subtitle: it leads the body, on a line of its own.
       body: [alert.subtitle, alert.body].filter(Boolean).join("\n"),
-      tag: payload.watch?.id ? `worker:${payload.watch.id}` : opts.collapseId || payload.aps?.["thread-id"] || "pearl-hub",
-      url: payload.aps?.["thread-id"] === "worker-offline" ? "/#workers" : "/#alerts",
+      tag: payload.watch?.id ? `worker:${payload.watch.id}` : payload.income ? String(payload.income.tag)
+        : opts.collapseId || payload.aps?.["thread-id"] || "pearl-hub",
+      url: payload.aps?.["thread-id"] === "worker-offline" ? "/#workers" : payload.income ? "/#wallet" : "/#alerts",
     });
   } catch { return { ok: false, fail: true, reason: "invalid payload" }; }
   if (enc.encode(plaintext).length > 3993) return { ok: false, fail: true, reason: "payload too large" };

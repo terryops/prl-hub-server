@@ -9,7 +9,7 @@
 // 0.8209, WhatToMine×BTC 0.789):
 //
 //   • CoinEx  PEARLUSDT — NB "PRLUSDT" on CoinEx is an unrelated token (~$0.11)
-//   • BigONE  PRL-USDT
+//   • BigONE  PEARL-USDT (PRL-USDT until its rename around 2026-10-19)
 //   • WhatToMine exchange_rate (PRL→BTC) × BTC/USD (Kraken, Coinbase fallback)
 //
 // A median of three shrugs off one stale or thin market. With two sources it is
@@ -47,7 +47,7 @@ async function coinex() {
 }
 
 async function bigone() {
-  const j = await getJSON("https://big.one/api/v3/asset_pairs/PRL-USDT/ticker");
+  const j = await getJSON("https://big.one/api/v3/asset_pairs/PEARL-USDT/ticker");
   const t = j && j.code === 0 ? j.data : null;
   return t ? { last: num(t.close), open24: num(t.open) } : null;
 }

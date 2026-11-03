@@ -2,6 +2,7 @@ import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { sampleNetwork, rollingSeries } from "../src/network.js";
 import { parseCandles } from "../src/pricehistory.js";
+import { fetchQuotes } from "../src/price.js";
 import { makeEnv, call, setNow, restoreNow, T0 } from "./helpers.js";
 const original = fetch;
 afterEach(() => { globalThis.fetch = original; restoreNow(); });
@@ -91,12 +92,12 @@ test("price: explicit spans use sorted BigONE daily close, share 1h D1 cache and
   const candles = Array.from({ length: 90 }, (_, i) => ({ time: new Date((T0 - i * 86400) * 1000).toISOString(), close: String(.8 + i / 100) }));
   globalThis.fetch = async (url, init) => {
     requests++;
-    assert.equal(String(url), "https://big.one/api/v3/asset_pairs/PRL-USDT/candles?period=day1&limit=90");
+    assert.equal(String(url), "https://big.one/api/v3/asset_pairs/PEARL-USDT/candles?period=day1&limit=90");
     assert.equal(init.redirect, "manual");
     return Response.json({ code: 0, data: candles });
   };
   const r = await call(e, "GET", "/v1/price/history?span=7d");
-  assert.equal(r.status, 200); assert.equal(r.body.source, "bigone"); assert.equal(r.body.market, "PRL-USDT"); assert.equal(r.body.quote, "USDT"); assert.equal(r.body.points.length, 7);
+  assert.equal(r.status, 200); assert.equal(r.body.source, "bigone"); assert.equal(r.body.market, "PEARL-USDT"); assert.equal(r.body.quote, "USDT"); assert.equal(r.body.points.length, 7);
   assert.deepEqual(r.body.points, candles.slice(0, 7).reverse().map((c) => [Date.parse(c.time) / 1000, Number(c.close)]));
   assert.equal((await call(e, "GET", "/v1/price/history?span=90d")).body.points.length, 90); assert.equal(requests, 1);
   assert.deepEqual((await call(e, "GET", "/v1/price/history")).body, { source: null, points: [] });
@@ -124,6 +125,42 @@ test("network: read throttle, bounded backfill rounds, and failed sampling prese
   assert.deepEqual(e.DB.rows("SELECT * FROM network_samples ORDER BY height"), saved);
   const limited = makeEnv({ RL_READ: { limit: async () => ({ success: false }) } });
   assert.equal((await call(limited, "GET", "/v1/network/history?span=7d")).status, 429);
+});
+test("price: BigONE's renamed pair — a row stored as PRL-USDT stands in while a refresh fails, then PEARL-USDT replaces it", async () => {
+  setNow(T0); const e = makeEnv();
+  // As stored before the rename (2026-10-19): days old, so the next read refreshes.
+  const before = { source: "bigone", market: "PRL-USDT", quote: "USDT", ts: T0 - 4 * 86400, points: [[T0 - 5 * 86400, 1.8169], [T0 - 4 * 86400, 1.8901]] };
+  e.DB.raw.prepare("INSERT INTO kv (k, v, ts) VALUES ('price:bigone:daily', ?, ?)").run(JSON.stringify(before), before.ts);
+  const urls = [];
+  // The old name answers like BigONE does now.
+  globalThis.fetch = async (url) => { urls.push(String(url)); return Response.json({ code: 10013, message: "Resource not found" }, { status: 404 }); };
+  const stale = await call(e, "GET", "/v1/price/history?span=7d");
+  assert.equal(stale.status, 200); assert.equal(stale.body.stale, true); assert.equal(stale.body.market, "PRL-USDT");
+  assert.deepEqual(stale.body.points, before.points);
+  assert.deepEqual(urls, ["https://big.one/api/v3/asset_pairs/PEARL-USDT/candles?period=day1&limit=90"]);
+  setNow(T0 + 120);
+  globalThis.fetch = async () => Response.json({ code: 0, data: [{ time: new Date(T0 * 1000).toISOString(), close: "2.0883" }, { time: new Date((T0 - 86400) * 1000).toISOString(), close: "2.1858" }] });
+  const fresh = await call(e, "GET", "/v1/price/history?span=7d");
+  assert.equal(fresh.status, 200); assert.equal(fresh.body.stale, undefined); assert.equal(fresh.body.market, "PEARL-USDT"); assert.equal(fresh.body.ts, T0 + 120);
+  assert.deepEqual(fresh.body.points, [[T0 - 86400, 2.1858], [T0, 2.0883]]);
+});
+test("price: the fallback median reads BigONE as PEARL-USDT (PRL-USDT is gone), beside CoinEx and WhatToMine", async () => {
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    const u = new URL(String(url)); urls.push(u.hostname + u.pathname);
+    if (u.hostname === "big.one") return u.pathname === "/api/v3/asset_pairs/PEARL-USDT/ticker"
+      ? Response.json({ code: 0, data: { asset_pair_name: "PEARL-USDT", open: "2.3246", close: "2.0883" } })
+      : Response.json({ code: 10013, message: "Resource not found" }, { status: 404 });
+    if (u.hostname === "api.coinex.com") return Response.json({ code: 0, data: [{ last: "2.09", open: "2.3" }] });
+    if (u.hostname === "whattomine.com") return Response.json({ exchange_rate: 2.08 / 80000, timestamp: Date.now() / 1000 });
+    if (u.hostname === "api.kraken.com") return Response.json({ result: { XXBTZUSD: { c: ["80000"] } } });
+    return new Response("nope", { status: 404 });
+  };
+  const q = await fetchQuotes();
+  assert.deepEqual(q.bigone, { last: 2.0883, open24: 2.3246 });
+  assert.ok(q.coinex && q.whattomine);
+  assert.ok(urls.includes("big.one/api/v3/asset_pairs/PEARL-USDT/ticker"));
+  assert.ok(!urls.some((u) => u.includes("PRL-USDT")));
 });
 test("price: corrupt cached daily candles trigger a refresh rather than an invalid successful reply", async () => {
   setNow(T0); const e = makeEnv();

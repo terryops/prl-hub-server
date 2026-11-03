@@ -43,14 +43,72 @@ export async function chainAddress(env, addr, pageSize = 20, page = 1) {
   o.transactions ||= [];
   return o;
 }
-export async function chainHeight(env) {
-  const base = (env.BLOCKBOOK_BASE || "https://blockbook.pearlresearch.ai").replace(/\/$/, "").replace(/\/api\/v2$/, "");
-  const r = await fetch(`${base}/api/`, { headers: { "user-agent": UA, accept: "application/json" }, redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
+/// GET `path` from the Blockbook at `base` → its JSON object; throws on any other status, a body
+/// past `max` bytes, or Blockbook's { error }.
+export async function blockbookJSON(base, path, { headers = {}, max = MAX_BODY } = {}) {
+  const r = await fetch(`${base}${path}`, {
+    headers: { "user-agent": UA, accept: "application/json", ...headers },
+    redirect: "manual",
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  });
   if (r.status !== 200) throw new Error("upstream");
-  const o = JSON.parse(await readCapped(r, MAX_BODY)), height = o?.blockbook?.bestHeight;
+  const o = JSON.parse(await readCapped(r, max));
+  if (!o || typeof o !== "object" || o.error) throw new Error("upstream");
+  return o;
+}
+/// The best height of the Blockbook at `base`, while it is in sync.
+export async function blockbookHeight(base, headers = {}) {
+  const o = await blockbookJSON(base, "/api/", { headers }), height = o?.blockbook?.bestHeight;
   if (!Number.isSafeInteger(height) || height < 0 || o.blockbook.inSync === false) throw new Error("invalid chain height");
   return height;
 }
+export async function chainHeight(env) {
+  return blockbookHeight(indexerBase(env.BLOCKBOOK_BASE || "https://blockbook.pearlresearch.ai"));
+}
+// Transactions per /v1/address page.
+const ADDRESS_PAGE = 20;
+// Concurrent Blockbook reads when a page is read one transaction at a time.
+const ADDRESS_TX_READS = 5;
+// A page Blockbook could not send whole, read as its txid list plus each transaction. An exchange
+// sweeps its deposit addresses with transactions of 1,500+ inputs (0.7 MB each in Blockbook's JSON),
+// so 20 of them pass MAX_BODY: SafeTrade's prl1p3nd…qqf4z0x had a 10 MB first page on 2026-10-26.
+// The txid list is a few KB and holds the balance; each transaction fits MAX_BODY.
+async function addressPageByTx(env, addr, page) {
+  const base = indexerBase(env.BLOCKBOOK_BASE || "https://blockbook.pearlresearch.ai");
+  const get = (path) => blockbookJSON(base, `/api/v2/${path}`);
+  const o = await get(`address/${addr}?details=txids&pageSize=${ADDRESS_PAGE}&page=${page}`);
+  const ids = o.txids || [];
+  if (!Array.isArray(ids) || (!o.txids && o.txs !== 0) || !ids.every((id) => TXID_RE.test(id)))
+    throw new Error("invalid address response");
+  // `read` waits for the transactions; the summary is usable before they arrive.
+  const read = async () => {
+    const out = [];
+    let next = 0, failed = false;
+    const reader = async () => {
+      while (!failed && next < ids.length) {
+        const i = next++;
+        try {
+          const tx = await get(`tx/${ids[i]}`);
+          if (tx.txid !== ids[i] || !Array.isArray(tx.vin) || !Array.isArray(tx.vout)) throw new Error("invalid transaction");
+          out[i] = tx;
+        } catch (e) {
+          failed = true;
+          throw e;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(ADDRESS_TX_READS, ids.length) }, reader));
+    return out;
+  };
+  return { o, read };
+}
+const addressSummary = (o) => ({
+  balance: atomic(o.balance).toString(),
+  // Blockbook reports a signed delta here when a mempool transaction spends
+  // this address's confirmed outputs. Transaction values stay nonnegative.
+  unconfirmed: signedAtomic(o.unconfirmedBalance ?? "0").toString(),
+  txs: o.txs || 0,
+});
 export async function address(env, body, ctx) {
   const addr = body?.addr;
   const page = body?.page ?? 1;
@@ -59,27 +117,42 @@ export async function address(env, body, ctx) {
   if (!Number.isSafeInteger(page) || page < 1 || page > 1000000) return json({ ok: false, error: "bad page" }, 400);
   try {
     return await cached(`address/v2/${await sha256(addr)}/${page}`, 30, ctx, async () => {
-      const o = await chainAddress(env, addr, 20, page);
+      let o;
+      try {
+        o = await chainAddress(env, addr, ADDRESS_PAGE, page);
+      } catch (e) {
+        // Only a page too big to read whole is read one transaction at a time: an indexer that
+        // is down or hanging would only fail (or time out) a second time, doubling the wait.
+        if (!(e instanceof Error && e.message === "too large")) throw e;
+        const byTx = await addressPageByTx(env, addr, page);
+        const summary = addressSummary(byTx.o);
+        try {
+          o = { ...byTx.o, transactions: await byTx.read() };
+        } catch {
+          // Not cached. Clients still get the balance; old ones only see the failure.
+          return json({ ok: false, error: "upstream", ...summary }, 502);
+        }
+      }
       return {
         ok: true,
-        balance: atomic(o.balance).toString(),
-        // Blockbook reports a signed delta here when a mempool transaction spends
-        // this address's confirmed outputs. Transaction values stay nonnegative.
-        unconfirmed: signedAtomic(o.unconfirmedBalance ?? "0").toString(),
-        txs: o.txs || 0,
+        ...addressSummary(o),
         page,
         hasMore: page < (o.totalPages || 1),
         history: o.transactions.map((tx) => {
           const own = (io) => io.addresses?.includes(addr), sent = (tx.vin || []).some(own);
           const external = (sent ? tx.vout || [] : tx.vin || []).filter((io) => !own(io));
           const peer = external.reduce((best, io) => !best || atomic(io.value) > atomic(best.value) ? io : best, null);
+          const received = totalTo(tx.vout, addr), spent = totalTo(tx.vin, addr);
+          // A sweep also spends other addresses' coins: what went to others, capped at this
+          // address's own net loss (when it has one).
+          const paid = sent ? external.reduce((n, io) => n + atomic(io.value), 0n) : 0n, lost = spent > received ? spent - received : 0n;
           return {
           txid: tx.txid,
           time: tx.blockTime || 0,
           confirmations: tx.confirmations || 0,
-          delta: (totalTo(tx.vout, addr) - totalTo(tx.vin, addr)).toString(),
+          delta: (received - spent).toString(),
           sent,
-          amount: (sent ? external.reduce((n, io) => n + atomic(io.value), 0n) : totalTo(tx.vout, addr)).toString(),
+          amount: (sent ? (lost > 0n && lost < paid ? lost : paid) : received).toString(),
           fee: atomic(tx.fees ?? "0").toString(),
           address: peer?.addresses?.[0] || "",
         }; }),
@@ -212,7 +285,7 @@ const OWN_BLOCKBOOK = "https://node.pearlhub.net";
 /// [name, base, headers] of the indexers to ask: ours (with its key), unless turned off, and the official one.
 // Either setting may be given with or without the trailing /api/v2 the requests add.
 const indexerBase = (base) => base.replace(/\/$/, "").replace(/\/api\/v2$/, "");
-function indexers(env) {
+export function indexers(env) {
   const official = indexerBase(env.BLOCKBOOK_BASE || "https://blockbook.pearlresearch.ai");
   const own = indexerBase(env.OWN_BLOCKBOOK_BASE ?? OWN_BLOCKBOOK);
   const key = env.OWN_BLOCKBOOK_KEY ? { "x-pearl-hub-key": env.OWN_BLOCKBOOK_KEY } : {};

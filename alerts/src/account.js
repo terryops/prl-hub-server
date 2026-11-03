@@ -41,7 +41,7 @@ export async function claimPush(env, session, token, kind = "notification") {
   const result = await db.batch([
     statement,
     db.prepare(`UPDATE account_push_claims SET revoked_at=? WHERE token IN (${others}) AND ${active}`).bind(now(), ...args),
-    ...["rules", "deferred", "watches", "webpush", "fcm", "devices"].map((table) => db.prepare(`DELETE FROM ${table} WHERE token IN (${others}) AND ${active}`).bind(...args)),
+    ...["rules", "deferred", "watches", "income_watches", "webpush", "fcm", "devices"].map((table) => db.prepare(`DELETE FROM ${table} WHERE token IN (${others}) AND ${active}`).bind(...args)),
   ]);
   return !!result[0].meta.changes;
 }
@@ -117,7 +117,7 @@ export async function accountRoutes(req, env) {
         guarded("UPDATE account_devices SET revoked_at=? WHERE user_id=? AND id<>?", now(), uid, session.device_id),
         guarded("UPDATE account_push_claims SET revoked_at=? WHERE user_id=? AND device_id<>?", now(), uid, session.device_id),
         guarded(`UPDATE account_push_claims SET revoked_at=? WHERE token IN(${ownedByOthers})`,now(),uid,session.device_id,uid,session.device_id),
-        ...["rules", "deferred", "watches", "webpush", "fcm", "devices", "live"].map((table) => guarded(`DELETE FROM ${table} WHERE token IN (${ownedByOthers})`, uid, session.device_id,uid,session.device_id)),
+        ...["rules", "deferred", "watches", "income_watches", "webpush", "fcm", "devices", "live"].map((table) => guarded(`DELETE FROM ${table} WHERE token IN (${ownedByOthers})`, uid, session.device_id,uid,session.device_id)),
         guarded("UPDATE sessions SET revoked_at=? WHERE user_id=? AND id<>?", now(), uid, session.id),
       ]);
       return out[0].meta.changes ? json({ ok: true, email: next.email }) : json({ error: "conflict" }, 409);
@@ -135,7 +135,7 @@ export async function accountRoutes(req, env) {
       db.prepare("UPDATE sessions SET revoked_at=? WHERE user_id=?").bind(now(), uid),
       db.prepare("UPDATE account_push_claims SET revoked_at=? WHERE user_id=?").bind(now(), uid),
       db.prepare(`UPDATE account_push_claims SET revoked_at=? WHERE token IN(${owned})`).bind(now(),uid,uid),
-      ...["rules", "deferred", "watches", "webpush", "fcm", "devices", "live"].map((table) => db.prepare(`DELETE FROM ${table} WHERE token IN (${owned})`).bind(uid,uid)),
+      ...["rules", "deferred", "watches", "income_watches", "webpush", "fcm", "devices", "live"].map((table) => db.prepare(`DELETE FROM ${table} WHERE token IN (${owned})`).bind(uid,uid)),
       db.prepare("DELETE FROM account_configs WHERE user_id=?").bind(uid),
       db.prepare("DELETE FROM auth_codes WHERE user_id=?").bind(uid),
       db.prepare("DELETE FROM device_tickets WHERE user_id=?").bind(uid),

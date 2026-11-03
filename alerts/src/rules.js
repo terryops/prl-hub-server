@@ -94,12 +94,17 @@ function cooldownOf(rule) {
 /// auto-off. Both values are server timestamps, so phone clock skew can't matter.
 /// Legacy clients (no oneshot) keep the old behaviour: their `enabled` wins.
 /// Unchanged rules keep armed/last_fired, so a re-sync never re-fires an alert.
+/// Except a reach rule switched back on: it takes its side afresh (armed = 1), so
+/// the next arrival notifies. Kept, its side could be stale (crossed while off), or
+/// it was disarmed by a firing and would wait for the price to get 2% away first.
 export function mergeRule(old, r, oneshot = false) {
   oneshot = r.repeating == null ? oneshot : r.repeating === 0;
   const same = old && old.kind === r.kind && old.value === r.value && old.window === r.window;
   if (!same) return { enabled: r.enabled, armed: 1, last_fired: null };
   const firedOff = oneshot && !old.enabled && old.last_fired && !(r.seen_fired >= old.last_fired);
-  return { enabled: r.enabled && !firedOff ? 1 : 0, armed: old.armed, last_fired: old.last_fired };
+  const enabled = r.enabled && !firedOff ? 1 : 0;
+  const switchedOn = old.kind === "reach" && !old.enabled && enabled;
+  return { enabled, armed: switchedOn ? 1 : old.armed, last_fired: old.last_fired };
 }
 
 /// mergeRule as one SQL upsert, so the merge reads the row as it is at write
@@ -107,20 +112,21 @@ export function mergeRule(old, r, oneshot = false) {
 /// longer be undone (re-armed, switched back on) by that PUT. The tests hold
 /// the two equal. Binds: token, id, kind, value, window, enabled, oneshot, seen_fired, repeating.
 /// (In an UPDATE, SQLite reads every `rules.` column before any is assigned.)
+const SAME_CONDITION = "rules.kind = excluded.kind AND rules.value = excluded.value AND rules.window = excluded.window";
+/// The merged `enabled` of a rule with the same condition (mergeRule's).
+const MERGED_ENABLED = `CASE WHEN excluded.enabled = 1
+                              AND NOT (COALESCE(?9 = 0, ?7 = 1) AND rules.enabled = 0 AND COALESCE(rules.last_fired, 0) > 0
+                                       AND ?8 < rules.last_fired)
+                             THEN 1 ELSE 0 END`;
 export const upsertRule = (guard = null) => `
   INSERT INTO rules (token, id, kind, value, window, enabled, armed, last_fired, repeating)
   ${guard == null ? "VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, NULL, ?9)" : `SELECT ?1, ?2, ?3, ?4, ?5, ?6, 1, NULL, ?9 WHERE ${guard}`}
   ON CONFLICT(token, id) DO UPDATE SET
-    enabled = CASE WHEN rules.kind = excluded.kind AND rules.value = excluded.value AND rules.window = excluded.window
-                   THEN CASE WHEN excluded.enabled = 1
-                              AND NOT (COALESCE(?9 = 0, ?7 = 1) AND rules.enabled = 0 AND COALESCE(rules.last_fired, 0) > 0
-                                       AND ?8 < rules.last_fired)
-                             THEN 1 ELSE 0 END
-                   ELSE excluded.enabled END,
-    armed = CASE WHEN rules.kind = excluded.kind AND rules.value = excluded.value AND rules.window = excluded.window
-                 THEN rules.armed ELSE 1 END,
-    last_fired = CASE WHEN rules.kind = excluded.kind AND rules.value = excluded.value AND rules.window = excluded.window
-                      THEN rules.last_fired ELSE NULL END,
+    enabled = CASE WHEN ${SAME_CONDITION} THEN ${MERGED_ENABLED} ELSE excluded.enabled END,
+    armed = CASE WHEN ${SAME_CONDITION}
+                 THEN CASE WHEN rules.kind = 'reach' AND rules.enabled = 0 AND ${MERGED_ENABLED} = 1 THEN 1 ELSE rules.armed END
+                 ELSE 1 END,
+    last_fired = CASE WHEN ${SAME_CONDITION} THEN rules.last_fired ELSE NULL END,
     kind = excluded.kind, value = excluded.value, window = excluded.window, repeating = excluded.repeating`;
 export const UPSERT_RULE = upsertRule();
 

@@ -4,7 +4,8 @@
 // Its RSA key signs an RS256 JWT that oauth2.googleapis.com trades for an access
 // token (the JWT-bearer grant). The token is kept in this isolate's memory until a
 // minute before Google says it expires; within an isolate the mint is single-flight,
-// so a tick's concurrent pushes all wait on one token.
+// so a tick's concurrent pushes all wait on one token. play.js signs in to the Play
+// Developer API through the same googleToken(), with its own key and scope.
 //
 // Messages are data-only: the app builds the notification itself from
 // { title, body, kind, tag, route }.
@@ -15,7 +16,7 @@ const SCOPE = "https://www.googleapis.com/auth/firebase.messaging";
 const TIMEOUT_MS = 8000;
 /// A cached access token is replaced this long before it expires.
 const EARLY = 60;
-const ROUTES = { price: "market", offline: "workers", test: "alerts" };
+const ROUTES = { price: "market", offline: "workers", income: "wallet", test: "alerts" };
 
 const b64url = (buf) =>
   btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -44,36 +45,52 @@ async function importKey(pem) {
   return crypto.subtle.importKey("pkcs8", der, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
 }
 
-export async function signJWT(sa, iat) {
+export async function signJWT(sa, iat, scope = SCOPE) {
   const head = b64urlJSON({ alg: "RS256", typ: "JWT", ...(sa.private_key_id ? { kid: sa.private_key_id } : {}) });
-  const claims = b64urlJSON({ iss: sa.client_email, scope: SCOPE, aud: TOKEN_URL, iat, exp: iat + 3600 });
+  const claims = b64urlJSON({ iss: sa.client_email, scope, aud: TOKEN_URL, iat, exp: iat + 3600 });
   const key = await importKey(sa.private_key);
   const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, new TextEncoder().encode(`${head}.${claims}`));
   return `${head}.${claims}.${b64url(sig)}`;
 }
 
-let memo = null;     // { raw, token, exp } — the current access token
-let minting = null;  // { raw, p } — the in-flight mint every concurrent caller awaits
+const memo = new Map();     // scope → { raw, token, exp }: the current access token
+const minting = new Map();  // scope → { raw, p }: the in-flight mint every concurrent caller awaits
 
-/// → { token } | { error: a send() result }. `stale` is a token FCM just refused:
-/// it is not handed out again.
-async function accessToken(env, sa, stale = null) {
-  const raw = env.FCM_SERVICE_ACCOUNT;
-  if (memo && memo.raw === raw && memo.token !== stale && Date.now() / 1000 < memo.exp - EARLY) return { token: memo.token };
-  if (!minting || minting.raw !== raw) {
-    const p = mint(sa).finally(() => { if (minting?.p === p) minting = null; });
-    minting = { raw, p };
+/// An access token for the service account `sa` (parsed from the secret text `raw`) in `scope`.
+/// `stale` is a token Google just refused: it is not handed out again.
+/// → { token } | { retry: true, status?, reason } Google down or busy, or no answer: try later
+///            | { refused: true, status?, reason } a bad key, a revoked or disabled account
+export async function googleToken(raw, sa, scope, stale = null) {
+  const m = memo.get(scope);
+  if (m && m.raw === raw && m.token !== stale && Date.now() / 1000 < m.exp - EARLY) return { token: m.token };
+  let f = minting.get(scope);
+  if (!f || f.raw !== raw) {
+    const p = mint(sa, scope).finally(() => { if (minting.get(scope)?.p === p) minting.delete(scope); });
+    f = { raw, p };
+    minting.set(scope, f);
   }
-  const got = await minting.p;
-  if (got.token) memo = { raw, token: got.token, exp: got.exp };
+  const got = await f.p;
+  if (got.token) memo.set(scope, { raw, token: got.token, exp: got.exp });
   return got;
 }
 
-async function mint(sa) {
+/// → { token } | { error: a send() result }. `stale` is a token FCM just refused.
+async function accessToken(env, sa, stale = null) {
+  const got = await googleToken(env.FCM_SERVICE_ACCOUNT, sa, SCOPE, stale);
+  if (got.token) return got;
+  const status = got.status ? { status: got.status } : {};
+  return {
+    error: got.retry
+      ? { ok: false, retry: true, ...status, reason: got.status ? "fcm auth unavailable" : "fcm auth failed" }
+      : { ok: false, fail: true, ...status, reason: got.status ? "fcm auth refused" : "invalid FCM configuration" },
+  };
+}
+
+async function mint(sa, scope) {
   const iat = Math.floor(Date.now() / 1000);
   let jwt;
-  try { jwt = await signJWT(sa, iat); }
-  catch { return { error: { ok: false, fail: true, reason: "invalid FCM configuration" } }; }
+  try { jwt = await signJWT(sa, iat, scope); }
+  catch { return { refused: true, reason: "invalid service account key" }; }
   try {
     const r = await fetch(TOKEN_URL, {
       method: "POST",
@@ -86,29 +103,31 @@ async function mint(sa) {
     if (typeof out?.access_token === "string" && out.access_token) {
       return { token: out.access_token, exp: iat + (Number(out.expires_in) || 3600) };
     }
-    // Google is down or busy: the push goes again on a later tick. Anything else
-    // (a revoked key, a disabled account) won't mend by retrying.
-    if (r.status === 429 || r.status >= 500) return { error: { ok: false, retry: true, status: r.status, reason: "fcm auth unavailable" } };
-    return { error: { ok: false, fail: true, status: r.status, reason: "fcm auth refused" } };
+    // Google is down or busy: ask again later. Anything else (a revoked key, a disabled
+    // account) won't mend by retrying.
+    if (r.status === 429 || r.status >= 500) return { retry: true, status: r.status, reason: "auth unavailable" };
+    return { refused: true, status: r.status, reason: "auth refused" };
   } catch {
-    return { error: { ok: false, retry: true, reason: "fcm auth failed" } };
+    return { retry: true, reason: "auth failed" };
   }
 }
 
-/// Tests: forget the cached token.
-export function resetTokenCache() {
-  memo = null;
-  minting = null;
+/// Tests: forget the cached tokens (of one scope, or all).
+export function resetTokenCache(scope) {
+  if (scope) { memo.delete(scope); minting.delete(scope); }
+  else { memo.clear(); minting.clear(); }
 }
 
 /// The data message for an APNs payload (i18n.js / the offline pushes in index.js).
 /// kind: price (a rule, also when queued for quiet hours), offline (a monitor's
-/// workers went down or came back), test. tag: what the notification replaces —
-/// the rule id, as APNs collapses on, or the watch, as Web Push tags it.
+/// workers went down or came back), income (到账提醒: a payment), test. tag: what the
+/// notification replaces — the rule id, as APNs collapses on, or the watch, as Web Push
+/// tags it; a payment replaces nothing (its own txid), so two payments are two notifications.
 export function dataFor(payload, opts = {}) {
   const alert = payload.aps?.alert || {};
-  const kind = payload.watch ? "offline" : payload.alert && !payload.alert.test ? "price" : "test";
-  const tag = kind === "offline" ? `worker:${payload.watch.id}` : kind === "price" ? String(opts.collapseId || payload.alert.id || "price-alert") : "test";
+  const kind = payload.watch ? "offline" : payload.income ? "income" : payload.alert && !payload.alert.test ? "price" : "test";
+  const tag = kind === "offline" ? `worker:${payload.watch.id}` : kind === "income" ? String(payload.income.tag)
+    : kind === "price" ? String(opts.collapseId || payload.alert.id || "price-alert") : "test";
   return {
     title: String(alert.title || "Pearl Hub"),
     // Android shows the monitor's name (the APNs subtitle) as the body's first line.
@@ -169,7 +188,9 @@ export async function sendData(env, reg, data, opts = {}) {
     android: {
       priority: opts.priority && opts.priority < 10 ? "NORMAL" : "HIGH",
       ttl: `${Math.max(0, Math.floor(opts.ttl ?? 3600))}s`,
-      ...(data.tag ? { collapse_key: data.tag } : {}),
+      // A payment replaces nothing, so it is not collapsible: FCM keeps only four collapse keys
+      // per offline device, and would drop payments past that.
+      ...(data.tag && data.kind !== "income" ? { collapse_key: data.tag } : {}),
     },
   };
   let auth = await accessToken(env, sa);

@@ -1,7 +1,6 @@
 // Exact-amount orders: integer decimal arithmetic, atomic claims, no public txid claiming.
 import { webJson as json, now, hex } from "./http.js";
 import { chainAddress, chainHeight, totalTo, ADDRESS_RE } from "./chain.js";
-import { send, apnsConfigured } from "./apns.js";
 import { logError } from "./log.js";
 export const ORDER_TTL = 1800; // seconds, quote validity and empty identity lifetime
 const MATCH_FOR = 7 * 86400; // seconds

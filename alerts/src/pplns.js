@@ -98,23 +98,33 @@ export function extendPPLNSHistory(previous, id, pool, point) {
 /// the work it displayed (fee, luck and lost work together); the pool's own block list says
 /// how much work those blocks took (Σ effort, each block's shares ÷ difficulty), so its luck
 /// is blocks ÷ Σ effort. Dividing that out leaves the fee and the work the pool loses: what a
-/// miner gives up in the long run. Pools that publish no per-block effort get no estimate.
+/// miner gives up in the long run. PearlHash's accepted shares stand in for a block list (see
+/// pearlHashShares); other pools that publish no per-block effort get no estimate.
 export function pplnsMeasurement(history, t = now(), effort = null) {
-  if (!validHistory(history) || !validEffort(effort)) return null;
-  const end = history.last.ts, daily = dailyPart(effort, end);
-  const segments = history.segments.filter((s) => s.end > end - FEE_SPAN && s.start >= (daily ? daily.from : effort.since));
+  if (!validHistory(history)) return null;
+  const end = history.last.ts, list = validEffort(effort), shares = list ? null : pearlHashShares(effort, end);
+  if (!list && !shares) return null;
+  const daily = list ? dailyPart(effort, end) : null;
+  const segments = history.segments.filter((s) => s.end > end - FEE_SPAN && s.start >= (shares ? shares.from : daily ? daily.from : effort.since));
   if (!segments.length) return null;
   const start = segments[0].start;
   const sum = (field) => segments.reduce((total, s) => total + s[field], 0);
   const covered = segments.reduce((total, s) => total + s.end - s.start, 0);
   if (covered < MIN_WINDOW || end - start > FEE_SPAN + 3600 || end > t + 60 || end < t - 1800) return null;
-  const netPRL = sum("netPRL"), expectedPRL = sum("expectedPRL");
+  if (shares && shares.seconds < covered * .9) return null;
+  // Net at today's fee, not the one each segment was written with: what a miner pays from now on,
+  // and a corrected fee counts at once (PearlHash: 1% assumed until 2026-11-01, 0.1% paid).
+  const fee = history.last.fee;
+  const gross = segments.reduce((total, s) => total + (s.grossPRL ?? (fee < 100 ? s.netPRL / (1 - fee / 100) : NaN)), 0);
+  const netPRL = gross * (1 - fee / 100), expectedPRL = sum("expectedPRL");
   if (!finite(netPRL) || !finite(expectedPRL) || expectedPRL <= 0) return null;
   const expectedBlocks = expectedPRL / history.last.reward;
   if (!(expectedBlocks >= MIN_PPLNS_BLOCKS)) return null;
   // The pool's blocks inside observed time: holes drop the pool's blocks as they drop the chain's.
   let i = 0, poolBlocks = 0, orphans = 0, work = 0;
-  for (const [, ts, e, orphan] of effort.blocks) {
+  // No list: the pool's blocks are the chain's, each taking its mean effort over the same days.
+  if (shares) { poolBlocks = sum("blocks"); work = poolBlocks * shares.work / shares.blocks; }
+  else for (const [, ts, e, orphan] of effort.blocks) {
     while (i < segments.length && segments[i].end < ts) i++;
     if (i === segments.length) break;
     if (ts <= segments[i].start) continue;
@@ -132,10 +142,12 @@ export function pplnsMeasurement(history, t = now(), effort = null) {
   if (!poolBlocks || !(work > 0) || Math.abs(chainBlocks - kept) > Math.max(3, kept * .05)) return null;
   // Luck out: × the pool's mean effort per block (its blocks ÷ the work they took, inverted).
   // Its own shares above the hashrate it displays mean the display runs low: the shares are the
-  // work its miners did, so the baseline becomes the blocks the chain saw plus orphans
-  // (fee and orphans remain). Below it, miners did work that never became shares, and the
-  // display stays the baseline.
-  const ratio = netPRL / expectedPRL * Math.min(work / poolBlocks, expectedBlocks / (chainBlocks + orphans));
+  // work its miners did, so the baseline becomes the blocks the chain saw plus orphans, at the
+  // reward those blocks paid (fee and orphans remain). Below it, miners did work that never
+  // became shares, and the display stays the baseline. (Pricing that baseline at the latest
+  // block reward read ~0.4% low while the reward fell: HeroMiners at fee 0 showed −0.44%.)
+  const ratio = Math.min(netPRL / expectedPRL * work / poolBlocks,
+    chainBlocks ? (1 - fee / 100) * chainBlocks / (chainBlocks + orphans) : Infinity);
   if (!finite(ratio)) return null;
   return { id: history.id, pool: history.pool, scheme: "PPLNS", start, end, netPRL, expectedPRL, expectedBlocks,
     poolBlocks, orphans, work, luck: poolBlocks / work, ratio,
@@ -216,11 +228,17 @@ export const validOrphans = (o, t = now()) => !!o && finite(o.start) && o.start 
 /// Pearl Fortune's 1 or HeroMiners' 3 that their own lists show. So a pool gets the higher of the
 /// two rates, and the window says which source it came from.
 const CHAIN_KEY = "public:chain-orphans:v1", CHAIN_KEEP = 8 * DAY, CHAIN_STEP = 3600;
-/// Payout addresses the explorer leaves unnamed, checked against the pool's own block list (as
-/// POOL_ADDRESSES in overview.js).
-const CHAIN_ADDRESSES = { prl1pgr2znrzz8nwu2lrw4phrzaqqa8ukt76qsqc29wxgcwgalanur7zsk8w070: "https://pearl.jetskipool.ai/" };
+/// Payout addresses the explorer leaves unnamed, checked against the pool's own block list or its
+/// coinbase tag (as POOL_ADDRESSES in overview.js).
+const CHAIN_ADDRESSES = {
+  prl1pgr2znrzz8nwu2lrw4phrzaqqa8ukt76qsqc29wxgcwgalanur7zsk8w070: "https://pearl.jetskipool.ai/",
+  prl1prsmhnjnphz4ll4v9lhg8nhr0tv3v7g8sl6qkuyqmnwkq7rhs9c2qqak0rr: "https://www.f2pool.com/",
+};
 const hostOf = (u) => { try { return new URL(u).hostname.toLowerCase().replace(/^www\./, ""); } catch { return null; } };
-const validChain = (c) => !!c && finite(c.since) && Array.isArray(c.orphans) && c.orphans.length <= 2000 &&
+const MAX_OWNERS = 500;
+const validOwners = (o) => o === undefined || !!o && typeof o === "object" && !Array.isArray(o) &&
+  Object.keys(o).length <= MAX_OWNERS && Object.values(o).every((id) => typeof id === "string" && id.length <= 300);
+const validChain = (c) => !!c && finite(c.since) && Array.isArray(c.orphans) && c.orphans.length <= 2000 && validOwners(c.owners) &&
   c.orphans.every((o) => Array.isArray(o) && typeof o[0] === "string" && finite(o[1]) && Number.isSafeInteger(o[2]) &&
     (o[3] === null || typeof o[3] === "string")) &&
   !!c.counters && typeof c.counters === "object" && Object.values(c.counters).every((pts) => Array.isArray(pts) &&
@@ -269,8 +287,64 @@ export function chainOrphanWindow(chain, id, t = now()) {
   return blocks >= MIN_ORPHAN_BLOCKS ? { start: first[0], end: t, blocks, orphans, source: "chain" } : null;
 }
 
-/// The higher of the two rates; on a tie, the pool's own list.
-const worseOrphans = (own, chain) => !own ? chain : !chain ? own : chain.orphans * own.blocks > own.orphans * chain.blocks ? chain : own;
+/// The higher of the two rates; on a tie, the chain's (read independently of the pool).
+const worseOrphans = (own, chain) => !own ? chain : !chain ? own : chain.orphans * own.blocks >= own.orphans * chain.blocks ? chain : own;
+
+// ── Orphans read off the chain by Pearl Hub's own node ──────────────────────────────────────
+
+/// Pearl Hub's own pearld (the node box behind node.pearlhub.net, node-gateway/chainwatch) lists
+/// every block it saw over the last 8 days: the main chain (`blocks`, [height, time, miner]) and
+/// the side branches (`stale`, [hash, height, time, miner]: blocks that lost the race), each with
+/// the address its coinbase pays (`miners[miner]`). A pool's orphan rate is then read off the
+/// chain itself, by its payout addresses. One node does not see every orphan either (one that
+/// lost at once may never reach it), so the orphans lordofpearls' node saw are added by hash, and
+/// the pool's own list still wins when it shows more.
+export const NODE_BLOCKS = "https://node.pearlhub.net/chain/blocks.json";
+const HASH_RE = /^[0-9a-f]{64}$/;
+const minerAt = (i, miners) => i === null || Number.isSafeInteger(i) && i >= 0 && i < miners;
+export const validNodeBlocks = (n, t = now()) => !!n && n.v === 1 && finite(n.ts) && n.ts <= t + 60 && n.ts >= t - 1800 &&
+  finite(n.from) && n.from > 0 && n.from <= n.ts &&
+  Array.isArray(n.miners) && n.miners.length <= 5000 && n.miners.every((a) => typeof a === "string" && a.length <= 120) &&
+  Array.isArray(n.blocks) && n.blocks.length <= 20000 && n.blocks.every((b) => Array.isArray(b) &&
+    Number.isSafeInteger(b[0]) && finite(b[1]) && minerAt(b[2], n.miners.length)) &&
+  Array.isArray(n.stale) && n.stale.length <= 2000 && n.stale.every((b) => Array.isArray(b) && typeof b[0] === "string" &&
+    HASH_RE.test(b[0]) && Number.isSafeInteger(b[1]) && finite(b[2]) && minerAt(b[3], n.miners.length));
+
+/// Which pool each payout address belongs to (address → row id): the explorer's names for the
+/// addresses it lists (lifetime and 24-hour boards), CHAIN_ADDRESSES for those it leaves unnamed.
+/// Kept with the chain record, so a snapshot without the explorer keeps the last known owners.
+export function addressOwners(previous, lop, rows) {
+  const byHost = new Map(rows.filter((r) => !r.solo && r.id).map((r) => [hostOf(r.id), r.id]));
+  const fresh = {};
+  for (const [address, url] of Object.entries(CHAIN_ADDRESSES)) {
+    const id = byHost.get(hostOf(url));
+    if (id) fresh[address] = id;
+  }
+  for (const list of [lop?.lifetime?.top, lop?.leaderboard?.top]) for (const e of Array.isArray(list) ? list : []) {
+    const id = typeof e?.address === "string" && e.address.length <= 120 && typeof e?.pool?.url === "string" ? byHost.get(hostOf(e.pool.url)) : null;
+    if (id) fresh[e.address] = id;
+  }
+  const owners = { ...(validOwners(previous) && previous ? previous : {}), ...fresh };
+  return Object.keys(owners).length <= MAX_OWNERS ? owners : fresh;
+}
+
+/// A pool's orphan rate over the last week from the node's blocks: its side-branch blocks (with
+/// the explorer's, by hash) ÷ those plus its main-chain blocks, by block time.
+export function nodeOrphanWindow(node, chain, id, t = now()) {
+  if (!validNodeBlocks(node, t) || !validChain(chain) || !chain.owners) return null;
+  const start = Math.max(t - FEE_SPAN, node.from);
+  if (t - start < DAY) return null;
+  const mine = new Set();
+  node.miners.forEach((address, i) => { if (chain.owners[address] === id) mine.add(i); });
+  if (!mine.size) return null;
+  let kept = 0;
+  for (const [, ts, i] of node.blocks) if (ts > start && ts <= t && mine.has(i)) kept++;
+  const lost = new Set();
+  for (const [hash, , ts, i] of node.stale) if (ts > start && ts <= t && mine.has(i)) lost.add(hash);
+  for (const [hash, ts, , owner] of chain.orphans) if (owner === id && ts > start && ts <= t) lost.add(hash);
+  const blocks = kept + lost.size;
+  return blocks >= MIN_ORPHAN_BLOCKS ? { start, end: t, blocks, orphans: lost.size, source: "chain" } : null;
+}
 
 /// Earlier counter points: from a PPLNS history (its last counter, less the blocks of the segments
 /// after each point) or, for a pool without one, the explorer's own count of its last 24 hours.
@@ -483,9 +557,9 @@ const validLuck = (w, span, t) => !!w && finite(w.start) && finite(w.end) && w.e
 /// PearlHash publishes no per-block effort, only `hashrate_diff_5m` in `/api/stats`: its accepted
 /// share difficulty per second (an account's value ÷ the pool's equals that account's share of
 /// an hourly payout). Its displayed hashrate is that × 2.5755e14 exactly, 8.5% below the 2^48
-/// hashes a unit of network difficulty takes. Which of the two is the work that finds blocks
-/// shows only over weeks: per UTC day this keeps the observed seconds, the blocks found and the
-/// blocks each reading predicts. Owner, 2026-10-20: record it for 2–3 weeks, then decide.
+/// hashes a unit of network difficulty takes. Per UTC day this keeps the observed seconds, the
+/// blocks found and the blocks each reading predicts. 2026-10-20 to 10-31 (10.8 days): 1,110
+/// found, 1,107 by its display, 1,210 by its shares; its display is the work that finds blocks.
 const PEARLHASH = "https://pearlhash.xyz/", PH_KEY = "public:pearlhash-work:v1", PH_DAYS = 60;
 const validPHPoint = (p) => !!p && finite(p.ts) && p.ts > 0 && Number.isSafeInteger(p.blocks) && p.blocks >= 0 &&
   finite(p.diffRate) && p.diffRate >= 0 && finite(p.display) && p.display >= 0 && finite(p.difficulty) && p.difficulty > 0;
@@ -515,6 +589,18 @@ export function extendPearlHashWork(previous, point) {
     }
   }
   return { last: { ts: point.ts, blocks: point.blocks, diffRate: point.diffRate, display: point.display, difficulty: point.difficulty }, days };
+}
+
+/// The record as a block list's Σ effort: its accepted share difficulty ÷ the network's, summed
+/// over time, is what each block's shares ÷ difficulty add up to. From the cost window's first
+/// whole UTC day, recorded at the same snapshots as the history; the blocks found in the same
+/// intervals make it a mean effort per block. It must have seen most of the history's time.
+function pearlHashShares(record, end) {
+  if (!record || !validPHPoint(record.last) || !validPHDays(record.days) || Math.abs(record.last.ts - end) > 1800) return null;
+  const from = Math.ceil((end - FEE_SPAN) / DAY) * DAY;
+  let seconds = 0, blocks = 0, work = 0;
+  for (const [day, s, n, w] of record.days) if (day >= from) { seconds += s; blocks += n; work += w; }
+  return blocks > 0 && work > 0 ? { from, seconds, blocks, work } : null;
 }
 
 /// PearlHash's row and network difficulty from the snapshot, its own rate and display from `/api/stats`.
@@ -553,25 +639,27 @@ export async function recordPPLNSSnapshot(db, snapshot, fetchJSON = null, prefet
   }
   const stored = await histories(db, snapshot.rows), writes = [], summary = [];
   const ids = [...new Set(estimatedRows(snapshot.rows).map((r) => r.id))];
-  // The block lists, PearlHash's rate and the explorer's orphans do not depend on each other: asked
-  // for together, the snapshot's first reader waits for the slowest, not for all three in turn.
-  const [efforts, pearlhash, recent] = await Promise.all([
+  // The block lists, PearlHash's rate, the explorer's orphans and our node's blocks do not depend on
+  // each other: asked for together, the snapshot's first reader waits for the slowest, not for all in turn.
+  const [efforts, pearlhash, lop, node] = await Promise.all([
     fetchJSON ? refreshEfforts(stored, ids, snapshot.ts, fetchJSON)
       : new Map(ids.map((id) => [id, validEffort(stored.get(effortKey(id))) ? stored.get(effortKey(id)) : null])),
     fetchJSON ? recordPearlHash(stored, snapshot, fetchJSON) : null,
-    fetchJSON ? Promise.resolve().then(() => fetchJSON("https://lordofpearls.xyz/api/public", "overview-lop"))
-      .then((o) => o?.orphans?.recent ?? null, () => null) : null,
+    fetchJSON ? Promise.resolve().then(() => fetchJSON("https://lordofpearls.xyz/api/public", "overview-lop")).catch(() => null) : null,
+    fetchJSON ? Promise.resolve().then(() => fetchJSON(NODE_BLOCKS, "overview-node")).catch(() => null) : null,
   ]);
+  const recent = lop?.orphans?.recent ?? null;
   for (const [id, effort] of efforts) if (effort && !same(effort, stored.get(effortKey(id))))
     writes.push(db.prepare("INSERT OR REPLACE INTO kv(k,v,ts) VALUES(?,?,?)").bind(effortKey(id), JSON.stringify(effort), snapshot.ts));
   if (pearlhash) writes.push(db.prepare("INSERT OR REPLACE INTO kv(k,v,ts) VALUES(?,?,?)").bind(PH_KEY, JSON.stringify(pearlhash), snapshot.ts));
   let chain = validChain(stored.get(CHAIN_KEY)) ? stored.get(CHAIN_KEY) : null;
   if (fetchJSON) {
-    const next = extendChainOrphans(chain, recent, snapshot.rows, snapshot.ts, (id, row) => counterSeed(stored.get(key(id)), row, snapshot.ts));
+    const extended = extendChainOrphans(chain, recent, snapshot.rows, snapshot.ts, (id, row) => counterSeed(stored.get(key(id)), row, snapshot.ts));
+    const next = extended && { ...extended, owners: addressOwners(chain?.owners, lop, snapshot.rows) };
     if (next && !same(next, chain)) { chain = next; writes.push(db.prepare("INSERT OR REPLACE INTO kv(k,v,ts) VALUES(?,?,?)").bind(CHAIN_KEY, JSON.stringify(chain), snapshot.ts)); }
   }
   const orphanRate = (row) => worseOrphans(efforts.get(row.id) ? orphanWindow(efforts.get(row.id), snapshot.ts) : null,
-    chain && !row.solo ? chainOrphanWindow(chain, row.id, snapshot.ts) : null);
+    chain && !row.solo ? nodeOrphanWindow(node, chain, row.id, snapshot.ts) ?? chainOrphanWindow(chain, row.id, snapshot.ts) : null);
   const summarized = new Set();
   for (const row of snapshot.rows) {
     const point = pplnsPoint(snapshot, row);
@@ -580,9 +668,10 @@ export async function recordPPLNSSnapshot(db, snapshot, fetchJSON = null, prefet
     if (next !== previous) writes.push(db.prepare("INSERT OR REPLACE INTO kv(k,v,ts) VALUES(?,?,?)")
       .bind(key(row.id), JSON.stringify(next), snapshot.ts));
     // Every shared contract gets luck windows; a cost estimate only where `costEstimated` says so
-    // and the pool publishes its blocks' effort. The measurement keeps scheme "PPLNS": it names
-    // the kind of estimate, not the pool's contract.
-    const pplns = costEstimated(row, sharedPayout(row)) ? pplnsMeasurement(next, snapshot.ts, efforts.get(row.id)) : null;
+    // and the pool publishes its blocks' effort (PearlHash: its share record). The measurement keeps
+    // scheme "PPLNS": it names the kind of estimate, not the pool's contract.
+    const effort = row.id === PEARLHASH ? pearlhash ?? stored.get(PH_KEY) : efforts.get(row.id);
+    const pplns = costEstimated(row, sharedPayout(row)) ? pplnsMeasurement(next, snapshot.ts, effort) : null;
     summary.push({ id: row.id, pool: row.name, luck: luckWindows(next, snapshot.ts), pplns, orphans: orphanRate(row) });
     summarized.add(row.id);
   }

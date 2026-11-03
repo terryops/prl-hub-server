@@ -1171,6 +1171,8 @@ test("routes: the request the app builds (the sample its own tests check) is tak
   ]);
   assert.deepEqual(env.DB.one("SELECT lang, oneshot, win_start, win_end, tz, original_transaction_id AS otid FROM devices"),
                    { lang: "zh-Hans", oneshot: 1, win_start: 480, win_end: 1380, tz: "Asia/Shanghai", otid: "1000001" });
+  assert.deepEqual(env.DB.one("SELECT addr, label, since FROM income_watches"),
+                   { addr: "prl1p8wznc8tkhlkjaq7v8ycugz93rgs8uezq6px7873934kh35nk9q2qlz0q9m", label: "Main", since: T0 });
 });
 
 test("routes: watches and price alerts are one device record; it goes when both are gone", async () => {

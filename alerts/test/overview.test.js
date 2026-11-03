@@ -9,7 +9,9 @@ import {
   decodePoolHistory,
   payoutComparison,
   chainPoolRows,
+  mpsDataURL,
   sharedSnapshot,
+  perynPool,
   WORK,
 } from "../src/overview.js";
 import { makeEnv, call, setNow, restoreNow, T0 } from "./helpers.js";
@@ -56,6 +58,47 @@ test("chain identity: a verified payout address names Jetski's blocks; other bar
   assert.equal(pool.lifetimeBlocks, 1032);
   assert.equal(pool.lastBlockTime, 1400);
 });
+test("PearlHash: PROP by the hour at its site's 1% fee, whatever the pool table says", () => {
+  // Its own account API, 2026-10-31: each hour's blocks go to that hour's shares. Its site: "1% pool fee".
+  const [pool] = buildOverview([], { hashrate: 1000, reward: 1, prlPerTHDay: .02 }, {
+    mps: { block_time_average: 180, data: [{ pool_id: "pearlhash.xyz", url: "https://pearlhash.xyz/", hashrate: 30, blocks_1000: 25, fee: 0.5, feetype: "" }] },
+  });
+  assert.equal(pool.name, "PearlHash");
+  assert.equal(pool.fee, 1);
+  assert.deepEqual(pool.payouts.map((p) => [p.scheme, p.fee]), [["PROP", 1]]);
+});
+test("miningpoolstats: the data file's host comes from the page's preload link", () => {
+  // The page on 2026-10-25: the pool data on server.miningpoolstats.stream, the old host only in comments
+  // for the price and history files (data.miningpoolstats.stream answers 403).
+  const page = 'var last_time = "1792934212";var page = "pearl";' +
+    '<link rel="preload" href="https://server.miningpoolstats.stream/data/pearl.js?t=1792934212" as="fetch">' +
+    '<!-- <link rel="preload" href="https://data.miningpoolstats.stream/data/price/pearl.js?t=1792934212" as="fetch"> -->' +
+    '<!-- <link rel="preload" href="https://data.miningpoolstats.stream/data/history/pearl.js?t=1792934212" as="fetch"> -->';
+  assert.equal(mpsDataURL(page), "https://server.miningpoolstats.stream/data/pearl.js?t=1792934212");
+  // Another miningpoolstats host is followed; anything else is not, and without a link the current host is used.
+  assert.equal(mpsDataURL('var last_time = "5"; href="https://Data2.MiningPoolStats.stream/data/pearl.js?t=5"'),
+    "https://data2.miningpoolstats.stream/data/pearl.js?t=5");
+  assert.equal(mpsDataURL('var last_time = "5"; href="https://evil.example/x.miningpoolstats.stream/data/pearl.js?t=5"'),
+    "https://server.miningpoolstats.stream/data/pearl.js?t=5");
+  assert.equal(mpsDataURL('var last_time = "5"; href="https://miningpoolstats.stream.evil.example/data/pearl.js?t=5"'),
+    "https://server.miningpoolstats.stream/data/pearl.js?t=5");
+  assert.equal(mpsDataURL('var last_time = "5"'), "https://server.miningpoolstats.stream/data/pearl.js?t=5");
+  assert.equal(mpsDataURL("<html>no time</html>"), null);
+});
+
+test("chain identity: F2Pool's address, checked by its coinbase tag, names its blocks for its miningpoolstats row", () => {
+  const f2 = "prl1prsmhnjnphz4ll4v9lhg8nhr0tv3v7g8sl6qkuyqmnwkq7rhs9c2qqak0rr";
+  const rows = chainPoolRows({ leaderboard: { window: 24, window_unit: "hours", top: [{ blocks: 8, address: f2 }] } });
+  assert.deepEqual(rows.map((r) => [r.name, r.url, r.blocks]), [["F2Pool", "https://www.f2pool.com/", 8]]);
+  const [pool] = buildOverview([], { hashrate: 1000, reward: 1, prlPerTHDay: .02 }, {
+    mps: { block_time_average: 180, data: [{ pool_id: "f2pool.com", url: "https://www.f2pool.com/", hashrate: 30, blocks_1000: 25, fee: 1, feetype: "PPS" }] },
+    chain: { leaderboard: { recent_blocks: [{ time: 1400, miner: f2 }, { time: 1500, miner: "prl1punknown" }] },
+      lifetime: { top: [{ blocks: 228, address: f2 }, { blocks: 5000, address: "prl1punknown" }] } },
+  });
+  assert.equal(pool.name, "F2Pool");
+  assert.equal(pool.lifetimeBlocks, 228);
+  assert.equal(pool.lastBlockTime, 1400);
+});
 test("history: delta decoding preserves gaps without resetting the running value", () => {
   const points = decodePoolHistory({ history_start: "1000", history_interval: 3600, history: [100, 10, -20, "x", 50, -5] });
   assert.deepEqual(points.map((p) => p.hashrate), [100, 110, 90, null, 140, 135]);
@@ -88,10 +131,35 @@ test("Fortune: two payout schemes share one hashrate and use the same daily work
   });
   assert.equal(rows.length, 1);
   assert.equal(rows[0].hashrate, 2e15);
-  assert.deepEqual(rows[0].payouts.map((p) => [p.scheme, p.fee, p.grossPerPH]), [["PPS", 5, 100], ["PPLNS", 2, 80]]);
+  // No fee-rate reply: PPS keeps the fallback figure.
+  assert.deepEqual(rows[0].payouts.map((p) => [p.scheme, p.fee, p.grossPerPH]), [["PPS", 4, 100], ["PPLNS", 2, 80]]);
   assert.equal(rows[0].payouts[0].realFeePercent, null);
   assert.equal(rows[0].payouts[1].realFeePercent, null);
   assert.equal(rows[0].blocksSample, 25);
+  assert.ok(rows[0].payouts.every((p) => p.mergeBonus === undefined));
+});
+test("Fortune: the PPS fee comes from its fee-rate API; nonsense keeps the fallback", () => {
+  const ppsFee = (fortuneFees) => buildOverview([{ name: "Pearl Fortune", url: "https://pearlfortune.org", hashrate: 3e15, blocks: 40 }], null, {
+    fortune: { pool_stats: { pool_fee_rate: .02, rolling_stats: [] } }, fortuneFees,
+  })[0].payouts.map((p) => [p.scheme, p.fee]);
+  assert.deepEqual(ppsFee({ pool_fee_rate: .02, pps_fee_rate: .04 }), [["PPS", 4], ["PPLNS", 2]]);
+  assert.deepEqual(ppsFee({ pps_fee_rate: .035 }), [["PPS", 3.5], ["PPLNS", 2]]);
+  assert.deepEqual(ppsFee({ pps_fee_rate: .05 }), [["PPS", 5], ["PPLNS", 2]]);
+  for (const bad of [null, {}, { pps_fee_rate: null }, { pps_fee_rate: 1.5 }, { pps_fee_rate: -0.01 }, { pps_fee_rate: "x" }])
+    assert.deepEqual(ppsFee(bad), [["PPS", 4], ["PPLNS", 2]], JSON.stringify(bad));
+});
+test("F2Pool: its NOCK merge-mining bonus rides on its payout as a label, yield and fee untouched", () => {
+  const rows = buildOverview([], { reward: 2000, hashrate: 1e19, prlPerTHDay: 0.02, ts: 1 }, {
+    mps: { block_time_average: 200, data: [
+      { url: "https://www.f2pool.com", hashrate: 2e18, fee: 1, feetype: "PPS%1", blocks_1000: 20 },
+      { url: "https://solo.f2pool.com", hashrate: 1e17, fee: 1, feetype: "SOLO", blocks_1000: 1 },
+      { url: "https://another.test", hashrate: 1e16, blocks_1000: 30, fee: 0 },
+    ] },
+  });
+  const f2 = rows.find((r) => r.name === "F2Pool");
+  assert.deepEqual(f2.payouts.map((p) => [p.scheme, p.fee, p.mergeBonus]), [["PPS", 1, { coin: "NOCK", minPercent: 1, maxPercent: 2 }]]);
+  assert.equal(f2.payouts[0].grossPerPH, 20);
+  assert.ok(rows.filter((r) => r !== f2).every((r) => r.payouts.every((p) => p.mergeBonus === undefined)), JSON.stringify(rows.map((r) => [r.name, r.solo])));
 });
 test("overview: recorded pool HTML locates columns by header, preserves missing and genuine zeros", () => {
   const rows = parseTable(fixture("lordofpearls_pools.html"));
@@ -208,6 +276,125 @@ test("comparison: HeroMiners takes its scheme and fee from its own config; SOLO 
   const solo = row({ rewardScheme: "prop", fee: 0 }, hero("SOLO", { url: "https://pearl.herominers.com/solo" }));
   assert.deepEqual([solo.scheme, solo.fee], ["SOLO", 1]);
 });
+test("comparison: Lucky Pool takes its payout and fee from its own config; SOLO and bad values keep the table's", () => {
+  // Its /api/stats on 2026-11-02: config.paymentMode "prop", fee 1, while the pool table said PPLNS.
+  const network = { hashrate: 10e18, reward: 2000, prlPerTHDay: 0.02 };
+  const lucky = (scheme = "PPLNS", extra = {}) => ({ name: "Lucky Pool", url: "https://pearl.luckypool.io", scheme,
+    hashrate: 1e18, fee: 2, blocks: 40, miners: null, ...extra });
+  const row = (config, input = lucky()) => buildOverview([input], network, { lucky: { config, pool: {} } })[0];
+  const prop = row({ paymentMode: "prop", fee: 1 });
+  assert.deepEqual([prop.scheme, prop.fee, prop.feeFromPoolAPI, prop.pps], ["PROP", 1, true, false]);
+  assert.deepEqual([prop.payouts[0].scheme, prop.payouts[0].fee], ["PROP", 1]);
+  assert.deepEqual([row({ paymentMode: " PPLNS " }).scheme, row({ paymentMode: "pplns" }).fee], ["PPLNS", 2]);
+  for (const config of [undefined, {}, { paymentMode: "", fee: "x" }, { paymentMode: 7, fee: -1 }, { paymentMode: "solo", fee: 101 }]) {
+    const kept = row(config);
+    assert.deepEqual([kept.scheme, kept.fee, kept.feeFromPoolAPI], ["PPLNS", 2, false]);
+  }
+  const solo = row({ paymentMode: "prop", fee: 1 }, lucky("SOLO", { url: "https://pearl.luckypool.io/solo" }));
+  assert.deepEqual([solo.scheme, solo.fee], ["SOLO", 2]);
+  // HeroMiners' config is not read for Lucky Pool, nor Lucky Pool's for HeroMiners.
+  assert.equal(buildOverview([lucky()], network, { hero: { config: { rewardScheme: "prop", fee: 0 }, pool: {} } })[0].scheme, "PPLNS");
+});
+// app.peryn.ai/api/pool/live on 2026-11-02, trimmed: no block found yet.
+const perynLive = (pool = {}, blocks = {}) => ({
+  network: "mainnet",
+  pool: { hashrate: { macsPerSecond: 47454568246548616, windowSeconds: 600, unit: "H/s (pearld CalcWork)" },
+    shareOfNetwork: 0.00058, feePct: 1, scheme: "PPLNS", activeWorkersLastHour: 142, minersLastHour: 35,
+    luck30d: null, fpps: { active: true, feePct: 1 }, ...pool },
+  networkStats: { difficulty: 51250567.95, height: 137075, hashrate: 82053867713851180000 },
+  blocks: { found: 0, byStatus: { submitted: 0, pending: 0, mature: 0, orphaned: 0, rejected: 0 }, recent: [], ...blocks },
+});
+test("Peryn: its own API adds a row with PPS+ and PPLNS at its own fees; no block yet is 0, not unknown", () => {
+  setNow(T0);
+  const network = { hashrate: 82e18, reward: 2200, prlPerTHDay: 0.02, difficulty24h: 51e6 };
+  const rows = buildOverview([{ name: "Kryptex", url: "https://prl.kryptex.network/", hashrate: 38e18, blocks: 230, fee: 3, scheme: "PPS+" }],
+    network, { peryn: perynLive() });
+  const pool = rows.find((r) => r.name === "Peryn");
+  assert.equal(rows.length, 2);
+  assert.deepEqual([pool.id, pool.url, pool.hashrate, pool.miners, pool.fee, pool.scheme, pool.pps, pool.solo],
+    ["https://peryn.ai/", "https://peryn.ai/", 47454568246548616, 35, 1, "PPLNS", false, false]);
+  near(pool.share, 47454568246548616 / 82e18);
+  assert.deepEqual([pool.blocksPerDay, pool.blocksSample, pool.lifetimeBlocks, pool.lastBlockTime], [0, 0, 0, null]);
+  assert.deepEqual([pool.source, pool.hashFromPoolAPI, pool.feeFromPoolAPI, pool.trustworthy], ["pool", true, true, false]);
+  const theory = 2200 * 86400 * 1e15 / (51e6 * WORK);
+  assert.deepEqual(pool.payouts.map((p) => [p.scheme, p.fee, p.estimated, p.solo]), [["PPS+", 1, true, false], ["PPLNS", 1, true, false]]);
+  near(pool.payouts[0].grossPerPH, theory);
+  assert.equal(pool.payouts[1].grossPerPH, 0);
+  // Ranked by hashrate with the rest.
+  assert.deepEqual(rows.map((r) => r.name), ["Kryptex", "Peryn"]);
+});
+test("Peryn: its listed blocks count by foundAt over 24h, orphaned and rejected left out", () => {
+  setNow(T0);
+  const at = (s) => new Date(s * 1000).toISOString();
+  const o = perynLive({}, { found: 5, byStatus: { submitted: 0, pending: 2, mature: 1, orphaned: 1, rejected: 1 }, recent: [
+    { height: 137100, foundAt: at(T0 - 600), status: "pending" },
+    { height: 137090, foundAt: at(T0 - 3600), status: "orphaned" },
+    { height: 137080, foundAt: at(T0 - 7200), status: "pending" },
+    { height: 137000, foundAt: at(T0 - 2 * 86400), status: "mature" },
+    { height: 136990, foundAt: at(T0 - 3 * 86400), status: "rejected" },
+    { foundAt: "soon" }, { foundAt: at(T0 + 3600) }, null,
+  ] });
+  const p = perynPool(o);
+  assert.deepEqual([p.blocks, p.lifetimeBlocks, p.lastBlockTime], [2, 3, T0 - 600]);
+  const [row] = buildOverview([], { hashrate: 82e18, reward: 2200, prlPerTHDay: 0.02 }, { peryn: o });
+  assert.deepEqual([row.blocksPerDay, row.lifetimeBlocks, row.lastBlockTime], [2, 3, T0 - 600]);
+  near(row.payouts[1].grossPerPH, 2 * 2200 / (47454568246548616 / 1e15));
+  // No list at all: a pool that says it found none has 0, anything else is unknown.
+  assert.equal(perynPool(perynLive({}, { recent: undefined })).blocks, 0);
+  assert.equal(perynPool(perynLive({}, { found: 4, recent: undefined })).blocks, null);
+  assert.equal(perynPool(perynLive({}, { found: 1, byStatus: { orphaned: 2 } })).lifetimeBlocks, null);
+});
+test("Peryn: terms it doesn't state are left out; a reply without a hashrate adds no row", () => {
+  setNow(T0);
+  // PPS+ switched off: PPLNS alone.
+  assert.deepEqual(perynPool(perynLive({ fpps: { active: false, feePct: 1 } })).ppsFee, null);
+  const [pplns] = buildOverview([], { hashrate: 82e18, reward: 2200, prlPerTHDay: 0.02 }, { peryn: perynLive({ fpps: null }) });
+  assert.deepEqual(pplns.payouts.map((p) => [p.scheme, p.fee]), [["PPLNS", 1]]);
+  // Only PPS+: a PPS row at that fee.
+  const [pps] = buildOverview([], { hashrate: 82e18, reward: 2200, prlPerTHDay: 0.02 }, { peryn: perynLive({ scheme: null, feePct: 2, fpps: { active: true, feePct: 0.5 } }) });
+  assert.deepEqual([pps.scheme, pps.fee, pps.pps, pps.payouts.length], ["PPS+", 0.5, true, 1]);
+  // Nonsense fees are unknown, never 0.
+  const odd = perynPool(perynLive({ feePct: -1, fpps: { active: true, feePct: "x" } }));
+  assert.deepEqual([odd.fee, odd.ppsFee, odd.miners], [null, null, 35]);
+  for (const o of [null, {}, "x", { pool: {} }, perynLive({ hashrate: { macsPerSecond: 0 } }), perynLive({ hashrate: 5e16 })])
+    assert.deepEqual(buildOverview([], { hashrate: 82e18, reward: 2200 }, { peryn: o }), []);
+});
+test("Peryn: Founding Miner fees ride on its payouts while sign-ups are open; fee, yield and other pools untouched", () => {
+  setNow(T0);
+  const network = { hashrate: 82e18, reward: 2200, prlPerTHDay: 0.02 };
+  const rows = (perynLaunch) => buildOverview([{ name: "Lucky Pool", url: "https://pearl.luckypool.io/", hashrate: 6e18, blocks: 30, fee: 1, scheme: "PPLNS" }],
+    network, { peryn: perynLive(), perynLaunch });
+  const open = rows({ launch: { mining: "live", foundingRegistration: "open" } });
+  const peryn = open.find((r) => r.name === "Peryn");
+  assert.deepEqual(peryn.payouts.map((p) => [p.scheme, p.fee, p.founding]), [["PPS+", 1, { fee: 0.5 }], ["PPLNS", 1, { fee: 0, afterFP8Months: 6 }]]);
+  assert.equal(peryn.fee, 1);
+  assert.equal(open.find((r) => r.name === "Lucky Pool").payouts[0].founding, undefined);
+  const closed = rows({ launch: { foundingRegistration: "closed" } }).find((r) => r.name === "Peryn");
+  assert.deepEqual(closed.payouts.map((p) => p.founding), [undefined, undefined]);
+  assert.deepEqual(closed.payouts.map((p) => p.grossPerPH), peryn.payouts.map((p) => p.grossPerPH));
+  for (const launch of [null, {}, { launch: null }, { launch: { foundingRegistration: true } }])
+    assert.deepEqual(rows(launch).find((r) => r.name === "Peryn").payouts.map((p) => p.founding), [undefined, undefined]);
+  // Only the schemes it names: PPLNS alone when PPS+ is off.
+  const pplns = buildOverview([], network, { peryn: perynLive({ fpps: null }), perynLaunch: { launch: { foundingRegistration: "open" } } })[0];
+  assert.deepEqual(pplns.payouts.map((p) => [p.scheme, p.founding]), [["PPLNS", { fee: 0, afterFP8Months: 6 }]]);
+});
+test("Peryn: a pool table or miningpoolstats listing of it is not doubled", () => {
+  setNow(T0);
+  const network = { hashrate: 82e18, reward: 2200, prlPerTHDay: 0.02 };
+  // Once the explorer's table lists it, that row keeps its 24h chain blocks and takes Peryn's own terms.
+  const listed = buildOverview([{ name: "Peryn", url: "https://peryn.ai", hashrate: 5e16, blocks: 1, fee: 0, scheme: "PROP", miners: 40 }],
+    network, { peryn: perynLive() });
+  assert.equal(listed.length, 1);
+  assert.deepEqual([listed[0].hashrate, listed[0].blocksPerDay, listed[0].miners, listed[0].source, listed[0].hashFromPoolAPI],
+    [5e16, 1, 40, "lordofpearls", false]);
+  assert.deepEqual(listed[0].payouts.map((p) => [p.scheme, p.fee]), [["PPS+", 1], ["PPLNS", 1]]);
+  // miningpoolstats under any of its hosts is the same pool.
+  const mps = buildOverview([], network, { peryn: perynLive(), mps: { block_time_average: 300, data: [
+    { pool_id: "peryn.ai", url: "https://pool.peryn.ai/", hashrate: 4e16, blocks_1000: 0, fee: 1, feetype: "PPLNS" }] } });
+  assert.deepEqual(mps.map((r) => [r.name, r.source]), [["Peryn", "pool"]]);
+  // Without its own API, nothing is made up.
+  assert.deepEqual(buildOverview([], network, {}), []);
+});
 test("comparison: unlisted and SOLO pools merged without duplicates or mixed-window winners", () => {
   const rows = buildOverview(
     [
@@ -266,7 +453,7 @@ const mock = (env, { fail = false, fallback = false } = {}) => {
     if (url.includes("/api/public")) return Response.json(chain());
     if (url.includes("lordofpearls"))
       return new Response(fixture("lordofpearls_pools.html"));
-    if (url.includes("data.miningpoolstats"))
+    if (url.includes("miningpoolstats.stream/data/pearl.js"))
       return Response.json({
         time: T0,
         nethash_estimat: 1e19,
@@ -287,6 +474,12 @@ const mock = (env, { fail = false, fallback = false } = {}) => {
       return new Response('var last_time = "1790000000"');
     if (url.includes("kryptex"))
       return Response.json({ fee: 0.02, fee_type: "PPS+", block_reward: 2000 });
+    if (url === "https://pearl.luckypool.io/api/stats")
+      return Response.json({ config: { paymentMode: "prop", fee: 1 }, pool: { blocks: [] } });
+    if (url === "https://pearlfortune.org/api/v1/stats/pool-fee-rate")
+      return Response.json({ data: { chain: "pearl", pool_fee_rate: 0.02, pps_fee_rate: 0.035 } });
+    if (url === "https://app.peryn.ai/api/pool/live") return Response.json(perynLive());
+    if (url === "https://peryn.ai/api/live") return Response.json({ launch: { mining: "live", foundingRegistration: "open" } });
     return Response.json({ pool: { realHashrate: 3e18 } });
   };
   return urls;
@@ -299,10 +492,19 @@ test("overview API: public no-store, capped budgets, full comparison and no pers
   assert.equal(r.status, 200);
   assert.equal(r.headers.get("cache-control"), "no-store");
   assert.ok(r.body.rows.length >= 5);
-  // Seven feeds for the table, then the newest blocks of each pool whose luck is taken out of Real Cost.
-  // The explorer's orphans and HeroMiners' blocks come from the table's own reads, not a second fetch.
-  assert.equal(urls.length, 9);
-  assert.deepEqual(urls.slice(7).sort(), ["https://pearl.luckypool.io/api/stats", "https://pearlfortune.org/api/v1/blocks?page=1"]);
+  // Eleven reads for the table (Pearl Fortune's summary and its fee rate, Lucky Pool's config, Peryn's pool and its
+  // launch state), then the newest blocks of each pool whose luck is taken out of Real Cost and our node's block
+  // list (orphans). The explorer's orphans and HeroMiners' and Lucky Pool's blocks come from the table's own
+  // reads, not a second fetch.
+  assert.equal(urls.length, 13);
+  assert.ok(urls.slice(0, 11).includes("https://pearlfortune.org/api/v1/stats/pool-fee-rate"));
+  assert.ok(urls.slice(0, 11).includes("https://app.peryn.ai/api/pool/live"));
+  assert.ok(urls.slice(0, 11).includes("https://peryn.ai/api/live"));
+  assert.equal(urls.filter((u) => u === "https://pearl.luckypool.io/api/stats").length, 1);
+  assert.deepEqual(urls.slice(11).sort(), ["https://node.pearlhub.net/chain/blocks.json", "https://pearlfortune.org/api/v1/blocks?page=1"]);
+  assert.equal(r.body.rows.find((row) => row.name === "Lucky Pool").scheme, "PROP");
+  const peryn = r.body.rows.find((row) => row.name === "Peryn");
+  assert.deepEqual([peryn.fee, peryn.miners, peryn.payouts.map((p) => [p.scheme, p.founding?.fee])], [1, 35, [["PPS+", 0.5], ["PPLNS", 0]]]);
   const pplns = r.body.rows.find((row) => row.scheme === "PPLNS" && row.earningsPerPH != null && row.fee != null);
   assert.ok(pplns);
   assert.equal(pplns.payouts[0].realFeePercent, null); // A 24h snapshot cannot supply a five-day PPLNS estimate.
@@ -364,6 +566,24 @@ test("overview feeds: a pool's own API that fails once is read again a second la
     assert.equal(r.body.rows.find((row) => row.name === "Pearl Fortune").feeFromPoolAPI, true);
     assert.equal(f.urls.filter((u) => u === "https://pearlfortune.org/api/v1/summary").length, 2);
     assert.deepEqual(f.warnings, ["overview feed failed: Pearl Fortune, attempt 1, HTTP 503"]);
+    // Through the whole reply (real fees and luck attached): PF's PPS fee from its fee-rate API, F2Pool's NOCK label.
+    assert.deepEqual(r.body.rows.find((row) => row.name === "Pearl Fortune").payouts.map((p) => [p.scheme, p.fee]), [["PPS", 3.5], ["PPLNS", 2]]);
+    assert.deepEqual(r.body.rows.find((row) => row.name === "F2Pool").payouts.map((p) => p.mergeBonus), [{ coin: "NOCK", minPercent: 1, maxPercent: 2 }]);
+  } finally { f.restore(); }
+});
+test("overview feeds: Pearl Fortune's fee rate failing alone keeps the snapshot whole with the fallback PPS fee", async () => {
+  setNow(T0);
+  const env = makeEnv(), f = flakyFortune(env, 0), base = globalThis.fetch;
+  globalThis.fetch = async (url, init) => String(url) === "https://pearlfortune.org/api/v1/stats/pool-fee-rate"
+    ? new Response("down", { status: 502 }) : base(url, init);
+  try {
+    const r = await call(env, "GET", "/v1/pools");
+    assert.equal(r.status, 200);
+    assert.equal(r.body.partial, false);
+    const pf = r.body.rows.find((row) => row.name === "Pearl Fortune");
+    assert.equal(pf.feeFromPoolAPI, true);
+    assert.deepEqual(pf.payouts.map((p) => [p.scheme, p.fee]), [["PPS", 4], ["PPLNS", 2]]);
+    assert.deepEqual(f.warnings, ["overview feed failed: Pearl Fortune fee rate, HTTP 502"]);
   } finally { f.restore(); }
 });
 test("overview feeds: a second failure leaves the snapshot partial; the pool table's own feeds are not retried", async () => {
@@ -394,11 +614,11 @@ test("shared source: API callers reuse the durable snapshot and refresh after fi
   setNow(T0 + 200);
   const next = await call(env, "GET", "/v1/pools");
   assert.equal(next.body.ts, first.body.ts);
-  assert.equal(urls.length, 9);
+  assert.equal(urls.length, 13);
   setNow(T0 + 301);
   const refreshed = await call(env, "GET", "/v1/pools");
   assert.equal(refreshed.body.ts, T0 + 301);
-  assert.equal(urls.length, 18);
+  assert.equal(urls.length, 26);
 });
 test("shared source: an upstream outage retains timestamped data, then expires it", async () => {
   setNow(T0);

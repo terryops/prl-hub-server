@@ -9,7 +9,7 @@ export async function revokeApple(env, ref) {
   const owned = "SELECT token FROM devices WHERE chan IN ('webpush', 'fcm') AND gid IN (SELECT gid FROM groups WHERE pro_src = 'apple' AND pro_ref = ?)";
   await db.batch([
     db.prepare("INSERT INTO apple_purchases (original_tx, revoked_at) VALUES (?, ?) ON CONFLICT(original_tx) DO UPDATE SET revoked_at = excluded.revoked_at").bind(ref, now()),
-    ...["rules", "deferred", "watches", "webpush", "fcm", "devices"].map((table) => db.prepare(`DELETE FROM ${table} WHERE token IN (${owned})`).bind(ref)),
+    ...["rules", "deferred", "watches", "income_watches", "webpush", "fcm", "devices"].map((table) => db.prepare(`DELETE FROM ${table} WHERE token IN (${owned})`).bind(ref)),
     db.prepare("UPDATE groups SET pro_at = NULL, pro_src = NULL, pro_ref = NULL WHERE pro_src = 'apple' AND pro_ref = ?").bind(ref),
   ]);
   // A refunded receipt must not delete devices authorized by another account
@@ -19,7 +19,7 @@ export async function revokeApple(env, ref) {
     AND p.revoked_at IS NULL AND a.revoked_at IS NULL AND u.deleted_at IS NULL AND g.pro_at IS NOT NULL)`;
   const receiptDevices = `SELECT token FROM devices WHERE original_transaction_id=? AND NOT ${retained("devices")}`;
   await db.batch([
-    ...["rules", "deferred", "watches", "devices"].map((table) => db.prepare(`DELETE FROM ${table} WHERE token IN (${receiptDevices})`).bind(ref)),
+    ...["rules", "deferred", "watches", "income_watches", "devices"].map((table) => db.prepare(`DELETE FROM ${table} WHERE token IN (${receiptDevices})`).bind(ref)),
     db.prepare(`DELETE FROM live WHERE original_transaction_id=? AND NOT ${retained("live")}`).bind(ref),
     db.prepare(`UPDATE devices SET account_pro=1 WHERE original_transaction_id=? AND ${retained("devices")}`).bind(ref),
     db.prepare(`UPDATE live SET account_pro=1 WHERE original_transaction_id=? AND ${retained("live")}`).bind(ref),

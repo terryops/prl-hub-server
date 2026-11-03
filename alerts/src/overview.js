@@ -70,14 +70,27 @@ const names = {
   "2miners.com": "2Miners",
   "akoyapool.com": "AkoyaPool",
   "jetskipool.ai": "Jetski",
+  "peryn.ai": "Peryn",
 };
 /// Payout addresses the explorer leaves unlabeled, each checked against the pool's own
-/// block list (every block it reports pays this address). Never inferred from volume.
+/// block list (every block it reports pays this address) or, for a pool without one, the
+/// pool's tag in the coinbase. Never inferred from volume.
 const POOL_ADDRESSES = {
   // pearl.jetskipool.ai/api/stats recent_blocks_found ↔ the explorer's block miners, 2026-10-16.
   prl1pgr2znrzz8nwu2lrw4phrzaqqa8ukt76qsqc29wxgcwgalanur7zsk8w070: "https://pearl.jetskipool.ai/",
+  // F2Pool lists no PRL blocks ("This currency has no block data"). Blocks 131130–131330
+  // (2026-10-21): every block whose coinbase ends "/F2Pool/" pays this address, and every
+  // block paid to it carries that tag.
+  prl1prsmhnjnphz4ll4v9lhg8nhr0tv3v7g8sl6qkuyqmnwkq7rhs9c2qqak0rr: "https://www.f2pool.com/",
 };
 const poolURL = (entry, address) => entry?.pool?.url || (Object.hasOwn(POOL_ADDRESSES, address || "") ? POOL_ADDRESSES[address] : null);
+// Pearl Fortune quotes its PPS fee apart from the summary (/api/v1/stats/pool-fee-rate: 4% on
+// 2026-10-23, 5% before). This is the figure when that read fails.
+const FORTUNE_PPS_FEE = 4;
+// F2Pool merge-mines NOCK for its PRL miners since 2026-10-21 (NOCK on PPLNS with a 1% fee, paid
+// to a NOCK address set in the account), worth about 1–2% of the PRL income (owner's estimate,
+// 2026-10-23). A label beside the fee: yield and Real Cost leave it out.
+const MERGE_BONUS = { F2Pool: { coin: "NOCK", minPercent: 1, maxPercent: 2 } };
 const pretty = (url, fallback) => {
   try {
     const h = new URL(url).hostname.toLowerCase();
@@ -151,6 +164,47 @@ export function chainPoolRows(chain) {
       hashrate: null, fee: null, scheme: null, miners: null });
   }
   return [...pools.values()];
+}
+/// Peryn (peryn.ai), listed by neither the explorer's table nor miningpoolstats on 2026-11-02, read
+/// from its own app.peryn.ai/api/pool/live: its 10-minute hashrate (accepted share difficulty × 2^64 /
+/// 0xffff per second, pearld's CalcWork, the 2^48 a unit of difficulty takes), the addresses that sent
+/// shares in the last hour (the "miners" of its own stats page), its fee and scheme, and the blocks it
+/// lists (`foundAt`; orphaned and rejected ones left out). It pays PPLNS or PPS+ (its default, `fpps`
+/// in the API), 1% each on 2026-11-02; its Founding Miners' fees: PERYN_FOUNDING.
+const PERYN_URL = "https://peryn.ai/";
+const PERYN_STATS = "https://app.peryn.ai/api/pool/live";
+// Its Founding Miner terms (peryn.ai/mine, 2026-11-02): PPS+ 0.5%, PPLNS 0% until Pearl's FP8 upgrade and for 6
+// months after it. Sign-ups close at that upgrade, so the terms ride on the payouts (an ⓘ beside the fee; never
+// in yield or Real Cost) only while its peryn.ai/api/live says `launch.foundingRegistration` is "open".
+const PERYN_LAUNCH = "https://peryn.ai/api/live";
+const PERYN_FOUNDING = { "PPS+": { fee: 0.5 }, PPLNS: { fee: 0, afterFP8Months: 6 } };
+const perynPercent = (v) => (num(v) != null && num(v) >= 0 && num(v) <= 100 ? num(v) : null);
+export function perynPool(o, t = now()) {
+  const pool = o?.pool, blocks = o?.blocks;
+  const hashrate = positive(pool?.hashrate?.macsPerSecond);
+  if (!pool || typeof pool !== "object" || hashrate == null) return null;
+  const recent = Array.isArray(blocks?.recent) ? blocks.recent : null;
+  const times = (recent || [])
+    .filter((b) => !/^(orphan|reject)/i.test(typeof b?.status === "string" ? b.status : ""))
+    .map((b) => (typeof b?.foundAt === "string" ? Date.parse(b.foundAt) / 1000 : NaN))
+    .filter((s) => Number.isFinite(s) && s > 0 && s <= t + 60);
+  const found = count(blocks?.found);
+  const lost = (count(blocks?.byStatus?.orphaned) ?? 0) + (count(blocks?.byStatus?.rejected) ?? 0);
+  const own = typeof pool.scheme === "string" ? scheme(pool.scheme.trim().toUpperCase()) : null;
+  const ppsFee = pool.fpps?.active === true ? perynPercent(pool.fpps.feePct) : null;
+  return {
+    name: "Peryn",
+    url: PERYN_URL,
+    hashrate,
+    miners: count(pool.minersLastHour),
+    blocks: recent ? times.filter((s) => s > t - 86400).length : found === 0 ? 0 : null,
+    fee: own || ppsFee == null ? perynPercent(pool.feePct) : ppsFee,
+    scheme: own || (ppsFee != null ? "PPS+" : null),
+    // PPS+ beside a shared-reward scheme; a pool whose own scheme is PPS already says it.
+    ppsFee: own && !/^(PPS|FPPS)/i.test(own) ? ppsFee : null,
+    lifetimeBlocks: found != null && found >= lost ? found - lost : null,
+    lastBlockTime: times.length ? Math.max(...times) : null,
+  };
 }
 export function averageDifficulty(o, days) {
   const live = positive(o?.network?.difficulty),
@@ -258,13 +312,16 @@ function mpsNetwork(m, k) {
 export function buildOverview(
   rows,
   network,
-  { hero = null, kryptex = null, mps = null, chain = null, fortune = null } = {},
+  { hero = null, lucky = null, kryptex = null, mps = null, chain = null, fortune = null, fortuneFees = null, peryn = null, perynLaunch = null } = {},
 ) {
-  const normalized = rows.map((r) => ({
+  // Peryn from its own API, unless the table already lists it (then that row takes its terms).
+  const perynData = perynPool(peryn);
+  const foundingOpen = perynLaunch?.launch?.foundingRegistration === "open";
+  const normalized = [...rows.map((r) => ({
     ...r,
     sampleDays: 1,
     source: "lordofpearls",
-  }));
+  })), ...(perynData && !rows.some((p) => samePool(p.url, perynData.url)) ? [{ ...perynData, sampleDays: 1, source: "pool" }] : [])];
   const mpsDays = positive(mps?.block_time_average)
     ? (1000 * num(mps.block_time_average)) / 86400
     : null;
@@ -273,7 +330,7 @@ export function buildOverview(
       (r) =>
         positive(r?.hashrate) &&
         safeURL(r.url) &&
-        !rows.some(
+        !normalized.some(
           (p) =>
             p.url.replace(/\/$/, "") === safeURL(r.url).replace(/\/$/, "") ||
             (p.name === pretty(r.url, "") &&
@@ -327,13 +384,34 @@ export function buildOverview(
         if (own) payout = own;
         if (ownFee != null && ownFee >= 0 && ownFee <= 100) { fee = ownFee; feeFromPoolAPI = true; }
       }
-      if (r.name === "PearlHash") fee = 1;
+      // Lucky Pool's own config names its payout and fee: "prop" and 1 on 2026-11-02 (its site shows "PROP"),
+      // while the pool table said PPLNS. A SOLO row keeps its own terms.
+      if (r.name === "Lucky Pool" && !solo && lucky?.config) {
+        const own = typeof lucky.config.paymentMode === "string" ? lucky.config.paymentMode.trim().toUpperCase() : "";
+        const ownFee = num(lucky.config.fee);
+        if (own === "PROP" || own === "PPLNS") payout = own;
+        if (ownFee != null && ownFee >= 0 && ownFee <= 100) { fee = ownFee; feeFromPoolAPI = true; }
+      }
+      // PearlHash's API names neither. Its account API, 2026-10-31: each UTC hour's blocks are shared by
+      // that hour's shares (PROP by the hour). The fee is its site's "1% pool fee" (owner, 2026-11-01),
+      // though its hours paid out 99.9% of their coinbases that week. WildRig: see MINER_REPORT (realfees.js).
+      if (r.name === "PearlHash") { fee = 1; if (!solo) payout = "PROP"; }
+      // Peryn's own API names its scheme and fee, and is where its own row's hashrate comes from.
+      const isPeryn = r.name === "Peryn" && !solo && !!perynData;
+      if (isPeryn) {
+        if (r.source === "pool" || !(hash > 0)) { hash = perynData.hashrate; hashFromPoolAPI = true; }
+        if (perynData.scheme) payout = perynData.scheme;
+        if (perynData.fee != null) { fee = perynData.fee; feeFromPoolAPI = true; }
+      }
       const isFortune = r.name === "Pearl Fortune" && !solo;
+      let ppsFee = FORTUNE_PPS_FEE;
       if (isFortune) {
         payout = "PPLNS";
         fee = num(fortune?.pool_stats?.pool_fee_rate) != null
           ? Math.round(num(fortune.pool_stats.pool_fee_rate) * 10000) / 100 : 2;
         feeFromPoolAPI ||= !!fortune;
+        const rate = num(fortuneFees?.pps_fee_rate);
+        if (rate != null && rate >= 0 && rate <= 1) ppsFee = Math.round(rate * 10000) / 100;
       }
       const pps = /^(PPS|FPPS)/i.test(payout || "");
       let perDay =
@@ -365,16 +443,23 @@ export function buildOverview(
         }
       }
       const payouts = isFortune ? [
-        payoutComparison("PPS", 5, theoretical, theoretical, true, false),
+        payoutComparison("PPS", ppsFee, theoretical, theoretical, true, false),
         payoutComparison("PPLNS", fee, earnings, theoretical, sample == null || sample < 20, false),
-      ] : [payoutComparison(payout, fee, earnings, theoretical, pps || sample == null || sample < 20, solo)];
+      ] : [
+        // Peryn's PPS+ (its default) beside its PPLNS, priced like PF's PPS.
+        ...(isPeryn && !pps && perynData.ppsFee != null ? [payoutComparison("PPS+", perynData.ppsFee, theoretical, theoretical, true, false)] : []),
+        payoutComparison(payout, fee, earnings, theoretical, pps || sample == null || sample < 20, solo),
+      ];
+      const bonus = !solo && Object.hasOwn(MERGE_BONUS, r.name) ? MERGE_BONUS[r.name] : null;
+      if (bonus) for (const p of payouts) p.mergeBonus = { ...bonus };
+      if (isPeryn && foundingOpen) for (const p of payouts) if (Object.hasOwn(PERYN_FOUNDING, p.scheme)) p.founding = { ...PERYN_FOUNDING[p.scheme] };
       const mpsRow = (Array.isArray(mps?.data) ? mps.data : []).find((p) =>
         samePool(p?.url, r.url) && ((p.url || "").toLowerCase().includes("solo") === solo));
       const recent = (Array.isArray(chain?.leaderboard?.recent_blocks) ? chain.leaderboard.recent_blocks : [])
         .filter((b) => samePool(poolURL(b, b?.miner), r.url)).map((b) => positive(b.time)).filter(Boolean);
       const lifetime = (Array.isArray(chain?.lifetime?.top) ? chain.lifetime.top : [])
         .filter((b) => samePool(poolURL(b, b?.address), r.url)).map((b) => count(b.blocks)).filter((v) => v != null);
-      const lastTimes = [positive(mpsRow?.lastblocktime), ...recent].filter(Boolean);
+      const lastTimes = [positive(mpsRow?.lastblocktime), ...recent, isPeryn ? perynData.lastBlockTime : null].filter(Boolean);
       return {
         id: r.url || r.name,
         name: r.name + (solo ? " SOLO" : ""),
@@ -402,7 +487,7 @@ export function buildOverview(
         history: decodePoolHistory(mpsRow),
         averageHashrate7d: num(mpsRow?.hashrate_average_7d) >= 0 ? num(mpsRow?.hashrate_average_7d) : null,
         lastBlockTime: lastTimes.length ? Math.max(...lastTimes) : null,
-        lifetimeBlocks: lifetime.length ? lifetime.reduce((a, b) => a + b, 0) : null,
+        lifetimeBlocks: lifetime.length ? lifetime.reduce((a, b) => a + b, 0) : isPeryn ? perynData.lifetimeBlocks : null,
         trustworthy:
           !solo &&
           !pps &&
@@ -474,24 +559,29 @@ async function feed(name, read, retry = false) {
     }
   }
 }
+/// The pool data file named by the page's preload link. Found 2026-10-25: it had moved from
+/// data.miningpoolstats.stream (403) to server.miningpoolstats.stream, and F2Pool and Jetski, listed
+/// only there, had dropped out of the table. Only a miningpoolstats.stream host is taken.
+export function mpsDataURL(page) {
+  const t = page.match(/var last_time\s*=\s*"(\d+)"/)?.[1];
+  if (!t) return null;
+  const host = page.match(/https:\/\/([a-z0-9-]+\.miningpoolstats\.stream)\/data\/pearl\.js\?t=/i)?.[1].toLowerCase()
+    || "server.miningpoolstats.stream";
+  return `https://${host}/data/pearl.js?t=${t}`;
+}
 async function fetchMPS(db) {
   const page = await get(
     "https://miningpoolstats.stream/pearl",
     db,
     "overview-mps",
   );
-  const t = page.match(/var last_time\s*=\s*"(\d+)"/)?.[1];
-  if (!t) throw new Error("upstream");
-  return JSON.parse(
-    await get(
-      `https://data.miningpoolstats.stream/data/pearl.js?t=${t}`,
-      db,
-      "overview-mps",
-    ),
-  );
+  const url = mpsDataURL(page);
+  if (!url) throw new Error("upstream");
+  return JSON.parse(await get(url, db, "overview-mps"));
 }
 const LOP_PUBLIC = "https://lordofpearls.xyz/api/public";
 const HERO_STATS = "https://pearl.herominers.com/api/stats";
+const LUCKY_STATS = "https://pearl.luckypool.io/api/stats";
 const fetchJSONFor = (db) => (url, budget) => get(url, db, budget).then(JSON.parse);
 export async function overview(env, ctx) {
   try {
@@ -511,21 +601,39 @@ export async function overview(env, ctx) {
         feed("miningpoolstats", () => fetchMPS(env.DB)),
         feed("Kryptex", () => get("https://prl-api.kryptex.network/api/v1/pool/stats", env.DB, "Kryptex").then(JSON.parse), true),
         feed("HeroMiners", () => get(HERO_STATS, env.DB, "HeroMiners").then(JSON.parse), true),
+        feed("Lucky Pool", () => get(LUCKY_STATS, env.DB, "Lucky Pool").then(JSON.parse), true),
         feed("Pearl Fortune", () => get("https://pearlfortune.org/api/v1/summary", env.DB, "Pearl Fortune")
           .then(JSON.parse).then((o) => o?.data || null), true),
+        // Its PPS fee is not in the summary: read once, and without it the row keeps FORTUNE_PPS_FEE
+        // (logged, never a partial snapshot).
+        get("https://pearlfortune.org/api/v1/stats/pool-fee-rate", env.DB, "Pearl Fortune").then(JSON.parse)
+          .then((o) => o?.data || null).catch((e) => {
+            console.warn(`overview feed failed: Pearl Fortune fee rate, ${e?.status != null ? `HTTP ${e.status}` : `${e?.name || "Error"}: ${e?.message || e}`}`);
+            return null;
+          }),
+        feed("Peryn", () => get(PERYN_STATS, env.DB, "Peryn").then(JSON.parse), true),
+        // Whether its Founding Miner sign-ups are open: read once; without it the founding terms are left out.
+        get(PERYN_LAUNCH, env.DB, "Peryn").then(JSON.parse).catch((e) => {
+          console.warn(`overview feed failed: Peryn launch, ${e?.status != null ? `HTTP ${e.status}` : `${e?.name || "Error"}: ${e?.message || e}`}`);
+          return null;
+        }),
       ]);
-      const [html, chain, mps, kryptex, hero, fortune] = replies.map((r) =>
+      const [html, chain, mps, kryptex, hero, lucky, fortune, fortuneFees, peryn, perynLaunch] = replies.map((r) =>
         r.status === "fulfilled" ? r.value : null,
       );
-      prefetched = { [LOP_PUBLIC]: chain, [HERO_STATS]: hero };
+      prefetched = { [LOP_PUBLIC]: chain, [HERO_STATS]: hero, [LUCKY_STATS]: lucky };
       const network = parseNetwork(chain) || mpsNetwork(mps, kryptex);
       const table = parseTable(html || "");
       const rows = buildOverview(table.length ? table : chainPoolRows(chain), network, {
         mps,
         kryptex,
         hero,
+        lucky,
         chain,
         fortune,
+        fortuneFees,
+        peryn,
+        perynLaunch,
       });
       if (!rows.length && !network) throw new Error("upstream");
       return {
@@ -556,7 +664,7 @@ export async function overview(env, ctx) {
 }
 
 // D1 holds one public snapshot across edge regions, Web sessions and app installs.
-// The atomic lease prevents different regions from polling the same seven feeds
+// The atomic lease prevents different regions from polling the same nine feeds
 // at once. Neither cache key includes an address, account or installation ID.
 const SNAPSHOT_KEY = "public:overview:v1";
 const LEASE_KEY = "public:overview:lease:v1";

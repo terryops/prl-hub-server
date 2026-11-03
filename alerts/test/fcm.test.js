@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { makeEnv, call, installFetch, setNow, restoreNow, T0, tick } from "./helpers.js";
 import { seedSession } from "./account-fixture.js";
 import { send, fcmConfigured, resetTokenCache, dataFor } from "../src/fcm.js";
-import { payloadFor, deferredPayloadFor, offlinePayloadFor } from "../src/i18n.js";
+import { payloadFor, deferredPayloadFor, offlinePayloadFor, incomePayloadFor } from "../src/i18n.js";
 import { b64 } from "../src/webpush.js";
 import { revokeDevice } from "../src/account-lifecycle.js";
 import { sha256 } from "../src/http.js";
@@ -154,6 +154,16 @@ test("fcm: a data-only message with string values, priority, ttl and collapse ke
   assert.equal(d.data.title, down.aps.alert.title);
   assert.equal(d.data.body, `Rig room\n${down.aps.alert.body}`);
   assert.deepEqual(d.android, { priority: "HIGH", ttl: "14400s", collapse_key: "worker:w1" });
+
+  // A payment (到账提醒) opens the wallet and replaces nothing: no collapse key, since FCM keeps only
+  // four per offline device and would drop payments past that.
+  const paid = incomePayloadFor("en", { addr: "prl1p9me4eaujkj6wl8n0a379jef0cqtu89kdm7d9vh2qt5s9zkpdt6wqr37u3n", label: "Rig" },
+    [{ txid: "ab".repeat(32), sats: 100000000n }]);
+  await send(env, REG, paid, { ttl: 12 * 3600 });
+  const i = g.sends[3].body.message;
+  assert.deepEqual({ kind: i.data.kind, tag: i.data.tag, route: i.data.route }, { kind: "income", tag: `income:${"ab".repeat(8)}`, route: "wallet" });
+  assert.equal(i.data.body, "Rig\nprl1p9me…r37u3n");
+  assert.deepEqual(i.android, { priority: "HIGH", ttl: "43200s" });
 
   // An alert queued through quiet hours is still a price alert for its rule.
   const later = dataFor(deferredPayloadFor("en", { rule_id: "r2", kind: "below", value: 0.5 }, 0.4, "03:00"), { collapseId: "r2" });

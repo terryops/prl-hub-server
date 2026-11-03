@@ -15,8 +15,15 @@ const unwrap = (v) => v?.data || v;
 const oldestEnd = (t) => Math.floor(t / DAY) * DAY - DAY;
 const current = (end, t) => end <= t && end >= oldestEnd(t);
 
+// Peryn's PPS+ is measured per fee tier: its Founding Miners' addresses and everyone else's (perynMeasurement).
+const PERYN = "Peryn", PERYN_TIERS = ["founding", "standard"], PERYN_MIN_DAYS = 3;
+const perynKey = (tier) => key(`${PERYN}:${tier}`);
+const KEYS = [...Object.keys(POOLS).map(key), ...PERYN_TIERS.map(perynKey)];
+
 export function validMeasurement(o, t = now()) {
-  return !!o && POOLS[o.pool] === o.scheme && o.theoryBasis === "hashrate_chain" &&
+  return !!o && (POOLS[o.pool] === o.scheme && o.tier == null ||
+      o.pool === PERYN && o.scheme === "PPS+" && PERYN_TIERS.includes(o.tier) && o.activeDays >= PERYN_MIN_DAYS) &&
+    o.theoryBasis === "hashrate_chain" &&
     Number.isFinite(o.netPRL) && o.netPRL >= 0 && Number.isFinite(o.expectedPRL) && o.expectedPRL > 0 &&
     Number.isSafeInteger(o.start) && o.start > 0 && Number.isSafeInteger(o.end) &&
     o.end - o.start === DAYS * DAY && o.start % DAY === 0 && current(o.end, t) &&
@@ -25,8 +32,8 @@ export function validMeasurement(o, t = now()) {
 }
 
 export async function readRealFees(db, t = now()) {
-  const { results } = await db.prepare("SELECT v FROM kv WHERE k IN (?, ?, ?)")
-    .bind(...Object.keys(POOLS).map(key)).all();
+  const { results } = await db.prepare(`SELECT v FROM kv WHERE k IN (${KEYS.map(() => "?").join(", ")})`)
+    .bind(...KEYS).all();
   return results.flatMap(({ v }) => {
     try { const o = JSON.parse(v); return validMeasurement(o, t) ? [o] : []; }
     catch { return []; }
@@ -45,16 +52,41 @@ function pplnsEstimate(row, payout, measurements) {
   return sample ? { percent: (1 - sample.ratio) * 100, start: sample.start, end: sample.end } : null;
 }
 
+// Blocks per accepted share, where a pool measurably turns its shares into fewer blocks than they imply.
+// PearlHash, 2026-11-01: its share target is the chain's (difficulty 128 = 2^208 / 128, read from the jobs it
+// sends), yet over 12 days it found 1,230 blocks where its accepted shares imply 1,339 (0.918 ± 0.026); its own
+// displayed hashrate is its share rate × 0.915 × 2^48. Real Cost counts that loss with the fee:
+// 100 − (100 − cost) × yield, and the payout carries `shareYield` for the bubble beside the figure.
+// HeroMiners, 2026-11-02: it credits shares at full value (6 h of our own 4090 on it: credited ÷ the card's own
+// reading 0.988 ± 0.035, 0.998 after the miner's 1% fee), yet from Oct 4 to Nov 1 its blocks were 0.907 ± 0.038 of
+// what its shares imply (Pearl Fortune over the same weeks 1.009); its displayed hashrate is 0.952–0.959 × its share
+// rate and its blocks follow that. The rest of the gap is left to luck, as everywhere else.
+const SHARE_YIELD = { PearlHash: 0.915, HeroMiners: 0.955 };
+
+const measuredPercent = (o) => (1 - o.netPRL / o.expectedPRL) * 100;
+
 export function attachRealFees(snapshot, measurements, pplnsMeasurements = []) {
   return { ...snapshot, rows: snapshot.rows.map((row) => {
-    const observation = measurements.find((o) => o.pool === row.name && validMeasurement(o));
+    const own = measurements.filter((o) => o.pool === row.name && validMeasurement(o));
+    // Peryn: the Founding Miners' figure while its sign-ups are open (the payout then carries `founding`, the terms a
+    // new miner gets), everyone else's once they close; the other tier when only one was measured. Both go in
+    // `realFeeTiers` for the bubble beside the figure.
+    const tiers = row.name === PERYN ? Object.fromEntries(own.filter((o) => o.tier).map((o) => [o.tier, o])) : null;
+    const open = (row.payouts || []).some((p) => p.scheme === "PPS+" && p.founding);
+    const observation = tiers ? (open ? ["founding", "standard"] : ["standard", "founding"]).map((k) => tiers[k]).find(Boolean)
+      : own.find((o) => o.tier == null);
     const matches = !row.solo && observation && (row.payouts || []).some((p) => !p.solo && p.scheme === observation.scheme);
     return { ...row, realFeeMeasurement: matches ? observation : null,
       payouts: row.payouts?.map((p) => {
         const measured = matches && !p.solo && p.scheme === observation.scheme;
         const estimate = pplnsEstimate(row, p, pplnsMeasurements);
-        return { ...p,
-          realFeePercent: measured ? (1 - observation.netPRL / observation.expectedPRL) * 100 : estimate?.percent ?? null,
+        const percent = measured ? measuredPercent(observation) : estimate?.percent ?? null;
+        const shareYield = !row.solo && !p.solo && Object.hasOwn(SHARE_YIELD, row.name) ? SHARE_YIELD[row.name] : null;
+        const cost = percent != null && shareYield ? 100 - (100 - percent) * shareYield : percent;
+        return { ...p, ...(shareYield && cost != null ? { shareYield } : {}),
+          ...(measured && observation.tier ? { realFeeTier: observation.tier,
+            realFeeTiers: Object.fromEntries(PERYN_TIERS.map((k) => [k, tiers[k] ? measuredPercent(tiers[k]) : null])) } : {}),
+          realFeePercent: cost,
           realFeeEstimated: measured ? observation.estimated : estimate ? true : null,
           realFeePeriod: measured ? { start: observation.start, end: observation.end }
             : estimate ? { start: estimate.start, end: estimate.end } : null,
@@ -289,5 +321,141 @@ export async function refreshRealFees(env) {
           THEN coalesce(json_extract(v, '$.end'), 0) < ? ELSE 1 END`).bind(key(pool), oldestEnd(t)),
       ]);
     }
+  }
+  await refreshPerynFees(env);
+}
+
+// ── Peryn (peryn.ai): PPS+ per fee tier ───────────────────────────────────────────────────────────────────────
+// Its public dashboard for an address (app.peryn.ai/address/<a>, no sign-in) states the PPS+ fee that address pays
+// ("PPS+ · 0.5% fee (Founding Miner)" or "PPS+ · 1% fee"), and lists its hashrate per UTC day for 7 days (credited
+// share difficulty over the day, three significant figures) and the $PEARL credited per day for 14 (two decimals)
+// beside Peryn's own prediction. Its JSON API (/api/v1/miner) has no history. Addresses come from its payout
+// batches (/api/v1/payments, each transaction's outputs less the pool's own inputs), largest first.
+// 2026-11-03, Oct 29 – Nov 2 against this chain integral: Founding Miner addresses 0.78% (11 addresses, 26 days),
+// everyone else 1.26% (4, 10); "Founding Miner Claimed" badges that still state 1% count with the 1%.
+// A day counts when the address mined the day before too (a first day comes ~2% short: what is credited a few
+// minutes late lands on the next day) and Peryn's prediction is within 3% of ours (a day with PPLNS work, or a
+// misread figure, is not a PPS+ day).
+const PERYN_APP = "https://app.peryn.ai", PERYN_TX = "https://blockbook.pearlresearch.ai/api/v2/tx/";
+const PERYN_PAYMENTS = 12, PERYN_PAGES = 24, PERYN_PAGE_BYTES = 4_000_000, PERYN_SETTLE = 1800, PERYN_BATCH = 4;
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const HASH_UNITS = { H: 1, kH: 1e3, KH: 1e3, MH: 1e6, GH: 1e9, TH: 1e12, PH: 1e15, EH: 1e18 };
+const figure = (s) => { const v = Number(String(s).replace(/,/g, "")); return Number.isFinite(v) && v >= 0 ? v : null; };
+// "28 Oct" on a page read at t: the latest such day not after t.
+function perynDay(d, m, t) {
+  const month = MONTHS.indexOf(m), day = Number(d);
+  if (month < 0 || !(day >= 1 && day <= 31)) return null;
+  const year = new Date(t * 1000).getUTCFullYear();
+  for (const y of [year, year - 1]) {
+    const s = Date.UTC(y, month, day) / 1000;
+    if (new Date(s * 1000).getUTCDate() === day && s <= t) return s;
+  }
+  return null;
+}
+
+export function perynPayees(txs) {
+  const pool = new Set(), paid = new Map();
+  for (const tx of txs) for (const v of tx?.vin || []) for (const a of v?.addresses || []) pool.add(a);
+  for (const tx of txs) for (const o of tx?.vout || []) {
+    const a = o?.addresses?.[0], v = number(o?.value);
+    if (typeof a !== "string" || !/^prl1[0-9a-z]{20,100}$/.test(a) || pool.has(a) || v == null || v <= 0) continue;
+    paid.set(a, (paid.get(a) || 0) + v);
+  }
+  return [...paid].sort((a, b) => b[1] - a[1]).map(([a]) => a);
+}
+
+// One address's dashboard: its tier and days, or null unless every worker shown is on PPS+.
+export function perynAddress(html, t = now()) {
+  if (typeof html !== "string") return null;
+  const fee = html.match(/>PPS\+ · ([0-9.]+)% fee( \(Founding Miner\))?</);
+  const mode = html.match(/data-payout-mode="[^"]*">([^<]*)</);
+  if (!fee || !mode || !/^PPS\+/.test(mode[1]) || />PPLNS</.test(html)) return null;
+  const hashrate = new Map(), credit = new Map(), seen = new Set();
+  for (const [, d, m, v, u] of html.matchAll(/<title>(\d{1,2}) ([A-Z][a-z]{2}): ([\d,.]+) ([kKMGTPE]?H)\/s<\/title>/g)) {
+    const s = perynDay(d, m, t), h = figure(v);
+    if (s == null || h == null) continue;
+    if (hashrate.has(s)) seen.add(s);
+    hashrate.set(s, h * HASH_UNITS[u]);
+  }
+  for (const [, d, m, p, a] of html.matchAll(/<title>(\d{1,2}) ([A-Z][a-z]{2}): predicted ([\d,.]+) \$PEARL, actual ([\d,.]+) \$PEARL<\/title>/g)) {
+    const s = perynDay(d, m, t), predicted = figure(p), actual = figure(a);
+    if (s == null || predicted == null || actual == null) continue;
+    if (credit.has(s)) seen.add(s);
+    credit.set(s, { predicted, actual });
+  }
+  // A day listed twice is ambiguous: neither reading counts.
+  const days = [...credit].filter(([s]) => !seen.has(s)).map(([start, c]) => ({ start, ...c, hashrate: hashrate.get(start) ?? null }));
+  return { tier: fee[2] ? "founding" : "standard", days };
+}
+
+export function perynMeasurement(tier, addresses, points, t = now()) {
+  const end = Math.floor(t / DAY) * DAY, start = end - DAYS * DAY;
+  let netPRL = 0, expectedPRL = 0;
+  const days = new Set(), used = new Set();
+  for (const [i, a] of addresses.entries()) {
+    if (a?.tier !== tier) continue;
+    const credited = new Map(a.days.map((d) => [d.start, d.actual]));
+    for (const d of a.days) {
+      if (d.start < start || d.start >= end || !(d.hashrate > 0) || !(d.actual > 0) || !(credited.get(d.start - DAY) > 0)) continue;
+      let expected;
+      try { expected = expectedEarnings(points, { start: d.start, end: d.start + DAY, hashrate: d.hashrate }); } catch { continue; }
+      if (!(expected > 0) || !(Math.abs(d.predicted / expected - 1) < 0.03)) continue;
+      netPRL += d.actual; expectedPRL += expected; days.add(d.start); used.add(i);
+    }
+  }
+  const o = { pool: PERYN, scheme: "PPS+", tier, netPRL, expectedPRL, start, end, measuredAt: t, estimated: true,
+    sampleCount: DAYS, activeDays: days.size, addresses: used.size, theoryBasis: "hashrate_chain" };
+  if (!validMeasurement(o, t)) throw new Error("no_complete_window");
+  return o;
+}
+
+async function getPage(env, url) {
+  if (!await reserveBudget(env.DB, PERYN, 1, now())) throw new Error("busy");
+  const r = await fetch(url, { headers: { "user-agent": UA, accept: "text/html", "accept-language": "en" }, redirect: "manual", signal: AbortSignal.timeout(15000) });
+  if (r.status !== 200) throw new Error("upstream");
+  return readCapped(r, PERYN_PAGE_BYTES);
+}
+async function settled(items, read) {
+  const out = [];
+  for (let i = 0; i < items.length; i += PERYN_BATCH)
+    out.push(...await Promise.allSettled(items.slice(i, i + PERYN_BATCH).map(read)));
+  return out.flatMap((r) => r.status === "fulfilled" && r.value ? [r.value] : []);
+}
+
+// Once a day, half an hour after 00:00 UTC (Peryn credits a few minutes late); a failed read tries again next hour.
+export async function refreshPerynFees(env) {
+  const t = now(), end = Math.floor(t / DAY) * DAY, doneKey = `realfees:last-success:${PERYN}`;
+  if (t - end < PERYN_SETTLE) return;
+  if ((await env.DB.prepare("SELECT v FROM kv WHERE k=?").bind(doneKey).first())?.v === String(end)) return;
+  const leaseKey = `realfees:lease:${PERYN}`, token = crypto.randomUUID();
+  const lease = await env.DB.prepare(`INSERT INTO kv (k,v,ts) VALUES (?,?,?)
+    ON CONFLICT(k) DO UPDATE SET v=excluded.v,ts=excluded.ts WHERE kv.ts<=?`)
+    .bind(leaseKey, token, t, t - 3600).run();
+  if (!lease.meta.changes) return;
+  const outdated = PERYN_TIERS.map((tier) => env.DB.prepare(`DELETE FROM kv WHERE k=? AND CASE WHEN json_valid(v)
+    THEN coalesce(json_extract(v, '$.end'), 0) < ? ELSE 1 END`).bind(perynKey(tier), oldestEnd(t)));
+  try {
+    const payments = (await getJSON(env, PERYN, `${PERYN_APP}/api/v1/payments?limit=${PERYN_PAYMENTS}`))?.payments;
+    const txids = [...new Set((Array.isArray(payments) ? payments : []).flatMap((p) => Array.isArray(p?.txids) ? p.txids : []))]
+      .filter((id) => /^[0-9a-f]{64}$/.test(id)).slice(0, 2 * PERYN_PAYMENTS);
+    const txs = await settled(txids, (id) => getJSON(env, PERYN, PERYN_TX + id));
+    if (!txids.length || txs.length < txids.length / 2) throw new Error("upstream");
+    const targets = perynPayees(txs).slice(0, PERYN_PAGES);
+    const read = await settled(targets, async (a) => ({ page: perynAddress(await getPage(env, `${PERYN_APP}/address/${a}`), t) }));
+    if (!targets.length || read.length < targets.length / 2) throw new Error("upstream");
+    const { results: points } = await env.DB.prepare("SELECT height,ts,difficulty FROM network_samples WHERE ts>=? ORDER BY ts,height")
+      .bind(oldestEnd(t) - (DAYS + 3) * DAY).all();
+    const distinct = points.filter((p, i) => !i || p.ts > points[i - 1].ts), pages = read.map((r) => r.page).filter(Boolean);
+    const found = PERYN_TIERS.flatMap((tier) => { try { return [perynMeasurement(tier, pages, distinct, t)]; } catch { return []; } });
+    await env.DB.batch([
+      ...found.map((o) => env.DB.prepare("INSERT OR REPLACE INTO kv (k,v,ts) VALUES (?,?,?)").bind(perynKey(o.tier), JSON.stringify(o), t)),
+      // A tier without enough days this time keeps yesterday's figure only while it is still current.
+      ...outdated,
+      env.DB.prepare("INSERT OR REPLACE INTO kv (k,v,ts) VALUES (?,?,?)").bind(doneKey, String(end), t),
+    ]);
+  } catch {
+    // Never log an address or a response.
+    console.warn("real-fee sample unavailable", PERYN);
+    await env.DB.batch(outdated);
   }
 }

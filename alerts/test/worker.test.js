@@ -105,15 +105,29 @@ test("mergeRule: one-shot clients keep a fired rule off until they have seen the
   assert.equal(mergeRule({ ...fired, enabled: 1, last_fired: null }, { ...resend, enabled: 0 }, true).enabled, 0);
 });
 
+test("mergeRule: a 到达目标价 rule switched back on takes its side afresh", () => {
+  const fired = { kind: "reach", value: 2, window: 0, enabled: 0, armed: 0, last_fired: 1000 };
+  const resend = { kind: "reach", value: 2, window: 0, enabled: 1, seen_fired: 1000 };
+  // Fired, then switched back on: it must not wait for the price to get 2% away first.
+  assert.deepEqual(mergeRule(fired, resend, true), { enabled: 1, armed: 1, last_fired: 1000 });
+  // Switched off by the user while armed on a side the price may have left since.
+  assert.deepEqual(mergeRule({ ...fired, armed: REACH_BELOW, last_fired: null }, resend, true), { enabled: 1, armed: 1, last_fired: null });
+  // Not switched on: a re-sync keeps the state, on or off.
+  assert.deepEqual(mergeRule({ ...fired, enabled: 1, armed: REACH_ABOVE }, resend, true), { enabled: 1, armed: REACH_ABOVE, last_fired: 1000 });
+  assert.deepEqual(mergeRule(fired, { ...resend, seen_fired: 900 }, true), { enabled: 0, armed: 0, last_fired: 1000 });
+  // 涨到 / 跌到 keep theirs.
+  assert.equal(mergeRule({ ...fired, kind: "above" }, { ...resend, kind: "above" }, true).armed, 0);
+});
+
 test("UPSERT_RULE (the SQL the PUT runs) agrees with mergeRule on every case", async () => {
   const db = makeD1();
   const olds = [undefined];
-  for (const enabled of [0, 1]) for (const armed of [0, 1]) for (const last_fired of [null, 1000]) {
-    olds.push({ kind: "above", value: 1.5, window: 0, enabled, armed, last_fired });
+  for (const kind of ["above", "reach"]) for (const enabled of [0, 1]) for (const armed of [0, 1, REACH_ABOVE]) for (const last_fired of [null, 1000]) {
+    olds.push({ kind, value: 1.5, window: 0, enabled, armed, last_fired });
   }
   const news = [];
-  for (const enabled of [0, 1]) for (const seen_fired of [0, 900, 1000, 1100]) for (const value of [1.5, 1.6]) {
-    news.push({ kind: "above", value, window: 0, enabled, seen_fired });
+  for (const kind of ["above", "reach"]) for (const enabled of [0, 1]) for (const seen_fired of [0, 900, 1000, 1100]) for (const value of [1.5, 1.6]) {
+    news.push({ kind, value, window: 0, enabled, seen_fired });
   }
   news.push({ kind: "move", value: 1.5, window: 3600, enabled: 1, seen_fired: 0 });
   let n = 0;

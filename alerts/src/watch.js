@@ -149,6 +149,23 @@ export function tell(told, push, back, t, still = []) {
   return next;
 }
 
+/// A name from the app for a push (a monitor's, a wallet's): control characters out, at most
+/// `max` UTF-16 units, cut between whole characters so an emoji is never split in half.
+export function cleanLabel(s, max = 40) {
+  if (typeof s !== "string") return "";
+  const t = s.replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+  if (t.length <= max) return t;
+  const parts = typeof Intl?.Segmenter === "function"
+    ? Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(t), (x) => x.segment)
+    : Array.from(t);
+  let out = "";
+  for (const part of parts) {
+    if (out.length + part.length > max) break;
+    out += part;
+  }
+  return out.trimEnd();
+}
+
 /// Validate one client-supplied watch; returns a normalized one or null.
 /// { id, pool, addr, acct?, label?, after?, again? } — acct: F2Pool's account name.
 export function sanitizeWatch(w) {
@@ -157,7 +174,7 @@ export function sanitizeWatch(w) {
   if (!id || typeof w.pool !== "string" || !POOLS.includes(w.pool)) return null;
   const addr = sanitizeTarget(w.pool, w.addr, w.acct);
   if (!addr) return null;
-  const label = typeof w.label === "string" ? w.label.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 40) : "";
+  const label = cleanLabel(w.label);
   return { id, pool: w.pool, addr, label, after: AFTER.includes(w.after) ? w.after : AFTER[0],
            again: AGAIN.includes(w.again) ? w.again : 0 };
 }

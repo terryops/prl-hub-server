@@ -413,3 +413,54 @@ function wrap(title, body, rule, usd) {
     alert: rule ? { id: rule.id, kind: rule.kind, usd } : { test: true, usd },
   };
 }
+
+// ── 到账提醒 ──────────────────────────────────────────────────────────────────
+
+/// "60.4", "0.48182119", "1234.5678": up to 4 decimals from 1 PRL up, all 8 below; cut, never
+/// rounded up past what arrived. sats: BigInt.
+export function fmtPRL(sats) {
+  const whole = sats / 100000000n;
+  let frac = (sats % 100000000n).toString().padStart(8, "0");
+  if (whole >= 1n) frac = frac.slice(0, 4);
+  frac = frac.replace(/0+$/, "");
+  return whole.toString() + (frac ? "." + frac : "");
+}
+
+/// Title of a payment push: one transaction, or n of them adding up to `amt`.
+const R = {
+  en: { one: (amt) => `Received ${amt} PRL`, many: (n, amt) => `Received ${amt} PRL in ${n} payments` },
+  "zh-Hans": { one: (amt) => `收到 ${amt} PRL`, many: (n, amt) => `收到 ${n} 笔，共 ${amt} PRL` },
+  "zh-Hant": { one: (amt) => `收到 ${amt} PRL`, many: (n, amt) => `收到 ${n} 筆，共 ${amt} PRL` },
+  ru: { one: (amt) => `Получено ${amt} PRL`, many: (n, amt) => `Получено ${amt} PRL, платежей: ${n}` },
+  vi: { one: (amt) => `Đã nhận ${amt} PRL`, many: (n, amt) => `Đã nhận ${amt} PRL qua ${n} khoản` },
+  id: { one: (amt) => `Diterima ${amt} PRL`, many: (n, amt) => `Diterima ${amt} PRL dari ${n} pembayaran` },
+  es: { one: (amt) => `Recibido: ${amt} PRL`, many: (n, amt) => `Recibido: ${amt} PRL en ${n} pagos` },
+  "pt-BR": { one: (amt) => `Recebido: ${amt} PRL`, many: (n, amt) => `Recebido: ${amt} PRL em ${n} pagamentos` },
+  fr: { one: (amt) => `Reçu : ${amt} PRL`, many: (n, amt) => `Reçu : ${amt} PRL en ${n} paiements` },
+  de: { one: (amt) => `${amt} PRL erhalten`, many: (n, amt) => `${amt} PRL in ${n} Zahlungen erhalten` },
+  it: { one: (amt) => `Ricevuti ${amt} PRL`, many: (n, amt) => `Ricevuti ${amt} PRL in ${n} pagamenti` },
+  tr: { one: (amt) => `${amt} PRL alındı`, many: (n, amt) => `${n} ödemede ${amt} PRL alındı` },
+  ja: { one: (amt) => `${amt} PRL を受け取りました`, many: (n, amt) => `${n} 件で ${amt} PRL を受け取りました` },
+  ko: { one: (amt) => `${amt} PRL 입금`, many: (n, amt) => `${n}건, 총 ${amt} PRL 입금` },
+  hi: { one: (amt) => `${amt} PRL प्राप्त हुए`, many: (n, amt) => `${n} भुगतानों में ${amt} PRL प्राप्त हुए` },
+  th: { one: (amt) => `ได้รับ ${amt} PRL`, many: (n, amt) => `ได้รับ ${amt} PRL จาก ${n} รายการ` },
+};
+
+/// "prl1p9me…r37u3n"
+export const shortAddress = (a) => (a.length > 18 ? `${a.slice(0, 8)}…${a.slice(-6)}` : a);
+
+/// The push for payments to a device's address. watch: { addr, label }; paid: [{ txid, sats }]
+/// (at least one, BigInt sats). The address's name in the app leads, when it has one.
+export function incomePayloadFor(lang, watch, paid) {
+  const r = R[lang] || R.en;
+  const amt = fmtPRL(paid.reduce((n, p) => n + p.sats, 0n));
+  const alert = { title: paid.length === 1 ? r.one(amt) : r.many(paid.length, amt), body: shortAddress(watch.addr) };
+  if (watch.label) alert.subtitle = watch.label;
+  return {
+    aps: { alert, sound: "default", "thread-id": "income" },
+    // A tap opens the wallet (the iOS / Mac app's PushDelegate; FCM and Web Push route on it too).
+    // `tag` is the notification's tag on Android and in browsers: one per transaction, so one
+    // payment never replaces another.
+    income: { txid: paid[paid.length - 1].txid, n: paid.length, tag: `income:${paid[paid.length - 1].txid.slice(-16)}` },
+  };
+}

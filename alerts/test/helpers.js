@@ -96,10 +96,13 @@ export function installFetch() {
       const r = await state.apns(call);
       return new Response(r.status === 200 ? null : JSON.stringify({ reason: r.reason }), { status: r.status });
     }
-    if (["lordofpearls.xyz", "miningpoolstats.stream", "data.miningpoolstats.stream"].includes(u.hostname) ||
+    if (["lordofpearls.xyz", "miningpoolstats.stream", "data.miningpoolstats.stream", "server.miningpoolstats.stream"].includes(u.hostname) ||
         u.hostname === "prl-api.kryptex.network" && u.pathname === "/api/v1/pool/stats" ||
         u.hostname === "pearl.herominers.com" && u.pathname === "/api/stats" ||
-        u.hostname === "pearlfortune.org" && u.pathname === "/api/v1/summary") {
+        u.hostname === "pearl.luckypool.io" && u.pathname === "/api/stats" ||
+        u.hostname === "app.peryn.ai" && u.pathname === "/api/pool/live" ||
+        u.hostname === "peryn.ai" && u.pathname === "/api/live" ||
+        u.hostname === "pearlfortune.org" && ["/api/v1/summary", "/api/v1/stats/pool-fee-rate"].includes(u.pathname)) {
       state.overviewRequests.push({ url: String(url), headers: init.headers });
       return state.overview ? state.overview(u, init) : new Response("overview unavailable", { status: 503 });
     }
@@ -110,7 +113,8 @@ export function installFetch() {
     const J = (o) => Response.json(o);
     const p = String(state.price);
     if (u.hostname === "api.coinex.com") return J({ code: 0, data: [{ last: p, open: "0.78" }] });
-    if (u.hostname === "big.one") return J({ code: 0, data: { close: p, open: "0.78" } });
+    // BigONE answers only the current pair name; the pre-rename PRL-USDT is "Resource not found".
+    if (u.hostname === "big.one" && u.pathname === "/api/v3/asset_pairs/PEARL-USDT/ticker") return J({ code: 0, data: { close: p, open: "0.78" } });
     if (u.hostname === "whattomine.com") return J({ exchange_rate: state.price / 80000, timestamp: Date.now() / 1000 });
     if (u.hostname === "api.kraken.com") return J({ result: { XXBTZUSD: { c: ["80000"] } } });
     if (u.hostname === "api.coinbase.com") return J({ data: { amount: "80000" } });

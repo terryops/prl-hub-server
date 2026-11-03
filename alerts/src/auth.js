@@ -102,6 +102,16 @@ async function human(req, env, body, purpose) {
   const result = await res.json();
   return res.ok && result.success === true && result.hostname === new URL(env.ACCOUNT_ORIGIN || req.url).hostname && result.action === `email_${purpose}`;
 }
+// Google Play's reviewers can't receive our email. Secret REVIEW_LOGIN = {"email":"…","code":"123456"} gives that
+// one address a fixed login code instead of an emailed one; Turnstile, every send budget, the 5-attempt limit and
+// the 5-minute expiry still apply. Unset (or malformed), sign-in is unchanged.
+function reviewCode(env, email, purpose) {
+  if (purpose !== "login" || !env.REVIEW_LOGIN) return null;
+  try {
+    const r = JSON.parse(env.REVIEW_LOGIN);
+    return emailOf(r?.email) === email && typeof r.code === "string" && /^\d{6}$/.test(r.code) ? r.code : null;
+  } catch { return null; }
+}
 export async function startEmail(req, env, body) {
   if (!enabled(env)) return error("accounts_unavailable", 503);
   if (!originOK(req, env)) return error("bad_origin", 403);
@@ -126,14 +136,15 @@ export async function startEmail(req, env, body) {
   const id = random(24);
   const bytes = new Uint32Array(1), ceiling = Math.floor(2 ** 32 / 1000000) * 1000000;
   do { crypto.getRandomValues(bytes); } while (bytes[0] >= ceiling);
-  const code = String(bytes[0] % 1000000).padStart(6, "0");
+  const review = reviewCode(env, email, purpose);
+  const code = review || String(bytes[0] % 1000000).padStart(6, "0");
   const inserted = await db.prepare(`INSERT INTO auth_challenges(id, email, purpose, user_id, code_hash, created_at, expires_at)
     SELECT ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM auth_challenges WHERE email = ? AND created_at > ?)
     RETURNING id`).bind(id, email, purpose, session?.user_id || null, await digest(env, `${id}:${email}:${purpose}:${code}`), t, t + 300, email, t - 60).first();
   if (!inserted) return error("rate_limited", 429);
   await db.prepare("UPDATE auth_challenges SET consumed_at = ? WHERE email = ? AND purpose = ? AND id <> ? AND consumed_at IS NULL").bind(t, email, purpose, id).run();
   try {
-    await env.EMAIL.send({ from: { email: env.EMAIL_FROM, name: "Pearl Hub" }, to: email,
+    if (!review) await env.EMAIL.send({ from: { email: env.EMAIL_FROM, name: "Pearl Hub" }, to: email,
       ...verificationEmail({ code, purpose, lang: body.lang }) });
     await db.prepare("UPDATE auth_challenges SET delivered = 1 WHERE id = ?").bind(id).run();
   } catch {
