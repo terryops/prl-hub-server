@@ -147,6 +147,21 @@ export const SOURCES = {
       };
     },
   },
+  Peryn: {
+    // peryn.ai. 200 with zeros and no workers for an address that never mined here; 400
+    // for one it can't parse. Each worker carries the pool's own `online` flag (it tracks
+    // the connection: a rig can be offline a minute after its last share) and an ISO stamp.
+    url: (a) => `https://app.peryn.ai/api/v1/miner/${a}`,
+    parse(o) {
+      const rigs = list(o.workers), b = o.balance && typeof o.balance === "object" ? o.balance : {};
+      const known = rigs.length > 0 || list(o.payouts).length > 0
+        || [o.hashrate1h, o.hashrate24h, b.owedPrl, b.pendingPrl, b.paidPrl].some((v) => num(v) > 0);
+      if (!known) return MISSING;
+      return {
+        workers: rigs.map((w) => ({ name: text(w.name), online: w.online === true, last: stamp(Date.parse(text(w.lastShare)) / 1000) })),
+      };
+    },
+  },
   F2Pool: {
     // The account's read-only page; `addr` is "<key>" or "<key>/<account>".
     // X-Requested-With is what makes it answer JSON instead of the HTML page.

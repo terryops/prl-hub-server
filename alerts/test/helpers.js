@@ -106,7 +106,8 @@ export function installFetch() {
       state.overviewRequests.push({ url: String(url), headers: init.headers });
       return state.overview ? state.overview(u, init) : new Response("overview unavailable", { status: 503 });
     }
-    if (state.pool && POOL_HOSTS.includes(u.hostname)) {
+    // Peryn's host also serves the overview and the daily Real Cost reads: only its miner endpoint is a poll.
+    if (state.pool && (POOL_HOSTS.includes(u.hostname) || u.hostname === "app.peryn.ai" && u.pathname.startsWith("/api/v1/miner/"))) {
       state.polls.push({ url: String(url), headers: init.headers });
       return state.pool(u, init);
     }

@@ -225,6 +225,20 @@ test("full stats: Jetski matches Swift fixtures — 5m live, 1h, 6h; grains to P
   assert.equal(parseStats("Jetski", [f("jetski_miner_empty.json")]).missing, true);
 });
 
+test("full stats: Peryn matches Swift fixtures — 1h and 24h, owed + confirming", () => {
+  const s = parseStats("Peryn", [f("peryn_miner.json")], 0);
+  assert.deepEqual(s.windows, ["hour", "day"]);
+  near(s.pending, 0.83860819);
+  near(s.paid, 24.1883303);
+  assert.equal(s.pendingKind, "pending");
+  near(value(s, "hour"), 2374365596771335.5);
+  near(value(s, "day"), 2243537486614917.2);
+  assert.deepEqual(s.workers.map((x) => [x.name, x.online]), [["4090", true], ["Rig001", true], ["Rig003", true], ["RIG004", false]]);
+  near(s.workers[3].rates.hour, 281877764516750.1);
+  assert.equal(s.workers[0].rates.live, undefined);
+  assert.equal(parseStats("Peryn", [f("peryn_miner_empty.json")]).missing, true);
+});
+
 test("full stats: definitive strangers and unconfirmed F2 estimate", () => {
   for (const [pool, file] of [
     ["AlphaPool", "alphapool_miner_empty.json"],

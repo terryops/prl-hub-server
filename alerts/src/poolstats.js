@@ -174,6 +174,14 @@ export function parseStats(pool, replies, t = now()) {
     s.pending = (n(o.current_balance_grains) + confirming) / 1e8;
     s.paid = n(o.total_paid_grains) / 1e8;
     s.workers = withRates(rows(o.workers), (w) => ({ live: n(w.hashrate_5m), hour: n(w.hashrate_1h), h6: n(w.hashrate_6h) }));
+  } else if (pool === "Peryn") {
+    if (identities.missing) return { missing: true };
+    // 1h and 24h only, both from accepted shares; owed (paid every 2 h from 1 PRL) + still confirming.
+    s.windows = ["hour", "day"];
+    s.rates = { hour: n(o.hashrate1h), day: n(o.hashrate24h) };
+    s.pending = n(o.balance?.owedPrl) + n(o.balance?.pendingPrl);
+    s.paid = n(o.balance?.paidPrl);
+    s.workers = withRates(rows(o.workers), (w) => ({ hour: n(w.hashrate1h), day: n(w.hashrate24h) }));
   } else if (pool === "F2Pool") {
     const d = o.originData;
     if (!d) return { missing: true };

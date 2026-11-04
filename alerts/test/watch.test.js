@@ -28,8 +28,22 @@ const plain = (o) => JSON.parse(JSON.stringify(o));
 
 // ── pools ────────────────────────────────────────────────────────────────────
 
-test("pools: the eight pools the app monitors, by the app's names", () => {
-  assert.deepEqual([...POOLS].sort(), ["AlphaPool", "F2Pool", "HeroMiners", "Jetski", "Kryptex", "Lucky Pool", "Pearl Fortune", "PearlHash"]);
+test("pools: the nine pools the app monitors, by the app's names", () => {
+  assert.deepEqual([...POOLS].sort(), ["AlphaPool", "F2Pool", "HeroMiners", "Jetski", "Kryptex", "Lucky Pool", "Pearl Fortune", "PearlHash", "Peryn"]);
+});
+
+test("pools: Peryn — the pool's own online flag (RIG004 is off a minute after its last share), ISO stamps; zeros are missing", () => {
+  const r = parseMiner("Peryn", 200, fx("peryn_miner.json"), 0);
+  assert.deepEqual(r.workers.map((w) => [w.name, w.online, w.last]), [
+    ["Rig001", true, 1793781335], ["Rig003", true, 1793781319], ["4090", true, 1793781375], ["RIG004", false, 1793780989],
+  ]);
+  assert.deepEqual(parseMiner("Peryn", 200, fx("peryn_miner_empty.json"), 0), { missing: true });
+  assert.throws(() => parseMiner("Peryn", 400, '{"v":1,"error":"invalid_address"}', 0), /http 400/);
+  // Paid out, nothing connected: a known miner with no workers, not a stranger.
+  assert.deepEqual(parseMiner("Peryn", 200, '{"workers":[],"balance":{"paidPrl":"2.5"}}', 0), { workers: [], partial: false });
+  const odd = JSON.stringify({ workers: [{ name: "", online: true }, { name: "a", online: "yes", lastShare: "garbage" }] });
+  assert.deepEqual(parseMiner("Peryn", 200, odd, 0).workers, [{ name: "—", online: true, last: null }, { name: "a", online: false, last: null }]);
+  assert.equal(sanitizeTarget("Peryn", "prl1p7777777777777777777777777777777777777777777777777777777777"), "prl1p7777777777777777777777777777777777777777777777777777777777");
 });
 
 test("pools: Jetski — the name after the address, online for 10 min after the last share; zeros are missing", () => {
