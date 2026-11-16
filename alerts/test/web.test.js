@@ -157,9 +157,9 @@ for (const [pool, files, pending, paid, window, count, online, total] of [
     1.10506955,
     63.40524874,
     "day",
-    2,
-    2,
-    1146779915064822.2,
+    8,
+    8,
+    2263271839527266,
   ],
   [
     "PearlHash",
@@ -203,8 +203,11 @@ for (const [pool, files, pending, paid, window, count, online, total] of [
     near(value(s, window), total);
     assert.equal(s.workers.length, count);
     assert.equal(s.workers.filter((x) => x.online).length, online);
-    if (pool === "Pearl Fortune" || pool === "PearlHash")
+    if (pool === "PearlHash")
       assert.equal(s.workers[0].rates.day, undefined);
+    if (pool === "Pearl Fortune")
+      assert.deepEqual(s.workers.find((x) => x.name === "storage01").rates,
+                       { live: 230952662098890.88, hour: 225055001718919.88, day: 238843688127861.56 });
     if (pool === "F2Pool") {
       near(s.rates.m15, 12509998964918.04);
       assert.deepEqual(s.windows, ["m15", "day"]);

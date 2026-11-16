@@ -136,7 +136,19 @@ export function parseStats(pool, replies, t = now()) {
       ) / (series.length || 1);
     s.rates = { live, hour: roll(1) || live, day: roll(24) || derived || live };
     s.pending = (bal + pend) / 1e8;
-    s.workers = withRates(rows(c?.workers), (w) => ({ live: n(w.reported_hashrate) }));
+    // Per rig (the app's PearlFortuneSource.rigs): live = Σ what the mining software reports on
+    // its live connections, left out when a live one reports nothing; 1h / 24h = the pool's
+    // own measurement. Before 2026-11-06 a rig was one connection with no measurement.
+    s.workers = withRates(rows(c?.workers), (w) => {
+      const live = (Array.isArray(w.sessions) ? rows(w.sessions) : [w]).filter((x) => x.stale === false);
+      const reports = live.filter((x) => (x.reported_telemetry?.hashrate_source ?? "miner") === "miner" && x.reported_hashrate != null);
+      const r = {}, m = w.pool;
+      if (!live.length) r.live = 0;
+      else if (reports.length) r.live = sum(reports, (x) => n(x.reported_hashrate));
+      if (n(m?.observed_1h_s) > 0 && m.hashrate_1h != null) r.hour = n(m.hashrate_1h);
+      if (n(m?.observed_24h_s) > 0 && m.hashrate_24h != null) r.day = n(m.hashrate_24h);
+      return r;
+    });
   } else if (pool === "PearlHash") {
     const ledger = list(o.balance_transactions).filter(prl);
     s.paid = -sum(ledger, (x) => Math.min(n(x.amount), 0));

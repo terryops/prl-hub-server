@@ -259,7 +259,9 @@ test("pool lists: each source reads its own format; a block it cannot read disca
   // HeroMiners: /api/stats and get_blocks share hash:time:difficulty:shares:score:hash:status:reward:address:region:scheme.
   const hero = ["d3:1792469299:2607960229071:3484127487590:3484006377062:d3:pending:224001991203:prl1p:na-ca:prop:", "130568",
     "64:1792373250:2541988767454:1590967350067:1590904592793:64:orphaned:224319402387:prl1p:eu-de:prop", "129995",
-    "65:1792373000:2541988767454:1590967350067:1590904592793:65:unlocked:224319402387:prl1p:eu-de:solo", "129990"];
+    "65:1792373000:2541988767454:1590967350067:1590904592793:65:unlocked:224319402387:prl1p:eu-de:solo", "129990",
+    // Real API records can retain the prop tail while the score identifies SOLO.
+    "66:1792372000:2541988767454:1590967350067:s0:66:unlocked:224319402387:prl1p:eu-de:prop", "129989"];
   const fromStats = parse("https://pearl.herominers.com/", { pool: { blocks: hero } });
   assert.deepEqual(fromStats, parse("https://pearl.herominers.com/", hero));
   assert.deepEqual(fromStats.map((x) => [x[0], x[3]]), [[130568, 0], [129995, 1]]);
@@ -398,7 +400,7 @@ test("pool lists: each snapshot reads the newest blocks and, while short of a we
     if (u.pathname === "/api/stats") return { pool: { blocks: (jump ? range(200, 210) : range(80, 90)).reverse().flatMap(entry) } };
     return range(Math.max(1, Number(u.searchParams.get("height")) - 10), Number(u.searchParams.get("height"))).reverse().flatMap(entry);
   };
-  const keep = stored(), short = { since: T0 + 85 * 600, blocks: keep.blocks.filter((x) => x[0] >= 85) };
+  const keep = stored(), short = { since: T0 + 85 * 600, sourceVersion: 2, blocks: keep.blocks.filter((x) => x[0] >= 85) };
   await env.DB.prepare("INSERT OR REPLACE INTO kv(k,v,ts) VALUES(?,?,?)").bind(`public:effort:${hero}`, JSON.stringify(short), end).run();
   setNow(end + 2700); await recordPPLNSSnapshot(env.DB, snapshot(end + 2700, { rows }), after);
   assert.equal(asked.at(-1)[0], "https://pearl.herominers.com/api/get_blocks?height=85");
@@ -534,10 +536,12 @@ test("PearlHash: per UTC day, the blocks found and the blocks its share rate and
 });
 
 /// PearlHash's record for a history: the same snapshots and block counter, its accepted shares worth
-/// `perDay` blocks of work a day (difficulty 1000), from `start`.
-const shareRecord = (end, perDay, start = T0) => {
+/// `perDay` blocks of work a day (difficulty 1000), from `start`; its display worth `shownPerDay` (by default
+/// the 80 a day it finds, as PearlHash's own display follows its blocks).
+const shareRecord = (end, perDay, start = T0, shownPerDay = 80) => {
   let w;
-  for (let ts = start; ts <= end; ts += 300) w = extendPearlHashWork(w, { ts, blocks: point(ts).blocks, diffRate: perDay * 1000 / DAY, display: 1, difficulty: 1000 });
+  for (let ts = start; ts <= end; ts += 300) w = extendPearlHashWork(w, { ts, blocks: point(ts).blocks, diffRate: perDay * 1000 / DAY,
+    display: shownPerDay * 1000 * 2 ** 48 / DAY, difficulty: 1000 });
   return w;
 };
 
@@ -568,6 +572,26 @@ test("PearlHash: its accepted shares stand in for Σ effort; luck out, the same 
   assert.equal(pplnsMeasurement(history(7, { hashPH: .1 }), end, shareRecord(end, 100)), null);
 });
 
+test("PearlHash: the share yield is its display ÷ its accepted shares, while its blocks still follow the display", () => {
+  const end = T0 + 7 * DAY, h = history(7);
+  const m = (record) => pplnsMeasurement(h, end, record);
+  // Shares worth 100 blocks a day, the display (and the blocks) 80: four in five shares find blocks.
+  near(m(shareRecord(end, 100)).shareYield, .8, 1e-6);
+  near(m(shareRecord(end, 80 / .982)).shareYield, .982, 1e-6); // PearlHash since 2026-11-02
+  // A display above the shares never counts as more than every share.
+  assert.equal(m(shareRecord(end, 70, T0, 80)).shareYield, 1);
+  // Blocks that no longer follow the display (here 80 found where it shows 100): no ratio, no estimate.
+  assert.equal(m(shareRecord(end, 120, T0, 100)), null);
+  // Within luck of it, the ratio stands: 80 found where it shows 82 a day.
+  near(m(shareRecord(end, 100, T0, 82)).shareYield, .82, 1e-6);
+  // Under 300 blocks recorded, the check cannot tell: no ratio.
+  assert.equal(m(shareRecord(end, 100, T0 + 3.5 * DAY)), null);
+  // A summary's ratio must be sane; one without it is still read (every other pool).
+  assert.ok(validPPLNSMeasurement(m(shareRecord(end, 100)), end));
+  assert.equal(validPPLNSMeasurement({ ...m(shareRecord(end, 100)), shareYield: .4 }, end), false);
+  assert.equal(validPPLNSMeasurement({ ...m(shareRecord(end, 100)), shareYield: NaN }, end), false);
+});
+
 test("PearlHash: a snapshot reads its /api/stats under its budget and stores the day totals", async () => {
   const env = makeEnv(), end = T0 + DAY;
   const ph = { ...row, id: "https://pearlhash.xyz/", name: "PearlHash", payouts: [{ scheme: null, solo: false, fee: 1 }] };
@@ -594,13 +618,14 @@ test("PearlHash: a snapshot reads its /api/stats under its budget and stores the
 
 test("PearlHash: once its share record covers the week, the summary and the API carry its cost estimate", async () => {
   const env = makeEnv(), ph = { ...row, id: "https://pearlhash.xyz/", name: "PearlHash", payouts: [{ scheme: null, solo: false, fee: 1, grossPerPH: 80, realFeePercent: null }] };
-  // 125 blocks of work a day in shares for 80 found; its display expects 100.
-  const fetchJSON = async (url) => url.includes("lordofpearls") ? {} : { hashrate: 1e15, hashrate_diff_5m: 125 * 4e7 / DAY };
+  // 125 blocks of work a day in shares for 80 found; the history's display expects 100, PearlHash's own shows the 80.
+  const fetchJSON = async (url) => url.includes("lordofpearls") ? {} : { hashrate: 80 * 4e7 * 2 ** 48 / DAY, hashrate_diff_5m: 125 * 4e7 / DAY };
   const snap = (ts) => snapshot(ts, { rows: [{ ...ph, lifetimeBlocks: point(ts).blocks }], network: { ts, prlPerTHDay: .1, reward: 1, difficulty: 4e7 } });
   for (let ts = T0; ts <= T0 + 6 * DAY; ts += 300) { setNow(ts); await recordPPLNSSnapshot(env.DB, snap(ts), fetchJSON); }
   const { pplns } = await readPoolLuck(env.DB, T0 + 6 * DAY);
   assert.deepEqual(pplns.map((m) => m.pool), ["PearlHash"]);
   near((1 - pplns[0].ratio) * 100, 1, 1e-6);
+  near(pplns[0].shareYield, .64, 1e-3);
   // A cached read (no fetcher) still uses the stored record.
   setNow(T0 + 6 * DAY + 300); await recordPPLNSSnapshot(env.DB, snap(T0 + 6 * DAY + 300));
   near((1 - (await readPoolLuck(env.DB, T0 + 6 * DAY + 300)).pplns[0].ratio) * 100, 1, 1e-6);
@@ -742,17 +767,17 @@ test("cost estimate: PPLNS and PROP by name, and PearlHash's unnamed scheme it p
   assert.equal(costEstimated(pearlhash, null), false);
   // Six days of samples: the summary carries an estimate for a PROP pool that publishes its blocks'
   // effort; PearlHash with no share record (no fetcher here), and an unnamed scheme elsewhere, get none.
-  const env = makeEnv(), hero = "https://pearl.herominers.com/", rows = [
-    { ...row, id: hero, name: "HeroMiners", payouts: [pay("PROP", { fee: 2, grossPerPH: 80, realFeePercent: null })] },
+  const env = makeEnv(), propPool = "https://pearl.luckypool.io/", rows = [
+    { ...row, id: propPool, name: "Lucky Pool", payouts: [pay("PROP", { fee: 2, grossPerPH: 80, realFeePercent: null })] },
     { ...row, id: pearlhash.id, name: "PearlHash", payouts: [pay(null, { fee: 2, grossPerPH: 80, realFeePercent: null })] },
     { ...row, id: "unnamed", name: "Unnamed", payouts: [pay(null, { fee: 2, grossPerPH: 80, realFeePercent: null })] }];
-  await env.DB.prepare("INSERT INTO kv(k,v,ts) VALUES(?,?,?)").bind(`public:effort:${hero}`, JSON.stringify(effortFor(T0 + 6 * DAY)), T0).run();
+  await env.DB.prepare("INSERT INTO kv(k,v,ts) VALUES(?,?,?)").bind(`public:effort:${propPool}`, JSON.stringify(effortFor(T0 + 6 * DAY)), T0).run();
   for (let ts = T0; ts <= T0 + 6 * DAY; ts += 300) {
     setNow(ts);
     await recordPPLNSSnapshot(env.DB, snapshot(ts, { rows: rows.map((r) => ({ ...r, lifetimeBlocks: 1000 + Math.floor((ts - T0) / 1080) })) }));
   }
   const { pplns, luck } = await readPoolLuck(env.DB, T0 + 6 * DAY);
-  assert.deepEqual(pplns.map((m) => m.pool), ["HeroMiners"]);
+  assert.deepEqual(pplns.map((m) => m.pool), ["Lucky Pool"]);
   near((1 - pplns[0].ratio) * 100, 2);
   assert.equal(luck.size, 3);
 });
@@ -1019,7 +1044,7 @@ test("node orphans: through the snapshot the node's rate is served, a tie is lab
   assert.deepEqual(r.by(hero), { start: end - 7 * DAY, end, blocks: week(1) + 1, orphans: 1, source: "chain" });
   assert.deepEqual(r.stored.owners, { prl1plucky: LUCKY, prl1phero: hero });
   // A pool's own list with more orphans than the node saw keeps its own.
-  const ownHero = effortFor(end, { since: end - 7 * DAY }); ownHero.blocks = ownHero.blocks.map((b, i) => i % 10 ? b : [b[0], b[1], b[2], 1]);
+  const ownHero = { ...effortFor(end, { since: end - 7 * DAY }), sourceVersion: 2 }; ownHero.blocks = ownHero.blocks.map((b, i) => i % 10 ? b : [b[0], b[1], b[2], 1]);
   r = await run(node, { [hero]: ownHero });
   assert.equal(r.by(hero).source, "pool"); assert.ok(r.by(hero).orphans > 1);
   // Node unreachable: Lucky's own list, as before (the explorer's counters start with this snapshot).

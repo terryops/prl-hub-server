@@ -127,39 +127,45 @@ test("the shared-reward estimate reaches PROP and PearlHash's unnamed payout, no
   setNow(t);
   const cost = (id, name, scheme) => attachRealFees({ ts: t, rows: [{ id, name, solo: false,
     payouts: [{ scheme, fee: 2, grossPerPH: 80, solo: false }] }] }, [], [publicPPLNS(id, name)]).rows[0].payouts[0];
-  near(cost("hero", "HeroMiners", "PROP").realFeePercent, 100 - (100 - 5.92) * .955);
-  // PearlHash's and HeroMiners' figures also count the shares they never turn into blocks (see the next test).
-  const pearlhash = cost("https://pearlhash.xyz/", "PearlHash", null);
-  near(pearlhash.realFeePercent, 100 - (100 - 5.92) * .915);
+  assert.equal(cost("hero", "HeroMiners", "PROP").realFeePercent, null); // Legacy summaries cannot replace its rolling estimate.
+  // PearlHash: with the share yield its record measured (its display ÷ its accepted shares).
+  const pearlhash = attachRealFees({ ts: t, rows: [{ id: "https://pearlhash.xyz/", name: "PearlHash", solo: false,
+    payouts: [{ scheme: null, fee: 2, grossPerPH: 80, solo: false }] }] }, [],
+    [{ ...publicPPLNS("https://pearlhash.xyz/", "PearlHash"), shareYield: .982 }]).rows[0].payouts[0];
+  near(pearlhash.realFeePercent, 100 - (100 - 5.92) * .982);
   assert.equal(pearlhash.realFeeEstimated, true);
   assert.deepEqual(pearlhash.realFeePeriod, { start: t - 5 * 86400, end: t });
   assert.equal(cost("other", "Other", null).realFeePercent, null);
   assert.equal(cost("https://pearlhash.xyz/", "PearlHash", "PPS").realFeePercent, null);
 });
 
-test("PearlHash's and HeroMiners' Real Cost count the shares they never turn into blocks: 100 − the rest × yield", () => {
+test("PearlHash counts its measured share yield, never the retired 0.915; HeroMiners never reuses a legacy summary", () => {
   setNow(t);
   const out = (rows, samples) => attachRealFees({ ts: t, rows }, [], samples).rows;
   const row = (id, name, solo = false) => ({ id, name, solo, payouts: [{ scheme: solo ? "SOLO" : "PROP", fee: 1, grossPerPH: 80, solo }] });
-  const PH = "https://pearlhash.xyz/";
+  const PH = "https://pearlhash.xyz/", phSample = (ratio, y = .982) => ({ ...publicPPLNS(PH, "PearlHash", ratio), shareYield: y });
   const [ph, phSolo, hero] = out([row(PH, "PearlHash"), row(PH + "solo", "PearlHash SOLO", true), row("hero", "HeroMiners")],
-    [publicPPLNS(PH, "PearlHash", .99), publicPPLNS("hero", "HeroMiners", .99)]);
+    [phSample(.99), publicPPLNS("hero", "HeroMiners", .99)]);
   const p = ph.payouts[0];
-  near(p.realFeePercent, 100 - 99 * .915);
-  assert.equal(p.shareYield, .915);
+  near(p.realFeePercent, 100 - 99 * .982); // ≈ 2.78%: the 1% fee and the 1.8% of shares that find no block
+  assert.equal(p.shareYield, .982);
   assert.equal(p.realFeeEstimated, true);
-  // HeroMiners with its own yield; not a solo payout, not another pool; and no old fields.
+  // A summary without the measured ratio (written before it, or the check failed): no figure, not the old constant.
+  const unmeasured = out([row(PH, "PearlHash")], [publicPPLNS(PH, "PearlHash", .99)])[0].payouts[0];
+  assert.equal(unmeasured.realFeePercent, null); assert.equal(unmeasured.shareYield, undefined); assert.equal(unmeasured.realFeePeriod, null);
+  // HeroMiners waits for a rolling observation rather than showing 0% from its old base estimate.
   assert.equal(phSolo.payouts[0].shareYield, undefined);
-  assert.equal(hero.payouts[0].shareYield, .955); near(hero.payouts[0].realFeePercent, 100 - 99 * .955);
+  assert.equal(hero.payouts[0].shareYield, undefined); assert.equal(hero.payouts[0].realFeePercent, null);
   const [other] = out([row("other", "Other")], [publicPPLNS("other", "Other", .99)]);
   assert.equal(other.payouts[0].shareYield, undefined);
   for (const k of ["minerReport", "realFeePending"]) assert.equal(p[k], undefined, k);
   // No Real Cost yet: no figure and no bubble.
   const none = out([row(PH, "PearlHash")], [])[0].payouts[0];
   assert.equal(none.realFeePercent, null); assert.equal(none.shareYield, undefined);
-  // A second request applies the same constant once, not again.
-  near(out([row(PH, "PearlHash")], [publicPPLNS(PH, "PearlHash", .5)])[0].payouts[0].realFeePercent, 100 - 50 * .915);
-  near(out([row(PH, "PearlHash")], [publicPPLNS(PH, "PearlHash", .99)])[0].payouts[0].realFeePercent, 100 - 99 * .915);
+  // A second request applies the ratio once, not again (a payout that already carries one is read afresh).
+  const again = { ...row(PH, "PearlHash"), payouts: [{ ...row(PH, "PearlHash").payouts[0], shareYield: .5, realFeePercent: 60 }] };
+  near(out([again], [phSample(.5)])[0].payouts[0].realFeePercent, 100 - 50 * .982);
+  near(out([again], [phSample(.99, .915)])[0].payouts[0].realFeePercent, 100 - 99 * .915);
 });
 
 test("Fortune retains the PPS settlement window alongside its five-day PPLNS output estimate", () => {
@@ -421,22 +427,22 @@ test("Peryn: read once a day from 00:30 UTC from its payout batches; addresses n
   assert.equal(env.DB.rows("SELECT k FROM kv WHERE k LIKE 'public:realfees:Peryn:%'").length, 0);
 });
 
-test("Peryn: the Founding Miners' figure leads while sign-ups are open, everyone else's once they close", () => {
+test("Peryn: the Founding Miners' figure leads, open or closed; everyone else's only when it alone was measured", () => {
   setNow(perynAt);
   const base = { pool: "Peryn", scheme: "PPS+", start: fixture.start, end: fixture.end, measuredAt: perynAt, estimated: true,
     sampleCount: 5, activeDays: 5, addresses: 3, theoryBasis: "hashrate_chain" };
   const founding = { ...base, tier: "founding", netPRL: 99.2, expectedPRL: 100 }, standard = { ...base, tier: "standard", netPRL: 98.7, expectedPRL: 100 };
   const row = (open) => ({ name: "Peryn", solo: false, payouts: [
-    { scheme: "PPLNS", solo: false, ...(open ? { founding: { fee: 0, afterFP8Months: 6 } } : {}) },
-    { scheme: "PPS+", solo: false, ...(open ? { founding: { fee: 0.5 } } : {}) }] });
+    { scheme: "PPLNS", solo: false, [open ? "founding" : "foundingClosed"]: { fee: 0, afterFP8Months: 6 } },
+    { scheme: "PPS+", solo: false, [open ? "founding" : "foundingClosed"]: { fee: 0.5 } }] });
   const [pplns, open] = attachRealFees({ rows: [row(true)] }, [standard, founding]).rows[0].payouts;
   near(open.realFeePercent, 0.8); assert.equal(open.realFeeTier, "founding");
   near(open.realFeeTiers.founding, 0.8); near(open.realFeeTiers.standard, 1.3);
   assert.deepEqual(open.realFeePeriod, { start: fixture.start, end: fixture.end });
   assert.equal(pplns.realFeePercent, null); assert.equal(pplns.realFeeTier, undefined);
-  const closed = attachRealFees({ rows: [row(false)] }, [founding, standard]).rows[0];
-  near(closed.payouts[1].realFeePercent, 1.3); assert.equal(closed.payouts[1].realFeeTier, "standard");
-  assert.equal(closed.realFeeMeasurement.tier, "standard");
+  const closed = attachRealFees({ rows: [row(false)] }, [standard, founding]).rows[0];
+  near(closed.payouts[1].realFeePercent, 0.8); assert.equal(closed.payouts[1].realFeeTier, "founding");
+  assert.equal(closed.realFeeMeasurement.tier, "founding"); near(closed.payouts[1].realFeeTiers.standard, 1.3);
   // Only one tier measured: that one, named, with the other missing.
   const only = attachRealFees({ rows: [row(true)] }, [standard]).rows[0].payouts[1];
   near(only.realFeePercent, 1.3); assert.equal(only.realFeeTier, "standard"); assert.equal(only.realFeeTiers.founding, null);

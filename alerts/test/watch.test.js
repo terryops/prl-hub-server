@@ -105,12 +105,19 @@ test("pools: HeroMiners and Lucky Pool — online for 10 min after the last shar
   assert.deepEqual(parseMiner("Lucky Pool", 404, '{"error":"Address not found"}', 0), { missing: true });
 });
 
-test("pools: Pearl Fortune — `stale` decides, last report from last_stats_at", () => {
+test("pools: Pearl Fortune — online while any connection isn't stale, last report = the latest last_stats_at", () => {
   const r = parseMiner("Pearl Fortune", 200, fx("pearlfortune_connections.json"), 0);
-  assert.deepEqual(r.workers, [
-    { name: "0221", online: true, last: Date.UTC(2026, 8, 27, 2, 12, 2) / 1000 },
-    { name: "033", online: true, last: Date.UTC(2026, 8, 27, 2, 11, 51) / 1000 },
-  ]);
+  assert.equal(r.workers.length, 8);
+  assert.ok(r.workers.every((w) => w.online));
+  assert.deepEqual(r.workers.find((w) => w.name === "storage01"),   // two connections
+                   { name: "storage01", online: true, last: Date.UTC(2026, 10, 6, 9, 45, 37) / 1000 });
+  const conns = (...stale) => JSON.stringify({ data: { workers: [{ worker: "a", sessions: stale.map((x) => ({ stale: x })) }] } });
+  assert.deepEqual(parseMiner("Pearl Fortune", 200, conns(true, false), 0).workers, [{ name: "a", online: true, last: null }]);
+  assert.deepEqual(parseMiner("Pearl Fortune", 200, conns(true), 0).workers, [{ name: "a", online: false, last: null }]);
+  // Before 2026-11-06: one connection per worker, `stale` on top.
+  const flat = JSON.stringify({ data: { workers: [{ worker: "0221", stale: false, last_stats_at: "2026-09-27T02:12:02.077661833Z" }] } });
+  assert.deepEqual(parseMiner("Pearl Fortune", 200, flat, 0).workers,
+                   [{ name: "0221", online: true, last: Date.UTC(2026, 8, 27, 2, 12, 2) / 1000 }]);
   assert.deepEqual(parseMiner("Pearl Fortune", 200, fx("pearlfortune_connections_empty.json"), 0), { workers: [], partial: false });
   assert.throws(() => parseMiner("Pearl Fortune", 200, '{"error":"busy"}', 0));
 });

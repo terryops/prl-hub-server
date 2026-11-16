@@ -4,6 +4,7 @@ import { readCapped, MAX_BODY, UA, SOURCES, sanitizeTarget } from "./pools.js";
 import { reserveBudget } from "./poolstats.js";
 import { now, webJson as json } from "./http.js";
 import { validPPLNSMeasurement, costEstimated } from "./pplns.js";
+import { HERO, validRollingShareMeasurement } from "./shareyield.js";
 
 const DAY = 86400, DAYS = 5, WORK = 2 ** 48, EMISSION = 650226n;
 const POOLS = { "Pearl Fortune": "PPS", Kryptex: "PPS+", F2Pool: "PPS" };
@@ -45,45 +46,48 @@ export async function realFees(env) {
   return json({ ok: true, days: DAYS, measurements });
 }
 
+// PPLNS / PROP: luck taken out by the pool's own per-block effort (pplnsMeasurement). HeroMiners' effort counts the
+// same shares it pays for, so dividing it out would also hide the shares it never turns into blocks: it gets the
+// rolling 30-day output estimate instead, its count interval carried with it (shareyield.js), and nothing until then.
 function pplnsEstimate(row, payout, measurements) {
   if (!costEstimated(row, payout)) return null;
   const sample = measurements.find((o) => o.id === row.id && o.pool === row.name && validPPLNSMeasurement(o));
-  // Luck taken out: the fee and the work the pool loses (see pplnsMeasurement).
-  return sample ? { percent: (1 - sample.ratio) * 100, start: sample.start, end: sample.end } : null;
+  if ((row.id === HERO || row.name === "HeroMiners") && !validRollingShareMeasurement(sample, now())) return null;
+  return sample ? { percent: (1 - sample.ratio) * 100, start: sample.start, end: sample.end, shareYield: sample.shareYield,
+    rolling: sample.theoryBasis === "accepted_share_rounds" ? sample : null } : null;
 }
 
-// Blocks per accepted share, where a pool measurably turns its shares into fewer blocks than they imply.
-// PearlHash, 2026-11-01: its share target is the chain's (difficulty 128 = 2^208 / 128, read from the jobs it
-// sends), yet over 12 days it found 1,230 blocks where its accepted shares imply 1,339 (0.918 ± 0.026); its own
-// displayed hashrate is its share rate × 0.915 × 2^48. Real Cost counts that loss with the fee:
-// 100 − (100 − cost) × yield, and the payout carries `shareYield` for the bubble beside the figure.
-// HeroMiners, 2026-11-02: it credits shares at full value (6 h of our own 4090 on it: credited ÷ the card's own
-// reading 0.988 ± 0.035, 0.998 after the miner's 1% fee), yet from Oct 4 to Nov 1 its blocks were 0.907 ± 0.038 of
-// what its shares imply (Pearl Fortune over the same weeks 1.009); its displayed hashrate is 0.952–0.959 × its share
-// rate and its blocks follow that. The rest of the gap is left to luck, as everywhere else.
-const SHARE_YIELD = { PearlHash: 0.915, HeroMiners: 0.955 };
+// PearlHash turns only part of its accepted shares into blocks, the part its displayed hashrate shows (pearlHashYield):
+// Real Cost counts that with the fee, 100 − (100 − cost) × yield, and the payout carries `shareYield` for the bubble.
+// Without the measured ratio it has no figure (the former fixed 0.915 is retired: PearlHash changed it on 2026-11-02).
+const SHARE_YIELD_POOLS = new Set(["PearlHash"]);
 
 const measuredPercent = (o) => (1 - o.netPRL / o.expectedPRL) * 100;
 
-export function attachRealFees(snapshot, measurements, pplnsMeasurements = []) {
+export function attachRealFees(snapshot, measurements, pplnsMeasurements = [], rollingEnabled = true) {
   return { ...snapshot, rows: snapshot.rows.map((row) => {
     const own = measurements.filter((o) => o.pool === row.name && validMeasurement(o));
-    // Peryn: the Founding Miners' figure while its sign-ups are open (the payout then carries `founding`, the terms a
-    // new miner gets), everyone else's once they close; the other tier when only one was measured. Both go in
-    // `realFeeTiers` for the bubble beside the figure.
+    // Peryn: the Founding Miners' figure, everyone else's only when it alone was measured (owner 2026-11-09: everyone
+    // else's group includes VIP addresses paid +2% on top, which pulls it to about zero). Both go in `realFeeTiers`
+    // for the bubble beside the figure.
     const tiers = row.name === PERYN ? Object.fromEntries(own.filter((o) => o.tier).map((o) => [o.tier, o])) : null;
-    const open = (row.payouts || []).some((p) => p.scheme === "PPS+" && p.founding);
-    const observation = tiers ? (open ? ["founding", "standard"] : ["standard", "founding"]).map((k) => tiers[k]).find(Boolean)
+    const observation = tiers ? ["founding", "standard"].map((k) => tiers[k]).find(Boolean)
       : own.find((o) => o.tier == null);
     const matches = !row.solo && observation && (row.payouts || []).some((p) => !p.solo && p.scheme === observation.scheme);
     return { ...row, realFeeMeasurement: matches ? observation : null,
       payouts: row.payouts?.map((p) => {
         const measured = matches && !p.solo && p.scheme === observation.scheme;
-        const estimate = pplnsEstimate(row, p, pplnsMeasurements);
+        const observationEstimate = measured ? null : pplnsEstimate(row, p, pplnsMeasurements);
+        const yieldPool = !row.solo && !p.solo && SHARE_YIELD_POOLS.has(row.name);
+        const shareYield = yieldPool ? observationEstimate?.shareYield ?? null : null;
+        // The rolling estimate only for clients that can show its interval; a share-yield pool only with its ratio.
+        const estimate = observationEstimate?.rolling && !rollingEnabled || yieldPool && shareYield == null ? null : observationEstimate;
         const percent = measured ? measuredPercent(observation) : estimate?.percent ?? null;
-        const shareYield = !row.solo && !p.solo && Object.hasOwn(SHARE_YIELD, row.name) ? SHARE_YIELD[row.name] : null;
-        const cost = percent != null && shareYield ? 100 - (100 - percent) * shareYield : percent;
-        return { ...p, ...(shareYield && cost != null ? { shareYield } : {}),
+        const cost = percent != null && shareYield != null ? 100 - (100 - percent) * shareYield : percent;
+        const { shareYield: previousYield, realFeeEstimate: previousEstimate, outputObservation: previousOutput,
+          settlementCost: previousSettlement, realFeeTier: previousTier, realFeeTiers: previousTiers, ...payout } = p;
+        return { ...payout, ...(shareYield != null && cost != null ? { shareYield } : {}),
+          ...(estimate?.rolling ? { realFeeEstimate: estimate.rolling } : {}),
           ...(measured && observation.tier ? { realFeeTier: observation.tier,
             realFeeTiers: Object.fromEntries(PERYN_TIERS.map((k) => [k, tiers[k] ? measuredPercent(tiers[k]) : null])) } : {}),
           realFeePercent: cost,

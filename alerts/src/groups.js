@@ -11,9 +11,9 @@ export async function me(env, gid) {
       .first(),
     db
       .prepare(
-        "SELECT * FROM orders WHERE gid = ? AND (expires_at > ? OR status IN ('seen', 'paid')) ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        "SELECT * FROM orders WHERE (gid = ? OR account_id = ?) AND (expires_at > ? OR status IN ('seen', 'paid')) ORDER BY created_at DESC, rowid DESC LIMIT 1",
       )
-      .bind(gid, t)
+      .bind(gid, gid, t)
       .first(),
   ]);
   return json({

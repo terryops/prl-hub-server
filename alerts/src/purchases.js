@@ -46,12 +46,15 @@ export async function refreshPurchase(env, purchase) {
 async function purchaseProfile(env, purchase, account=null) {
   await refreshPurchase(env,purchase);
   const view=await (await me(env,purchase.user_id)).json();
-  const linked=await env.DB.prepare(`SELECT COUNT(*) AS n FROM orders o JOIN entitlements e ON e.source='prl' AND e.ref=o.txid
+  const linked=await env.DB.prepare(`SELECT COUNT(*) AS n FROM orders o JOIN entitlements e
+    ON e.source=CASE WHEN o.txid IS NULL THEN 'admin' ELSE 'prl' END AND e.ref=COALESCE(o.txid,'order:'||o.id)
     WHERE o.gid=? AND o.status='paid' AND e.revoked_at IS NULL`).bind(purchase.user_id).first();
   return {...view,purchase_id:purchase.user_id,linked:linked.n>0};
 }
 export async function buyerMe(env,{account,purchase}) {
-  if (account) await syncPaid(env,account.user_id);
+  // Ordinary status refreshes must also finish a missed legacy payment callback.
+  if (account && purchase) await associatePurchase(env,account,purchase);
+  else if (account) await syncPaid(env,account.user_id);
   const local=purchase?await purchaseProfile(env,purchase,account):null;
   const base=account?await (await me(env,account.user_id)).json():local;
   return json({...base,pro:!!(base?.pro||local?.pro),pro_scope:base?.pro&&account?"account":"device",
@@ -67,19 +70,27 @@ export async function associatePurchase(env, account, purchase) {
     AND s.revoked_at IS NULL AND u.deleted_at IS NULL AND a.revoked_at IS NULL)
     AND EXISTS(SELECT 1 FROM purchase_visitors WHERE id=? AND revoked_at IS NULL)`;
   await db.batch([
-    // A Google Play purchase made on this device before signing in becomes the account's (play.js).
-    db.prepare(`UPDATE entitlements SET user_id=? WHERE source='google' AND user_id=? AND revoked_at IS NULL AND ${guard}`)
-      .bind(uid,id,account.id,uid,id),
+    // Keep the first verified owner even if confirmation arrives after logout.
+    db.prepare(`UPDATE orders SET account_id=? WHERE gid=? AND account_id IS NULL AND ${guard}
+      AND NOT EXISTS(SELECT 1 FROM entitlements e WHERE e.source='prl' AND e.ref=orders.txid AND e.user_id<>?)`)
+      .bind(uid,id,account.id,uid,id,uid),
+    // Move guest-owned Play receipts and transaction-less manual order grants only once.
+    db.prepare(`UPDATE entitlements SET user_id=? WHERE user_id=? AND revoked_at IS NULL AND ${guard}
+      AND (source='google' OR (source='admin' AND ref IN
+        (SELECT 'order:'||o.id FROM orders o WHERE o.gid=? AND o.account_id=? AND o.status='paid' AND o.txid IS NULL)))`)
+      .bind(uid,id,account.id,uid,id,id,uid),
     db.prepare(`INSERT OR IGNORE INTO entitlements(source,ref,user_id,product,platform,granted_at)
-      SELECT 'prl',o.txid,?,'pro','web',o.paid_at FROM orders o WHERE o.gid=? AND o.status='paid' AND o.txid IS NOT NULL AND ${guard}`)
-      .bind(uid,id,account.id,uid,id),
+      SELECT 'prl',o.txid,?,'pro','web',o.paid_at FROM orders o WHERE o.gid=? AND o.account_id=? AND o.status='paid' AND o.txid IS NOT NULL AND ${guard}`)
+      .bind(uid,id,uid,account.id,uid,id),
     recalculate(db,uid),
     db.prepare(`INSERT OR IGNORE INTO purchase_licenses(visitor_id,source,ref,granted_at)
       SELECT ?,e.source,e.ref,e.granted_at FROM entitlements e WHERE e.user_id=? AND e.product='pro'
       AND e.platform='web' AND e.revoked_at IS NULL AND ${guard}`).bind(id,uid,account.id,uid,id),
   ]);
-  const conflict=await db.prepare(`SELECT 1 FROM orders o JOIN entitlements e ON e.source='prl' AND e.ref=o.txid
-    WHERE o.gid=? AND o.status='paid' AND e.revoked_at IS NULL AND e.user_id<>? LIMIT 1`).bind(id,uid).first();
+  const conflict=await db.prepare(`SELECT 1 FROM orders o LEFT JOIN entitlements e
+    ON e.source=CASE WHEN o.txid IS NULL THEN 'admin' ELSE 'prl' END AND e.ref=COALESCE(o.txid,'order:'||o.id)
+    WHERE o.gid=? AND (o.status IN('paid','seen') OR (o.status='pending' AND o.expires_at>?))
+    AND ((o.account_id IS NOT NULL AND o.account_id<>?) OR (e.revoked_at IS NULL AND e.user_id<>?)) LIMIT 1`).bind(id,now(),uid,uid).first();
   await refreshPurchase(env,purchase);
   return {linked:!conflict,conflict:!!conflict};
 }

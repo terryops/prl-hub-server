@@ -2,6 +2,7 @@
 import { webJson as json, now, hex } from "./http.js";
 import { chainAddress, chainHeight, totalTo, ADDRESS_RE } from "./chain.js";
 import { logError } from "./log.js";
+import { orderEntitlements } from "./entitlements.js";
 export const ORDER_TTL = 1800; // seconds, quote validity and empty identity lifetime
 const MATCH_FOR = 7 * 86400; // seconds
 const PRICE_STALE = 300; // seconds
@@ -60,11 +61,29 @@ function randomTail() {
   } while (bytes[0] >= max);
   return (bytes[0] % 9999) + 1;
 }
-export async function createOrder(env, gid, ip, tail = randomTail) {
+export async function createOrder(env, gid, ip, tail = randomTail, account = null) {
   if (!paymentSettings(env).enabled)
     return json({ error: "payments_off" }, 503);
   const db = env.DB,
     t = now();
+  const accountGuard = `EXISTS(SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id
+    JOIN account_devices a ON a.user_id=s.user_id AND a.id=s.device_id
+    WHERE s.id=? AND s.user_id=? AND s.revoked_at IS NULL AND u.deleted_at IS NULL AND a.revoked_at IS NULL
+    AND s.idle_expires>? AND s.max_expires>? AND (s.client='web' OR s.access_expires>?))`;
+  const accountParams = account ? [account.id, account.user_id, t, t, t] : [];
+  const accountActive = () => db.prepare(`SELECT 1 WHERE ${accountGuard}`).bind(...accountParams).first();
+  const view = async (o) => {
+    if (account && !o.account_id) {
+      // An anonymous checkout may have appeared after the caller's association check.
+      const claimed = await db.prepare(`UPDATE orders SET account_id=? WHERE id=? AND account_id IS NULL AND ${accountGuard}
+        AND NOT EXISTS(SELECT 1 FROM entitlements e WHERE e.source='prl' AND e.ref=orders.txid AND e.user_id<>?) RETURNING *`)
+        .bind(account.user_id,o.id,...accountParams,account.user_id).first();
+      o = claimed || await db.prepare("SELECT * FROM orders WHERE id=?").bind(o.id).first();
+      if (!await accountActive()) return json({ error: "unauthorized" }, 401);
+    }
+    return account && o.account_id !== account.user_id
+      ? json({ error: "purchase_already_linked" }, 409) : json(publicOrder(env, o));
+  };
   if (
     (
       await db
@@ -82,7 +101,7 @@ export async function createOrder(env, gid, ip, tail = randomTail) {
       .bind(gid, t)
       .first();
   const old = await active();
-  if (old) return json(publicOrder(env, old));
+  if (old) return view(old);
   if (env.RL_NEW && !(await env.RL_NEW.limit({ key: ip })).success)
     return json({ error: "rate limited" }, 429);
   const row = await db.prepare("SELECT v FROM kv WHERE k = 'price'").first();
@@ -116,16 +135,19 @@ export async function createOrder(env, gid, ip, tail = randomTail) {
         db.prepare("INSERT OR IGNORE INTO groups (gid, created_at, seen_at) VALUES (?, ?, ?)")
           .bind(gid, t, t),
         db.prepare(
-          `INSERT INTO orders (id, gid, usd, rate, sats, created_at, expires_at, start_height)
-        SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS
+          `INSERT INTO orders (id, gid, usd, rate, sats, created_at, expires_at, start_height, account_id)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS
         (SELECT 1 FROM orders WHERE gid = ? AND (status = 'seen' OR (status = 'pending' AND expires_at > ?)))
-        AND EXISTS (SELECT 1 FROM groups WHERE gid = ? AND pro_at IS NULL)`,
+        AND EXISTS (SELECT 1 FROM groups WHERE gid = ? AND pro_at IS NULL)
+        ${account ? `AND ${accountGuard}` : ""}`,
         )
-        .bind(id, gid, usd, p.usd, sats, t, t + ORDER_TTL, height, gid, t, gid),
+        .bind(id, gid, usd, p.usd, sats, t, t + ORDER_TTL, height, account?.user_id || null, gid, t, gid, ...accountParams),
       ]);
       const o = await active();
+      if (!o && account && !await accountActive())
+        return json({ error: "unauthorized" }, 401);
       return o
-        ? json(publicOrder(env, o))
+        ? view(o)
         : json({ error: "already_pro" }, 409);
     } catch (e) {
       if (!String(e).includes("UNIQUE") || !String(e).includes("sats")) throw e;
@@ -273,6 +295,7 @@ async function scanAddress(env, db, t, address, pending, threshold, budget, befo
                     ON CONFLICT(gid) DO UPDATE SET pro_at = COALESCE(groups.pro_at, excluded.pro_at), pro_src = 'prl', pro_ref = excluded.pro_ref`,
                   )
                   .bind(order.gid, t, t, t, tx.txid),
+                ...orderEntitlements(db, order.id),
               ]
             : []),
         ]);
@@ -344,6 +367,7 @@ export async function admin(env, method, path, body) {
           .prepare("UPDATE payments SET order_id = ? WHERE txid = ?")
           .bind(o.id, body.txid),
       );
+    writes.push(...orderEntitlements(db, o.id));
   }
   if (typeof gid !== "string" || !/^(?:[0-9a-f]{64}|u_[A-Za-z0-9_-]{16,80}|g_[0-9a-f]{64})$/.test(gid))
     return json({ error: "bad gid" }, 400);

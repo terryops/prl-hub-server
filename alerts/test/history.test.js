@@ -1,7 +1,7 @@
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { sampleNetwork, rollingSeries } from "../src/network.js";
-import { parseCandles } from "../src/pricehistory.js";
+import { parseCandles, parseGateCandles, parseCoinbaseCandles, parseKrakenCandles, parseSafeTradeCandles } from "../src/pricehistory.js";
 import { fetchQuotes } from "../src/price.js";
 import { makeEnv, call, setNow, restoreNow, T0 } from "./helpers.js";
 const original = fetch;
@@ -87,28 +87,29 @@ test("network: a span reads a few hundred samples however many D1 holds (\"all\"
   }
   assert.ok(read < 4 * 1500, `rows handed back for four spans: ${read}`);
 });
-test("price: explicit spans use sorted BigONE daily close, share 1h D1 cache and retain old reply without span", async () => {
+test("price: explicit spans use Gate daily close, share 1h D1 cache, fall back to Coinbase / Kraken, and retain old reply without span", async () => {
   setNow(T0); const e = makeEnv(); let requests = 0;
-  const candles = Array.from({ length: 90 }, (_, i) => ({ time: new Date((T0 - i * 86400) * 1000).toISOString(), close: String(.8 + i / 100) }));
+  // 90 Gate candlesticks [ts, quote_vol, close, high, low, open, base_vol, closed]
+  const candles = Array.from({ length: 90 }, (_, i) => [String(T0 - (89 - i) * 86400), "1000000", String(0.8 + i / 100), "2", "0.5", "1", "500000", "true"]);
   globalThis.fetch = async (url, init) => {
     requests++;
-    assert.equal(String(url), "https://big.one/api/v3/asset_pairs/PEARL-USDT/candles?period=day1&limit=90");
+    assert.equal(String(url), "https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=PEARL_USDT&interval=1d&limit=90");
     assert.equal(init.redirect, "manual");
-    return Response.json({ code: 0, data: candles });
+    return Response.json(candles);
   };
   const r = await call(e, "GET", "/v1/price/history?span=7d");
-  assert.equal(r.status, 200); assert.equal(r.body.source, "bigone"); assert.equal(r.body.market, "PEARL-USDT"); assert.equal(r.body.quote, "USDT"); assert.equal(r.body.points.length, 7);
-  assert.deepEqual(r.body.points, candles.slice(0, 7).reverse().map((c) => [Date.parse(c.time) / 1000, Number(c.close)]));
+  assert.equal(r.status, 200); assert.equal(r.body.source, "gate"); assert.equal(r.body.market, "PEARL/USDT"); assert.equal(r.body.quote, "USDT"); assert.equal(r.body.points.length, 7);
+  assert.deepEqual(r.body.points, candles.slice(-7).map((c) => [Number(c[0]), Number(c[2])]));
   assert.equal((await call(e, "GET", "/v1/price/history?span=90d")).body.points.length, 90); assert.equal(requests, 1);
   assert.deepEqual((await call(e, "GET", "/v1/price/history")).body, { source: null, points: [] });
   assert.equal((await call(e, "GET", "/v1/price/history?span=bad")).status, 400);
   setNow(T0 + 3600); globalThis.fetch = async () => new Response(null, { status: 500 });
   const stale = await call(e, "GET", "/v1/price/history?span=30d");
-  assert.equal(stale.body.stale, true); assert.equal(stale.body.source, "bigone"); assert.equal(stale.body.ts, T0);
+  assert.equal(stale.body.stale, true); assert.equal(stale.body.source, "gate"); assert.equal(stale.body.ts, T0);
   assert.equal(stale.body.points.length, 30);
-  assert.equal(e.DB.raw.prepare("SELECT ts FROM kv WHERE k = 'price:bigone:daily'").get().ts, T0);
+  assert.equal(e.DB.raw.prepare("SELECT ts FROM kv WHERE k = 'price:daily:v2'").get().ts, T0);
   assert.equal((await call(makeEnv(), "GET", "/v1/price/history?span=30d")).status, 502);
-  assert.throws(() => parseCandles({ code: 0, data: [{ time: "invalid", close: "bad" }] }));
+  assert.throws(() => parseCandles([["invalid", "0", "bad"]]));
 });
 test("network: read throttle, bounded backfill rounds, and failed sampling preserve existing points", async () => {
   setNow(T0); const e = makeEnv(); let blocks = 0;
@@ -126,71 +127,147 @@ test("network: read throttle, bounded backfill rounds, and failed sampling prese
   const limited = makeEnv({ RL_READ: { limit: async () => ({ success: false }) } });
   assert.equal((await call(limited, "GET", "/v1/network/history?span=7d")).status, 429);
 });
-test("price: BigONE's renamed pair — a row stored as PRL-USDT stands in while a refresh fails, then PEARL-USDT replaces it", async () => {
-  setNow(T0); const e = makeEnv();
-  // As stored before the rename (2026-10-19): days old, so the next read refreshes.
-  const before = { source: "bigone", market: "PRL-USDT", quote: "USDT", ts: T0 - 4 * 86400, points: [[T0 - 5 * 86400, 1.8169], [T0 - 4 * 86400, 1.8901]] };
-  e.DB.raw.prepare("INSERT INTO kv (k, v, ts) VALUES ('price:bigone:daily', ?, ?)").run(JSON.stringify(before), before.ts);
-  const urls = [];
-  // The old name answers like BigONE does now.
-  globalThis.fetch = async (url) => { urls.push(String(url)); return Response.json({ code: 10013, message: "Resource not found" }, { status: 404 }); };
-  const stale = await call(e, "GET", "/v1/price/history?span=7d");
-  assert.equal(stale.status, 200); assert.equal(stale.body.stale, true); assert.equal(stale.body.market, "PRL-USDT");
-  assert.deepEqual(stale.body.points, before.points);
-  assert.deepEqual(urls, ["https://big.one/api/v3/asset_pairs/PEARL-USDT/candles?period=day1&limit=90"]);
-  setNow(T0 + 120);
-  globalThis.fetch = async () => Response.json({ code: 0, data: [{ time: new Date(T0 * 1000).toISOString(), close: "2.0883" }, { time: new Date((T0 - 86400) * 1000).toISOString(), close: "2.1858" }] });
-  const fresh = await call(e, "GET", "/v1/price/history?span=7d");
-  assert.equal(fresh.status, 200); assert.equal(fresh.body.stale, undefined); assert.equal(fresh.body.market, "PEARL-USDT"); assert.equal(fresh.body.ts, T0 + 120);
-  assert.deepEqual(fresh.body.points, [[T0 - 86400, 2.1858], [T0, 2.0883]]);
-});
-test("price: the fallback median reads BigONE as PEARL-USDT (PRL-USDT is gone), beside CoinEx and WhatToMine", async () => {
-  const urls = [];
+test("price: Gate 25-day series serves pure Gate for 7d and SafeTrade+Gate backfill for 30d/90d; Coinbase & Kraken stand in when Gate is down", async () => {
+  // Simulate 2026-11-16 UTC midnight (1794787200), with Gate having 25 candles since 2026-10-23 (1792713600).
+  const T_NOV16 = 1794787200;
+  setNow(T_NOV16);
+  const e = makeEnv();
+  const gate25 = Array.from({ length: 25 }, (_, i) => [String(1792713600 + i * 86400), "2000000", String(1.5 + i * 0.005), "2", "1", "1.5", "1000000", "true"]);
   globalThis.fetch = async (url) => {
-    const u = new URL(String(url)); urls.push(u.hostname + u.pathname);
-    if (u.hostname === "big.one") return u.pathname === "/api/v3/asset_pairs/PEARL-USDT/ticker"
-      ? Response.json({ code: 0, data: { asset_pair_name: "PEARL-USDT", open: "2.3246", close: "2.0883" } })
-      : Response.json({ code: 10013, message: "Resource not found" }, { status: 404 });
-    if (u.hostname === "api.coinex.com") return Response.json({ code: 0, data: [{ last: "2.09", open: "2.3" }] });
-    if (u.hostname === "whattomine.com") return Response.json({ exchange_rate: 2.08 / 80000, timestamp: Date.now() / 1000 });
-    if (u.hostname === "api.kraken.com") return Response.json({ result: { XXBTZUSD: { c: ["80000"] } } });
-    return new Response("nope", { status: 404 });
+    const u = new URL(String(url));
+    if (u.hostname === "api.gateio.ws") return Response.json(gate25);
+    return new Response("down", { status: 503 });
   };
-  const q = await fetchQuotes();
-  assert.deepEqual(q.bigone, { last: 2.0883, open24: 2.3246 });
-  assert.ok(q.coinex && q.whattomine);
-  assert.ok(urls.includes("big.one/api/v3/asset_pairs/PEARL-USDT/ticker"));
-  assert.ok(!urls.some((u) => u.includes("PRL-USDT")));
+
+  const r7 = await call(e, "GET", "/v1/price/history?span=7d");
+  assert.equal(r7.status, 200);
+  assert.equal(r7.body.source, "gate");
+  assert.equal(r7.body.market, "PEARL/USDT");
+  assert.equal(r7.body.points.length, 7);
+
+  const r30 = await call(e, "GET", "/v1/price/history?span=30d");
+  assert.equal(r30.body.source, "safetrade+gate");
+  assert.equal(r30.body.points.length, 30);
+
+  const r90 = await call(e, "GET", "/v1/price/history?span=90d");
+  assert.equal(r90.body.source, "safetrade+gate");
+  assert.equal(r90.body.points.length, 90);
+  assert.ok(r90.body.points.every((p, idx) => idx === 0 || p[0] > r90.body.points[idx - 1][0]));
+
+  // After TTL expires, if Gate fails and Coinbase answers 4 recent daily candles, 30d/90d remain complete without gaps.
+  setNow(T_NOV16 + 3700);
+  globalThis.fetch = async (url) => {
+    const u = new URL(String(url));
+    if (u.hostname === "api.exchange.coinbase.com") {
+      return Response.json([
+        [1794787200, 1.49, 1.70, 1.50, 1.6196, 890000],
+        [1794700800, 1.48, 1.80, 1.51, 1.7884, 920000],
+        [1794614400, 1.45, 1.60, 1.51, 1.5021, 710000],
+        [1794528000, 1.38, 1.58, 1.40, 1.5113, 640000],
+      ]);
+    }
+    return new Response("down", { status: 503 });
+  };
+  const cb30 = await call(e, "GET", "/v1/price/history?span=30d");
+  assert.equal(cb30.status, 200);
+  assert.equal(cb30.body.source, "safetrade+coinbase");
+  assert.equal(cb30.body.quote, "USD");
+  assert.equal(cb30.body.points.length, 30);
+  assert.equal(cb30.body.points.at(-1)[1], 1.6196);
+});
+test("price: pushed SafeTrade daily candles take precedence without upstream fetch, and Kraken fallback works", async () => {
+  setNow(T0);
+  const e = makeEnv({ INGEST_TOKEN: "sec-tok" });
+  const daily90 = Array.from({ length: 90 }, (_, i) => [T0 - (89 - i) * 86400, 1.2, 1.5, 1.1, 1.35 + i * 0.001, 100000]);
+  const ing = await call(
+    e,
+    "POST",
+    "/v1/ingest/safetrade",
+    { at: T0, ticker: { last: "1.61", open: "1.50", volume: "3400000" }, daily: daily90 },
+    { authorization: "Bearer sec-tok" },
+  );
+  assert.equal(ing.status, 200);
+
+  globalThis.fetch = async () => { throw new Error("must not call upstream when pushed SafeTrade daily is fresh"); };
+  const r = await call(e, "GET", "/v1/price/history?span=90d");
+  assert.equal(r.status, 200);
+  assert.equal(r.body.source, "safetrade");
+  assert.equal(r.body.market, "PEARL/USDT");
+  assert.equal(r.body.points.length, 90);
+
+  // Separate env testing Kraken fallback when Gate and Coinbase return 503.
+  const eKr = makeEnv();
+  globalThis.fetch = async (url) => {
+    const u = new URL(String(url));
+    if (u.hostname === "api.kraken.com") {
+      return Response.json({
+        error: [],
+        result: {
+          PEARLUSD: Array.from({ length: 90 }, (_, i) => [T0 - (89 - i) * 86400, "1.4", "1.6", "1.3", String(1.45 + i * 0.001), "1.5", "10000", 500]),
+          last: T0,
+        },
+      });
+    }
+    return new Response("down", { status: 503 });
+  };
+  const kr = await call(eKr, "GET", "/v1/price/history?span=90d");
+  assert.equal(kr.status, 200);
+  assert.equal(kr.body.source, "kraken");
+  assert.equal(kr.body.quote, "USD");
+  assert.equal(kr.body.points.length, 90);
 });
 test("price: corrupt cached daily candles trigger a refresh rather than an invalid successful reply", async () => {
   setNow(T0); const e = makeEnv();
-  e.DB.raw.prepare("INSERT INTO kv (k, v, ts) VALUES ('price:bigone:daily', ?, ?)").run(JSON.stringify({ source: "bigone", market: "PRL-USDT", quote: "USDT", points: [[T0, "bad"]] }), T0);
-  globalThis.fetch = async () => Response.json({ code: 0, data: [{ time: new Date(T0 * 1000).toISOString(), close: "0.8" }] });
+  e.DB.raw.prepare("INSERT INTO kv (k, v, ts) VALUES ('price:daily:v2', ?, ?)").run(JSON.stringify({ source: "gate", market: "PEARL/USDT", quote: "USDT", points: [[T0, "bad"]] }), T0);
+  const candles = Array.from({ length: 90 }, (_, i) => [String(T0 - (89 - i) * 86400), "1000", "0.8", "0.9", "0.7", "0.8", "1000", "true"]);
+  globalThis.fetch = async () => Response.json(candles);
   const r = await call(e, "GET", "/v1/price/history?span=7d");
-  assert.equal(r.status, 200); assert.deepEqual(r.body.points, [[T0, .8]]);
+  assert.equal(r.status, 200); assert.equal(r.body.points.at(-1)[1], 0.8);
 });
-test("price: BigONE ISO times and string closes are parsed in ascending order; invalid candles fail", () => {
-  const candle = { time: "2026-10-10T00:00:00Z", open: "1.36", high: "1.4489", low: "1.3032", close: "1.3883", volume: "427527.6999" };
-  assert.deepEqual(parseCandles({ code: 0, data: [candle, { ...candle, time: "2026-10-09T00:00:00Z", close: "1.36" }] }), [[1791504000, 1.36], [1791590400, 1.3883]]);
-  for (const patch of [{ time: "bad" }, { time: null }, { time: 1791590400000 }, { close: "0" }, { close: "-1" }, { close: "Infinity" }, { close: "1.2bad" }])
-    assert.throws(() => parseCandles({ code: 0, data: [{ ...candle, ...patch }] }));
-  assert.throws(() => parseCandles({ code: 1, data: [candle] }));
-  assert.throws(() => parseCandles({ code: 0, data: null }));
+test("price: Gate, Coinbase, Kraken and SafeTrade candle parsers sort ascending and reject malformed rows", () => {
+  assert.deepEqual(
+    parseGateCandles([["1791590400", "100", "1.3883", "1.4", "1.3", "1.36", "70", "true"], ["1791504000", "100", "1.36", "1.4", "1.3", "1.35", "70", "true"]]),
+    [[1791504000, 1.36], [1791590400, 1.3883]],
+  );
+  assert.deepEqual(
+    parseCoinbaseCandles([[1791590400, 1.3, 1.4, 1.36, 1.3883, 100], [1791504000, 1.3, 1.4, 1.35, 1.36, 100]]),
+    [[1791504000, 1.36], [1791590400, 1.3883]],
+  );
+  assert.deepEqual(
+    parseKrakenCandles({ error: [], result: { PEARLUSD: [[1791504000, "1.35", "1.4", "1.3", "1.36", "1.36", "100", 10]], last: 1791504000 } }),
+    [[1791504000, 1.36]],
+  );
+  assert.deepEqual(
+    parseSafeTradeCandles([[1791504000, "1.35", "1.4", "1.3", "1.36", "100"]]),
+    [[1791504000, 1.36]],
+  );
+  for (const bad of [[["bad", "0", "1.2"]], [["1791590400", "0", "0"]], [["1791590400", "0", "-1"]], [["1791590400", "0", "Infinity"]], [["1791590400", "0", "1.2bad"]]]) {
+    assert.throws(() => parseGateCandles(bad));
+  }
+  assert.throws(() => parseKrakenCandles({ error: ["EQuery:Unknown asset pair"], result: {} }));
+  assert.throws(() => parseSafeTradeCandles([]));
 });
-test("price: concurrent spans share one BigONE refresh; the former daily cache is never served", async () => {
+test("price: concurrent spans share one refresh; legacy bigone and coinex daily caches are never served", async () => {
   setNow(T0); const e = makeEnv(); let requests = 0, release;
-  const old = { source: "coinex", market: "PRLUSDT", quote: "USDT", ts: T0, points: [[T0, .11]] };
-  e.DB.raw.prepare("INSERT INTO kv (k, v, ts) VALUES ('price:coinex:daily', ?, ?)").run(JSON.stringify(old), T0);
-  const gate = new Promise((resolve) => { release = resolve; });
-  globalThis.fetch = async () => { requests++; await gate; return Response.json({ code: 0, data: Array.from({ length: 90 }, (_, i) => ({ time: new Date((T0 - i * 86400) * 1000).toISOString(), close: "1.3883" })) }); };
+  const oldCoinex = { source: "coinex", market: "PRLUSDT", quote: "USDT", ts: T0, points: [[T0, .11]] };
+  const oldBigone = { source: "bigone", market: "PEARL-USDT", quote: "USDT", ts: T0, points: [[T0, 1.51]] };
+  e.DB.raw.prepare("INSERT INTO kv (k, v, ts) VALUES ('price:coinex:daily', ?, ?)").run(JSON.stringify(oldCoinex), T0);
+  e.DB.raw.prepare("INSERT INTO kv (k, v, ts) VALUES ('price:bigone:daily', ?, ?)").run(JSON.stringify(oldBigone), T0);
+  const gateLatch = new Promise((resolve) => { release = resolve; });
+  globalThis.fetch = async () => {
+    requests++;
+    await gateLatch;
+    return Response.json(Array.from({ length: 90 }, (_, i) => [String(T0 - (89 - i) * 86400), "1000", "1.3883", "1.4", "1.3", "1.38", "800", "true"]));
+  };
   const pending = ["7d", "30d", "90d"].map((span) => call(e, "GET", `/v1/price/history?span=${span}`));
   release();
   const replies = await Promise.all(pending);
   assert.equal(requests, 1);
   assert.deepEqual(replies.map((r) => r.body.points.length), [7, 30, 90]);
-  for (const r of replies) { assert.equal(r.status, 200); assert.equal(r.body.source, "bigone"); assert.equal(r.body.points.at(-1)[1], 1.3883); }
+  for (const r of replies) { assert.equal(r.status, 200); assert.equal(r.body.source, "gate"); assert.equal(r.body.points.at(-1)[1], 1.3883); }
   const failed = makeEnv();
-  failed.DB.raw.prepare("INSERT INTO kv (k, v, ts) VALUES ('price:coinex:daily', ?, ?)").run(JSON.stringify(old), T0);
+  failed.DB.raw.prepare("INSERT INTO kv (k, v, ts) VALUES ('price:coinex:daily', ?, ?)").run(JSON.stringify(oldCoinex), T0);
+  failed.DB.raw.prepare("INSERT INTO kv (k, v, ts) VALUES ('price:bigone:daily', ?, ?)").run(JSON.stringify(oldBigone), T0);
   globalThis.fetch = async () => new Response(null, { status: 503 });
   assert.equal((await call(failed, "GET", "/v1/price/history?span=7d")).status, 502);
 });

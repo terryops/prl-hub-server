@@ -10,7 +10,7 @@
 //                     then 到账提醒: read the new blocks and push the devices whose
 //                     address they paid (income-watch.js)
 //   GET    /v1/price/history              24h same-source price history
-//          /v1/price/history?span=…       BigONE daily close (7d / 30d / 90d)
+//          /v1/price/history?span=…       Daily close (7d / 30d / 90d; SafeTrade / Gate / Coinbase / Kraken)
 //   GET    /v1/network/history?span=…     sampled D1 history (24h / 7d / 30d / all)
 //   GET    /v1/fx                         thirteen USD exchange rates
 //   GET    /v1/pools                      public comparison and network yield
@@ -89,9 +89,10 @@ import { logError } from "./log.js";
 import { revokeApple } from "./apple.js";
 import { income } from "./income.js";
 import { fx } from "./fx.js";
+import { markets } from "./markets.js";
 import { networkHistory, sampleNetwork } from "./network.js";
 import { realFees, refreshRealFees } from "./realfees.js";
-import { longPriceHistory } from "./pricehistory.js";
+import { longPriceHistory, parseSafeTradeCandles } from "./pricehistory.js";
 import { authRoutes, authenticate, enabled as accountsEnabled, authCleanup } from "./auth.js";
 import { accountRoutes, claimPush, pushOwner, releasePush } from "./account.js";
 import { purchaseRoutes, buyerContexts, buyerMe, associatePurchase, refreshPurchase, claimPurchasePush, purchaseProSQL, prunePurchases } from "./purchases.js";
@@ -137,7 +138,7 @@ const LIVE_TOKEN_RE = /^[0-9a-f]{64,512}$/;   // ActivityKit push tokens run lon
 // Store notification nests one inside another.
 const MAX_DEVICE_BODY = 16384;
 const MAX_LIVE_BODY = 8192;
-const MAX_INGEST_BODY = 16384;
+const MAX_INGEST_BODY = 32768;
 const MAX_ASN_BODY = 65536;
 // A raw transaction as hex, inside { "hex": … }.
 const MAX_SEND_BODY = 2 * SEND_MAX_BYTES + 4096;
@@ -814,6 +815,23 @@ async function ingestSafeTrade(req, env) {
   const q = parseSafeTrade(body, t);
   if (!q) return json({ error: "bad ticker" }, 400);
   await env.DB.prepare("INSERT OR REPLACE INTO kv (k, v, ts) VALUES ('safetrade', ?, ?)").bind(JSON.stringify(q), t).run();
+  if (Array.isArray(body?.daily)) {
+    try {
+      const points = parseSafeTradeCandles(body.daily);
+      const daily = {
+        source: "safetrade",
+        liveSource: "safetrade",
+        liveFromTs: points[0][0],
+        market: "PEARL/USDT",
+        quote: "USDT",
+        ts: t,
+        points,
+      };
+      await env.DB.prepare("INSERT OR REPLACE INTO kv (k, v, ts) VALUES ('safetrade:daily', ?, ?)").bind(JSON.stringify(daily), t).run();
+    } catch {
+      // Ignore malformed optional daily payload while keeping the valid spot ticker.
+    }
+  }
   return json({ ok: true, last: q.last });
 }
 
@@ -1170,12 +1188,15 @@ async function route(req, env, ctx) {
     const [body, bad] = await readJSON(req, MAX_SEND_BODY);
     return bad || sendTx(env, body, ip);
   }
-  if ((["/v1/price/history", "/v1/pools", "/v1/pool-fees", "/v1/fx", "/v1/network/history"].includes(path) && req.method === "GET") || (["/v1/pool/stats", "/v1/address", "/v1/address/income", "/v1/tx"].includes(path) && req.method === "POST")) {
+  if ((["/v1/price/history", "/v1/pools", "/v1/pool-fees", "/v1/fx", "/v1/markets", "/v1/network/history"].includes(path) && req.method === "GET") || (["/v1/pool/stats", "/v1/address", "/v1/address/income", "/v1/tx"].includes(path) && req.method === "POST")) {
     if (env.RL_READ && !(await env.RL_READ.limit({ key: ip })).success) return json({ ok: false, error: "rate limited" }, 429);
     if (path === "/v1/fx") return fx(env, ctx);
+    if (path === "/v1/markets") return markets(env, ctx);
     if (path === "/v1/price/history") return url.searchParams.has("span") ? longPriceHistory(env, url.searchParams.get("span"), ctx) : priceHistory(env, ctx);
     if (path === "/v1/network/history") return networkHistory(env, url.searchParams.get("span") || "7d", ctx);
-    if (path === "/v1/pools") return overview(env, ctx);
+    // Old clients describe shared-reward costs as luck-corrected and cannot show
+    // a count interval. Only capable clients opt into the rolling estimate.
+    if (path === "/v1/pools") return overview(env, ctx, url.searchParams.get("real_cost") === "rolling");
     if (path === "/v1/pool-fees") return realFees(env);
     const [body, bad] = await readJSON(req, MAX_DEVICE_BODY);
     return bad || (path === "/v1/address/income" ? income(env, body, ctx) : path === "/v1/address" ? address(env, body, ctx) : path === "/v1/tx" ? tx(env, body, ctx, ip) : poolStats(env, body, ctx, ip));
@@ -1205,10 +1226,10 @@ async function route(req, env, ctx) {
     if (path === "/v1/orders" && req.method === "POST") {
       const effective=await (await buyerMe(env,contexts)).json();
       if(effective.pro) return json({error:"already_pro"},409);
-      return createOrder(env,contexts.purchase?.user_id||gid,ip);
+      return createOrder(env,contexts.purchase?.user_id||gid,ip,undefined,contexts.account);
     }
     if (parts[1] === "orders" && parts.length === 3 && req.method === "GET") {
-      const owned=await env.DB.prepare("SELECT gid FROM orders WHERE id=? AND gid IN (?,?)").bind(parts[2],contexts.account?.user_id||"",contexts.purchase?.user_id||"").first();
+      const owned=await env.DB.prepare("SELECT gid FROM orders WHERE id=? AND (gid IN (?,?) OR account_id=?)").bind(parts[2],contexts.account?.user_id||"",contexts.purchase?.user_id||"",contexts.account?.user_id||"").first();
       return owned?getOrder(env,owned.gid,parts[2]):json({error:"not found"},404);
     }
     if (path === "/v1/me/config" && ["GET", "PUT"].includes(req.method)) {

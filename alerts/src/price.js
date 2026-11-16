@@ -52,6 +52,18 @@ async function bigone() {
   return t ? { last: num(t.close), open24: num(t.open) } : null;
 }
 
+async function gate() {
+  // Gate lists Pearl as PEARL_USDT; PRL_USDT on Gate is an unrelated ~$0.07 token.
+  const j = await getJSON("https://api.gateio.ws/api/v4/spot/tickers?currency_pair=PEARL_USDT");
+  const t = Array.isArray(j) ? j[0] : null;
+  if (!t || t.currency_pair !== "PEARL_USDT") return null;
+  const last = num(t.last);
+  if (!last) return null;
+  const pct = typeof t.change_percentage === "string" ? parseFloat(t.change_percentage) : t.change_percentage;
+  const open24 = typeof pct === "number" && Number.isFinite(pct) && pct > -100 ? last / (1 + pct / 100) : null;
+  return { last, open24: open24 && open24 > 0 ? open24 : null };
+}
+
 async function btcUsd() {
   // Both at once, Kraken preferred: asking Coinbase only after Kraken timed out
   // could hold the tick for two timeouts.
@@ -105,10 +117,11 @@ export function parseSafeTrade(body, now) {
   const last = t && num(t.last);
   const at = body && num(body.at);
   if (!last || !at || Math.abs(now - at) > 300) return null;
-  return { last, open24: num(t.open), at };
+  const quoteVol = num(t.volume) || num(t.vol);
+  return quoteVol ? { last, open24: num(t.open), quoteVol, at } : { last, open24: num(t.open), at };
 }
 
 export async function fetchQuotes() {
-  const [cx, bo, wtm] = await Promise.all([coinex(), bigone(), whattomine()]);
-  return { coinex: cx, bigone: bo, whattomine: wtm };
+  const [cx, bo, gt, wtm] = await Promise.all([coinex(), bigone(), gate(), whattomine()]);
+  return { coinex: cx, bigone: bo, gate: gt, whattomine: wtm };
 }

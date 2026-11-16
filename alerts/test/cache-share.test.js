@@ -109,7 +109,7 @@ test("cached: an error Response from the builder reaches waiters with its status
 for (const [name, row, call, check] of [
   ["fx", { ok: true, base: "USD", ts: 1000, rates: Object.fromEntries(FX_CODES.map((c) => [c, 2])) },
    (env) => fx(env, null), (o) => assert.equal(o.rates.CNY, 2)],
-  ["the long price history", { source: "bigone", market: "PEARL-USDT", quote: "USDT", ts: 1000, points: [[1, 0.5], [2, 0.6]] },
+  ["the long price history", { source: "gate", liveSource: "gate", liveFromTs: 1, market: "PEARL/USDT", quote: "USDT", ts: 1000, points: [[1, 0.5], [2, 0.6]] },
    (env) => longPriceHistory(env, "7d", null), (o) => assert.deepEqual(o.points, [[1, 0.5], [2, 0.6]])],
 ]) {
   test(`${name}: a refresh stuck on D1 holds later requests at most SHARE_WAIT_MS`, async () => {

@@ -1,5 +1,6 @@
 // Public pool work and attributed block counters only; no miner credentials.
 import { now } from "./http.js";
+import { HERO, SHARE_YIELD_DAYS, rollingShareMeasurement, validRollingShareMeasurement } from "./shareyield.js";
 
 // MIN_WINDOW is observed time, not span: holes left by gaps do not count towards it.
 // The PPLNS cost estimate keeps its seven-day span; block luck reads the full fortnight.
@@ -111,7 +112,7 @@ export function pplnsMeasurement(history, t = now(), effort = null) {
   const sum = (field) => segments.reduce((total, s) => total + s[field], 0);
   const covered = segments.reduce((total, s) => total + s.end - s.start, 0);
   if (covered < MIN_WINDOW || end - start > FEE_SPAN + 3600 || end > t + 60 || end < t - 1800) return null;
-  if (shares && shares.seconds < covered * .9) return null;
+  if (shares && (shares.seconds < covered * .9 || shares.shareYield == null)) return null;
   // Net at today's fee, not the one each segment was written with: what a miner pays from now on,
   // and a corrected fee counts at once (PearlHash: 1% assumed until 2026-11-01, 0.1% paid).
   const fee = history.last.fee;
@@ -150,11 +151,12 @@ export function pplnsMeasurement(history, t = now(), effort = null) {
     chainBlocks ? (1 - fee / 100) * chainBlocks / (chainBlocks + orphans) : Infinity);
   if (!finite(ratio)) return null;
   return { id: history.id, pool: history.pool, scheme: "PPLNS", start, end, netPRL, expectedPRL, expectedBlocks,
-    poolBlocks, orphans, work, luck: poolBlocks / work, ratio,
+    poolBlocks, orphans, work, luck: poolBlocks / work, ratio, ...(shares ? { shareYield: shares.shareYield } : {}),
     estimated: true, sampleCount: sum("samples"), blocksSample: chainBlocks, covered, theoryBasis: "pool_effort" };
 }
 
 export function validPPLNSMeasurement(o, t = now()) {
+  if (o?.theoryBasis === "accepted_share_rounds") return validRollingShareMeasurement(o, t);
   return !!o && typeof o.id === "string" && typeof o.pool === "string" && o.scheme === "PPLNS" &&
     o.theoryBasis === "pool_effort" && o.estimated === true &&
     finite(o.start) && o.start > 0 && finite(o.end) && o.end - o.start >= MIN_WINDOW && o.end - o.start <= FEE_SPAN + 3600 &&
@@ -162,6 +164,7 @@ export function validPPLNSMeasurement(o, t = now()) {
     finite(o.expectedPRL) && o.expectedPRL > 0 && finite(o.expectedBlocks) && o.expectedBlocks >= MIN_PPLNS_BLOCKS &&
     Number.isSafeInteger(o.poolBlocks) && o.poolBlocks > 0 && finite(o.work) && o.work > 0 &&
     finite(o.ratio) && o.ratio >= 0 && o.ratio <= 2 &&
+    (o.shareYield === undefined || finite(o.shareYield) && o.shareYield >= .5 && o.shareYield <= 1) &&
     Number.isSafeInteger(o.sampleCount) && o.sampleCount > 0 &&
     Number.isSafeInteger(o.blocksSample) && o.blocksSample >= 0;
 }
@@ -437,6 +440,8 @@ export const EFFORT_SOURCES = {
   // the newest blocks; get_blocks?height=H the ten before H.
   "https://pearl.herominers.com/": {
     budget: "HeroMiners",
+    keep: 35 * DAY,
+    backfillSpan: (SHARE_YIELD_DAYS + 1) * DAY,
     latest: "https://pearl.herominers.com/api/stats",
     older: (e) => `https://pearl.herominers.com/api/get_blocks?height=${e.cursor ?? e.blocks[0][0]}`,
     // Below the lowest block that page held, solo ones included: ten solo blocks in a row would
@@ -446,7 +451,9 @@ export const EFFORT_SOURCES = {
       const low = heights.length ? Math.min(...heights) : null;
       return low && low < (e.cursor ?? e.blocks[0][0]) ? low : null;
     },
-    parse: (o) => pairs(Array.isArray(o) ? o : o?.pool?.blocks, (p, h) => p.length < 7 ? null : /solo/i.test(p[10] || "") ? false :
+    // The public tail field can say "prop" on a SOLO block. HeroMiners' own
+    // renderer recognizes SOLO by the score's "s" prefix (for example "s0").
+    parse: (o) => pairs(Array.isArray(o) ? o : o?.pool?.blocks, (p, h) => p.length < 7 ? null : /^s/i.test(p[4] || "") || /solo/i.test(p[10] || "") ? false :
       block(h, p[1], shares(p[2], p[3]), /orphan/i.test(p[6]))),
   },
   // The last 50 blocks, each with its effort and lifecycle ("orphan" when it lost the race).
@@ -460,7 +467,7 @@ export const EFFORT_SOURCES = {
 /// Adds a list to the stored one. The newest list must reach back into what is stored, or
 /// blocks between them may be missing and the store starts again from it. An older page
 /// extends the store backwards (each source asks only for pages that join on).
-export function mergeEfforts(stored, list, t, older = false) {
+export function mergeEfforts(stored, list, t, older = false, keep = EFFORT_KEEP) {
   if (!Array.isArray(list) || !list.length) return validEffort(stored) ? stored : null;
   const fresh = [...new Map(list.map((b) => [b[0], b])).values()].sort((a, b) => a[0] - b[0]);
   let blocks, since, restarted = false;
@@ -481,13 +488,15 @@ export function mergeEfforts(stored, list, t, older = false) {
   }
   // A pool that re-dates a block cannot make the list run backwards.
   for (let i = 1; i < blocks.length; i++) if (blocks[i][1] < blocks[i - 1][1]) blocks[i] = [blocks[i][0], blocks[i - 1][1], blocks[i][2], blocks[i][3]];
-  blocks = blocks.filter((b) => b[1] >= t - EFFORT_KEEP).slice(-EFFORT_MAX);
+  blocks = blocks.filter((b) => b[1] >= t - keep).slice(-EFFORT_MAX);
   if (!blocks.length) return null;
   const next = { since: Math.max(since, blocks[0][1]), blocks };
   // Daily totals stay with the list whatever happens to it (they are the pool's own, by day).
   if (validDays(stored?.days)) next.days = stored.days.filter((d) => d[0] >= t - EFFORT_KEEP - DAY);
   // Where the backfill goes on from belongs to the list it was worked out for.
   if (!restarted && stored.cursor !== undefined) next.cursor = stored.cursor;
+  if (!restarted && finite(stored?.observedAt)) next.observedAt = stored.observedAt;
+  if (!restarted && stored?.sourceVersion === 2) next.sourceVersion = 2;
   return validEffort(next) ? next : null;
 }
 
@@ -497,17 +506,22 @@ async function refreshEfforts(stored, ids, t, fetchJSON) {
   const out = new Map();
   await Promise.all(ids.map(async (id) => {
     const source = EFFORT_SOURCES[id], before = stored.get(effortKey(id));
-    let effort = validEffort(before) ? before : null;
-    const short = !!effort?.blocks.length && effort.since > t - FEE_SPAN - 3600, backfill = short && !!source.older;
+    let effort = validEffort(before) && (id !== HERO || before.sourceVersion === 2) ? before : null;
+    const keep = source.keep ?? EFFORT_KEEP;
+    const short = !!effort?.blocks.length && effort.since > t - (source.backfillSpan ?? FEE_SPAN + 3600), backfill = short && !!source.older;
     const [latest, older, daily] = await Promise.allSettled([fetchJSON(source.latest, source.budget),
       backfill ? fetchJSON(source.older(effort), source.budget) : null,
       short && source.days ? fetchJSON(source.days, source.budget) : null]);
     const oldest = effort?.blocks[0]?.[0];
-    if (latest.status === "fulfilled") effort = mergeEfforts(effort, source.parse(latest.value), t);
+    if (latest.status === "fulfilled") {
+      const parsed = source.parse(latest.value);
+      effort = mergeEfforts(effort, parsed, t, false, keep);
+      if (id === HERO && effort && Array.isArray(parsed) && parsed.length) effort = { ...effort, observedAt: t, sourceVersion: 2 };
+    }
     // The older page was asked for below the stored list; if the newest list started over, it no longer joins.
     const page = effort && backfill && effort.blocks[0][0] === oldest && older.status === "fulfilled" && older.value ? source.parse(older.value) : null;
     if (page) {
-      effort = mergeEfforts(effort, page, t, true) || effort;
+      effort = mergeEfforts(effort, page, t, true, keep) || effort;
       // Read, so the next round asks for the page after it (`before` is the list it was chosen for).
       const cursor = source.next?.(before, older.value);
       if (Number.isSafeInteger(cursor) && cursor > 0) effort = { ...effort, cursor };
@@ -598,9 +612,24 @@ export function extendPearlHashWork(previous, point) {
 function pearlHashShares(record, end) {
   if (!record || !validPHPoint(record.last) || !validPHDays(record.days) || Math.abs(record.last.ts - end) > 1800) return null;
   const from = Math.ceil((end - FEE_SPAN) / DAY) * DAY;
-  let seconds = 0, blocks = 0, work = 0;
-  for (const [day, s, n, w] of record.days) if (day >= from) { seconds += s; blocks += n; work += w; }
-  return blocks > 0 && work > 0 ? { from, seconds, blocks, work } : null;
+  let seconds = 0, blocks = 0, work = 0, shown = 0;
+  for (const [day, s, n, w, d] of record.days) if (day >= from) { seconds += s; blocks += n; work += w; shown += d; }
+  return blocks > 0 && work > 0 ? { from, seconds, blocks, work, shareYield: pearlHashYield(record, shown / work) } : null;
+}
+
+/// The part of PearlHash's accepted shares that finds blocks: its displayed hashrate ÷ its accepted share rate over
+/// the cost window. PearlHash sets that display itself (× 0.915 until 2026-11-02, × 0.982 since) and its blocks
+/// follow it, not the shares: 10-20 to 11-02, 1,358 blocks against 1,363 by its display and 1,489 by its shares;
+/// 11-04 to 11-09, 427 against 421 and 430. A ratio of two work records, so no block luck is in it. It counts only
+/// while the whole record still bears that out (blocks within 2.58 σ of what the display predicts, 300 blocks at least);
+/// otherwise no figure.
+const PH_CHECK_BLOCKS = 300, PH_CHECK_Z = 2.58;
+function pearlHashYield(record, ratio) {
+  if (!finite(ratio) || ratio <= 0) return null;
+  let blocks = 0, shown = 0;
+  for (const [, , n, , d] of record.days) { blocks += n; shown += d; }
+  if (blocks < PH_CHECK_BLOCKS || !(shown > 0) || Math.abs(blocks - shown) > PH_CHECK_Z * Math.sqrt(shown)) return null;
+  return Math.min(1, ratio);
 }
 
 /// PearlHash's row and network difficulty from the snapshot, its own rate and display from `/api/stats`.
@@ -671,7 +700,8 @@ export async function recordPPLNSSnapshot(db, snapshot, fetchJSON = null, prefet
     // and the pool publishes its blocks' effort (PearlHash: its share record). The measurement keeps
     // scheme "PPLNS": it names the kind of estimate, not the pool's contract.
     const effort = row.id === PEARLHASH ? pearlhash ?? stored.get(PH_KEY) : efforts.get(row.id);
-    const pplns = costEstimated(row, sharedPayout(row)) ? pplnsMeasurement(next, snapshot.ts, effort) : null;
+    const pplns = row.id === HERO ? rollingShareMeasurement(effort, sharedPayout(row)?.fee, snapshot.ts)
+      : costEstimated(row, sharedPayout(row)) ? pplnsMeasurement(next, snapshot.ts, effort) : null;
     summary.push({ id: row.id, pool: row.name, luck: luckWindows(next, snapshot.ts), pplns, orphans: orphanRate(row) });
     summarized.add(row.id);
   }

@@ -11,7 +11,8 @@ import {
   chainPoolRows,
   mpsDataURL,
   sharedSnapshot,
-  perynPool,
+  perynPool, perynBlocks24h,
+  perynHistory,
   WORK,
 } from "../src/overview.js";
 import { makeEnv, call, setNow, restoreNow, T0 } from "./helpers.js";
@@ -137,6 +138,66 @@ test("Fortune: two payout schemes share one hashrate and use the same daily work
   assert.equal(rows[0].payouts[1].realFeePercent, null);
   assert.equal(rows[0].blocksSample, 25);
   assert.ok(rows[0].payouts.every((p) => p.mergeBonus === undefined));
+});
+const prlscanReply = (items, age = 60) => ({ updated_at: new Date((T0 - age) * 1000).toISOString(), items });
+test("prlscan: its 24h block count replaces the table's wherever it lists the pool", () => {
+  setNow(T0);
+  const scan = prlscanReply([
+    { slug: "kryptex", website_url: "https://pool.kryptex.com/prl", blocks_24h: 203 },
+    { slug: "f2pool", website_url: "https://www.f2pool.com/#prl", blocks_24h: 15 },
+    { slug: "k1pool", website_url: "https://k1pool.com/pool/pearl", blocks_24h: 0 },
+    { slug: "pearlskipool", website_url: "https://pearl.jetskipool.ai/", blocks_24h: 6 },
+    { slug: "bad", website_url: "https://broken.example/", blocks_24h: -1 },
+    { slug: "twin-a", website_url: "https://a.twin.example/", blocks_24h: 4 },
+    { slug: "twin-b", website_url: "https://a.twin.example/b", blocks_24h: 5 },
+  ]);
+  const table = [
+    { name: "Kryptex", url: "https://prl.kryptex.network/", hashrate: 4e19, fee: 3, blocks: 202, scheme: "PPS+" },
+    { name: "k1pool.com", url: "https://k1pool.com/pool/pearl", hashrate: 1e16, fee: 1, blocks: 1, scheme: "PPLNS" },
+    { name: "k1pool.com", url: "https://k1pool.com/pool/pearlsolo", hashrate: 1e16, fee: 1, blocks: 2, scheme: "SOLO" },
+    { name: "Unlisted", url: "https://unlisted.example/", hashrate: 1e17, fee: 1, blocks: 3, scheme: "PPLNS" },
+    { name: "Broken", url: "https://broken.example/", hashrate: 1e17, fee: 1, blocks: 7, scheme: "PPLNS" },
+    { name: "Twin", url: "https://a.twin.example/", hashrate: 1e17, fee: 1, blocks: 8, scheme: "PPLNS" },
+  ];
+  const mps = { block_time_average: 200, data: [
+    { url: "https://www.f2pool.com", hashrate: 2e18, fee: 1, feetype: "PPLNS", blocks_1000: 25 },
+    { url: "https://pearl.jetskipool.ai", hashrate: 1e18, fee: 1, feetype: "PPLNS", blocks_1000: 15 },
+  ] };
+  const network = { reward: 2000, hashrate: 8e19, prlPerTHDay: 0.02, ts: T0 };
+  const by = (rows) => Object.fromEntries(rows.map((r) => [r.name, [r.blocksPerDay, r.blocksSample, r.sampleDays, r.blocksSource ?? null, r.source]]));
+  const rows = buildOverview(table, network, { mps, prlscan: scan });
+  const days = 1000 * 200 / 86400;
+  assert.deepEqual(by(rows), {
+    // Another host, the same pool (Kryptex), and miningpoolstats' 1000-block rows take prlscan's 24h too.
+    Kryptex: [203, 203, 1, "prlscan", "lordofpearls"],
+    F2Pool: [15, 15, 1, "prlscan", "miningpoolstats"],
+    Jetski: [6, 6, 1, "prlscan", "miningpoolstats"],
+    "k1pool.com": [0, 0, 1, "prlscan", "lordofpearls"],
+    // A SOLO row's blocks pay its miners, not the pool's address.
+    "k1pool.com SOLO": [2, 2, 1, null, "lordofpearls"],
+    // Not listed, a count that isn't one, two entries on one host: the table's own.
+    Unlisted: [3, 3, 1, null, "lordofpearls"],
+    Broken: [7, 7, 1, null, "lordofpearls"],
+    Twin: [8, 8, 1, null, "lordofpearls"],
+  });
+  // The 24h yield follows the count it shows.
+  const f2 = rows.find((r) => r.name === "F2Pool");
+  near(f2.earningsPerPH, 15 * 2000 / (2e18 / 1e15));
+  // No reply, a stale one or one from the future: every row keeps the table's count.
+  for (const bad of [null, {}, prlscanReply(scan.items, 1801), prlscanReply(scan.items, -301), { ...scan, items: null }, { ...scan, updated_at: "soon" }]) {
+    const r = by(buildOverview(table, network, { mps, prlscan: bad }));
+    assert.deepEqual([r.Kryptex, r.F2Pool], [[202, 202, 1, null, "lordofpearls"], [25 / days, 25, days, null, "miningpoolstats"]], JSON.stringify(bad));
+  }
+});
+test("prlscan: Pearl Fortune shows prlscan's count while its yield stays its own day's coins", () => {
+  setNow(T0);
+  const fortune = { pool_stats: { pool_fee_rate: .02, rolling_stats: [{ hours: 1, hashrate: 2e15 }, { hours: 24, hashrate: 1e15, total_coins: 80, expected_coins: 100, block_count: 25 }] } };
+  const table = [{ name: "Pearl Fortune", url: "https://pearlfortune.org", hashrate: 3e15, blocks: 40, scheme: "PPS", fee: 5 }];
+  const [own] = buildOverview(table, null, { fortune });
+  const [scanned] = buildOverview(table, null, { fortune, prlscan: prlscanReply([{ website_url: "https://pearlfortune.org", blocks_24h: 41 }]) });
+  assert.deepEqual([own.blocksPerDay, own.blocksSample, "blocksSource" in own], [25, 25, false]);
+  assert.deepEqual([scanned.blocksPerDay, scanned.blocksSample, scanned.sampleDays, scanned.blocksSource], [41, 41, 1, "prlscan"]);
+  assert.deepEqual(scanned.payouts.map((p) => [p.scheme, p.grossPerPH]), own.payouts.map((p) => [p.scheme, p.grossPerPH]));
 });
 test("Fortune: the PPS fee comes from its fee-rate API; nonsense keeps the fallback", () => {
   const ppsFee = (fortuneFees) => buildOverview([{ name: "Pearl Fortune", url: "https://pearlfortune.org", hashrate: 3e15, blocks: 40 }], null, {
@@ -323,6 +384,25 @@ test("Peryn: its own API adds a row with PPS+ and PPLNS at its own fees; no bloc
   // Ranked by hashrate with the rest.
   assert.deepEqual(rows.map((r) => r.name), ["Kryptex", "Peryn"]);
 });
+test("Peryn: when its 10 listed blocks all fall inside the day, the older hours come from `hourly` (2026-11-09: 15, not 10)", () => {
+  // app.peryn.ai/api/pool/live at 2026-11-09 14:36:54 UTC: the list reaches back to 18:42 yesterday.
+  const t = Date.parse("2026-11-09T14:36:54Z") / 1000;
+  const listed = ["13:05", "10:07", "06:29", "05:21", "00:25"].map((h) => `2026-11-09T${h}:00Z`)
+    .concat(["23:58", "21:40", "20:31", "19:12", "18:42"].map((h) => `2026-11-08T${h}:00Z`));
+  const recent = listed.map((foundAt, i) => ({ height: 140694 - i, foundAt, status: i < 2 ? "pending" : "mature" }));
+  const perHour = [1, 3, 1, 0, 1, 2, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 1, 0]; // 14:00 yesterday … 14:00 today
+  const start = Date.parse("2026-11-08T14:00:00Z");
+  const hourly = perHour.map((blocks, i) => ({ hour: new Date(start + i * 3600_000).toISOString().replace(".000", ""), hashrate: 3e18, blocks }));
+  // 10 listed + 15:00–17:59 yesterday (3 + 1 + 0); the 14:00 hour is mostly before the day began.
+  assert.equal(perynBlocks24h({ recent }, hourly, t), 14);
+  assert.equal(perynPool({ ...perynLive(), blocks: { found: 49, byStatus: { orphaned: 2 }, recent }, hourly }, t).blocks, 14);
+  // An hour that held more blocks than the list shows of it: the unlisted ones count too.
+  assert.equal(perynBlocks24h({ recent }, hourly.map((h, i) => i === 4 ? { ...h, blocks: 2 } : h), t), 15);
+  // A list that reaches back a whole day is exact on its own; without hours, the listed day is all there is.
+  assert.equal(perynBlocks24h({ recent: recent.slice(0, 3) }, hourly, Date.parse("2026-11-09T14:00:00Z") / 1000 + 86400), 0);
+  assert.equal(perynBlocks24h({ recent }, undefined, t), 10);
+  assert.equal(perynBlocks24h({ recent }, [{ hour: "bad", blocks: 9 }], t), 10);
+});
 test("Peryn: its listed blocks count by foundAt over 24h, orphaned and rejected left out", () => {
   setNow(T0);
   const at = (s) => new Date(s * 1000).toISOString();
@@ -359,24 +439,36 @@ test("Peryn: terms it doesn't state are left out; a reply without a hashrate add
   for (const o of [null, {}, "x", { pool: {} }, perynLive({ hashrate: { macsPerSecond: 0 } }), perynLive({ hashrate: 5e16 })])
     assert.deepEqual(buildOverview([], { hashrate: 82e18, reward: 2200 }, { peryn: o }), []);
 });
-test("Peryn: Founding Miner fees ride on its payouts while sign-ups are open; fee, yield and other pools untouched", () => {
+test("Peryn: Founding Miner fees ride on its payouts — open with the closing day, then closed; fee, yield and other pools untouched", () => {
   setNow(T0);
   const network = { hashrate: 82e18, reward: 2200, prlPerTHDay: 0.02 };
   const rows = (perynLaunch) => buildOverview([{ name: "Lucky Pool", url: "https://pearl.luckypool.io/", hashrate: 6e18, blocks: 30, fee: 1, scheme: "PPLNS" }],
     network, { peryn: perynLive(), perynLaunch });
+  const terms = (row) => row.find((r) => r.name === "Peryn").payouts.map((p) => [p.scheme, p.founding, p.foundingClosed]);
   const open = rows({ launch: { mining: "live", foundingRegistration: "open" } });
   const peryn = open.find((r) => r.name === "Peryn");
-  assert.deepEqual(peryn.payouts.map((p) => [p.scheme, p.fee, p.founding]), [["PPS+", 1, { fee: 0.5 }], ["PPLNS", 1, { fee: 0, afterFP8Months: 6 }]]);
+  assert.deepEqual(terms(open), [["PPS+", { fee: 0.5, closes: "2026-11-08" }, undefined], ["PPLNS", { fee: 0, afterFP8Months: 6, closes: "2026-11-08" }, undefined]]);
+  assert.deepEqual(peryn.payouts.map((p) => p.fee), [1, 1]);
   assert.equal(peryn.fee, 1);
-  assert.equal(open.find((r) => r.name === "Lucky Pool").payouts[0].founding, undefined);
-  const closed = rows({ launch: { foundingRegistration: "closed" } }).find((r) => r.name === "Peryn");
-  assert.deepEqual(closed.payouts.map((p) => p.founding), [undefined, undefined]);
-  assert.deepEqual(closed.payouts.map((p) => p.grossPerPH), peryn.payouts.map((p) => p.grossPerPH));
+  assert.deepEqual(open.find((r) => r.name === "Lucky Pool").payouts.map((p) => [p.founding, p.foundingClosed]), [[undefined, undefined]]);
+  // Closed (2.1.11 apps read `founding` as open sign-ups, so it is left out): registered addresses keep the terms.
+  const closedTerms = [["PPS+", undefined, { fee: 0.5 }], ["PPLNS", undefined, { fee: 0, afterFP8Months: 6 }]];
+  const closed = rows({ launch: { foundingRegistration: "closed" } });
+  assert.deepEqual(terms(closed), closedTerms);
+  assert.deepEqual(closed.find((r) => r.name === "Peryn").payouts.map((p) => p.grossPerPH), peryn.payouts.map((p) => p.grossPerPH));
+  // Unknown before the closing day: no terms.
   for (const launch of [null, {}, { launch: null }, { launch: { foundingRegistration: true } }])
-    assert.deepEqual(rows(launch).find((r) => r.name === "Peryn").payouts.map((p) => p.founding), [undefined, undefined]);
+    assert.deepEqual(terms(rows(launch)), [["PPS+", undefined, undefined], ["PPLNS", undefined, undefined]]);
+  // 8 Nov is the last day; from 9 Nov 00:00 UTC closed whatever its API says or whether it answers.
+  setNow(Date.UTC(2026, 10, 8, 23, 59, 59) / 1000);
+  assert.equal(terms(rows({ launch: { foundingRegistration: "open" } }))[0][1].closes, "2026-11-08");
+  setNow(Date.UTC(2026, 10, 9) / 1000);
+  for (const launch of [{ launch: { foundingRegistration: "open" } }, { launch: { foundingRegistration: "closed" } }, null])
+    assert.deepEqual(terms(rows(launch)), closedTerms);
+  setNow(T0);
   // Only the schemes it names: PPLNS alone when PPS+ is off.
   const pplns = buildOverview([], network, { peryn: perynLive({ fpps: null }), perynLaunch: { launch: { foundingRegistration: "open" } } })[0];
-  assert.deepEqual(pplns.payouts.map((p) => [p.scheme, p.founding]), [["PPLNS", { fee: 0, afterFP8Months: 6 }]]);
+  assert.deepEqual(pplns.payouts.map((p) => [p.scheme, p.founding]), [["PPLNS", { fee: 0, afterFP8Months: 6, closes: "2026-11-08" }]]);
 });
 test("Peryn: a pool table or miningpoolstats listing of it is not doubled", () => {
   setNow(T0);
@@ -394,6 +486,39 @@ test("Peryn: a pool table or miningpoolstats listing of it is not doubled", () =
   assert.deepEqual(mps.map((r) => [r.name, r.source]), [["Peryn", "pool"]]);
   // Without its own API, nothing is made up.
   assert.deepEqual(buildOverview([], network, {}), []);
+});
+test("Peryn: its own daily and hourly hashrate give the 7-day trend and average miningpoolstats would", () => {
+  // app.peryn.ai/api/pool/live on 2026-11-09 at 10:55 UTC, trimmed: days from 10-27 (today so far), the last 25 hours.
+  const t = Date.parse("2026-11-09T12:00:00Z") / 1000;
+  setNow(t);
+  const day = (d, e) => ({ day: `2026-${d}`, hashrate: e * 1e18, miners: 1, blocks: 0 });
+  const history = [day("10-31", 0.02), day("11-01", 0.04), day("11-02", 0.07), day("11-03", 0.17), day("11-04", 0.52),
+    day("11-05", 0.84), day("11-06", 1.21), day("11-07", 1.87), day("11-08", 2.56), day("11-09", 3.05)];
+  const hourly = Array.from({ length: 25 }, (_, i) =>
+    ({ hour: new Date((t - (25 - i) * 3600) * 1000).toISOString().replace(".000", ""), hashrate: (2.4 + i * 0.05) * 1e18, miners: 1, blocks: 0 }));
+  const o = { ...perynLive(), history: [...history].reverse(), hourly };
+  const h = perynHistory(o, t);
+  // Half of today has passed: today ½, six full days, half of the eighth day back.
+  near(h.averageHashrate7d, (3.05 * 0.5 + 2.56 + 1.87 + 1.21 + 0.84 + 0.52 + 0.17 + 0.07 * 0.5) / 7 * 1e18);
+  // Days at noon until the hours begin (11-08 11:00), then the hours at half past; only the last 7 days.
+  assert.deepEqual(h.history.slice(0, 6).map((p) => [new Date(p.ts * 1000).toISOString().slice(0, 13), p.hashrate / 1e18]),
+    [["2026-11-02T12", 0.07], ["2026-11-03T12", 0.17], ["2026-11-04T12", 0.52], ["2026-11-05T12", 0.84], ["2026-11-06T12", 1.21], ["2026-11-07T12", 1.87]]);
+  assert.equal(h.history.length, 6 + 25);
+  assert.equal(h.history.at(-1).ts, t - 3600 + 1800);
+  assert.ok(h.history.every((p, i) => i === 0 || p.ts > h.history[i - 1].ts));
+  // Its row carries them; a miningpoolstats listing of it would take over.
+  const [row] = buildOverview([], { hashrate: 82e18, reward: 2200, prlPerTHDay: 0.02 }, { peryn: o });
+  assert.deepEqual([row.history, row.averageHashrate7d], [h.history, h.averageHashrate7d]);
+  // A pool two days old averages what it has; no days, no hours, or junk: nothing.
+  near(perynHistory({ history: [day("11-08", 2), day("11-09", 4)] }, t).averageHashrate7d, (2 + 4 * 0.5) / 1.5 * 1e18);
+  assert.equal(perynHistory({ history: [day("11-09", 4)] }, t).averageHashrate7d, null);
+  for (const bad of [null, {}, { history: "x", hourly: [{ hour: "x", hashrate: 1 }, { hour: "2026-11-09T11:00:00Z", hashrate: -1 }] }])
+    assert.deepEqual(perynHistory(bad, t), { history: [], averageHashrate7d: null });
+  // A history that stopped over a day ago has no average; its old days still draw.
+  assert.deepEqual(perynHistory({ history: [day("11-01", 1), day("11-02", 1)] }, t),
+    { history: [{ ts: Date.parse("2026-11-02T12:00:00Z") / 1000, hashrate: 1e18 }, { ts: Date.parse("2026-11-01T12:00:00Z") / 1000, hashrate: 1e18 }].reverse(), averageHashrate7d: null });
+  assert.deepEqual(buildOverview([], { hashrate: 82e18, reward: 2200 }, { peryn: perynLive() })[0].history, []);
+  assert.equal(buildOverview([], { hashrate: 82e18, reward: 2200 }, { peryn: perynLive() })[0].averageHashrate7d, null);
 });
 test("comparison: unlisted and SOLO pools merged without duplicates or mixed-window winners", () => {
   const rows = buildOverview(
@@ -480,6 +605,7 @@ const mock = (env, { fail = false, fallback = false } = {}) => {
       return Response.json({ data: { chain: "pearl", pool_fee_rate: 0.02, pps_fee_rate: 0.035 } });
     if (url === "https://app.peryn.ai/api/pool/live") return Response.json(perynLive());
     if (url === "https://peryn.ai/api/live") return Response.json({ launch: { mining: "live", foundingRegistration: "open" } });
+    if (url === "https://api.prlscan.com/v1/pools") return Response.json(prlscanReply([{ website_url: "https://pool.kryptex.com/prl", blocks_24h: 203 }]));
     return Response.json({ pool: { realHashrate: 3e18 } });
   };
   return urls;
@@ -492,16 +618,17 @@ test("overview API: public no-store, capped budgets, full comparison and no pers
   assert.equal(r.status, 200);
   assert.equal(r.headers.get("cache-control"), "no-store");
   assert.ok(r.body.rows.length >= 5);
-  // Eleven reads for the table (Pearl Fortune's summary and its fee rate, Lucky Pool's config, Peryn's pool and its
-  // launch state), then the newest blocks of each pool whose luck is taken out of Real Cost and our node's block
+  // Twelve reads for the table (Pearl Fortune's summary and its fee rate, Lucky Pool's config, Peryn's pool and its
+  // launch state, prlscan's block counts), then the newest blocks of each pool whose luck is taken out of Real Cost and our node's block
   // list (orphans). The explorer's orphans and HeroMiners' and Lucky Pool's blocks come from the table's own
   // reads, not a second fetch.
-  assert.equal(urls.length, 13);
-  assert.ok(urls.slice(0, 11).includes("https://pearlfortune.org/api/v1/stats/pool-fee-rate"));
-  assert.ok(urls.slice(0, 11).includes("https://app.peryn.ai/api/pool/live"));
-  assert.ok(urls.slice(0, 11).includes("https://peryn.ai/api/live"));
+  assert.equal(urls.length, 14);
+  assert.ok(urls.slice(0, 12).includes("https://pearlfortune.org/api/v1/stats/pool-fee-rate"));
+  assert.ok(urls.slice(0, 12).includes("https://app.peryn.ai/api/pool/live"));
+  assert.ok(urls.slice(0, 12).includes("https://peryn.ai/api/live"));
+  assert.ok(urls.slice(0, 12).includes("https://api.prlscan.com/v1/pools"));
   assert.equal(urls.filter((u) => u === "https://pearl.luckypool.io/api/stats").length, 1);
-  assert.deepEqual(urls.slice(11).sort(), ["https://node.pearlhub.net/chain/blocks.json", "https://pearlfortune.org/api/v1/blocks?page=1"]);
+  assert.deepEqual(urls.slice(12).sort(), ["https://node.pearlhub.net/chain/blocks.json", "https://pearlfortune.org/api/v1/blocks?page=1"]);
   assert.equal(r.body.rows.find((row) => row.name === "Lucky Pool").scheme, "PROP");
   const peryn = r.body.rows.find((row) => row.name === "Peryn");
   assert.deepEqual([peryn.fee, peryn.miners, peryn.payouts.map((p) => [p.scheme, p.founding?.fee])], [1, 35, [["PPS+", 0.5], ["PPLNS", 0]]]);
@@ -614,11 +741,11 @@ test("shared source: API callers reuse the durable snapshot and refresh after fi
   setNow(T0 + 200);
   const next = await call(env, "GET", "/v1/pools");
   assert.equal(next.body.ts, first.body.ts);
-  assert.equal(urls.length, 13);
+  assert.equal(urls.length, 14);
   setNow(T0 + 301);
   const refreshed = await call(env, "GET", "/v1/pools");
   assert.equal(refreshed.body.ts, T0 + 301);
-  assert.equal(urls.length, 26);
+  assert.equal(urls.length, 28);
 });
 test("shared source: an upstream outage retains timestamped data, then expires it", async () => {
   setNow(T0);

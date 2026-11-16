@@ -174,11 +174,65 @@ export function chainPoolRows(chain) {
 const PERYN_URL = "https://peryn.ai/";
 const PERYN_STATS = "https://app.peryn.ai/api/pool/live";
 // Its Founding Miner terms (peryn.ai/mine, 2026-11-02): PPS+ 0.5%, PPLNS 0% until Pearl's FP8 upgrade and for 6
-// months after it. Sign-ups close at that upgrade, so the terms ride on the payouts (an ⓘ beside the fee; never
-// in yield or Real Cost) only while its peryn.ai/api/live says `launch.foundingRegistration` is "open".
+// months after it; an ⓘ beside the fee, never in yield or Real Cost. Sign-ups close on 8 Nov 2026 (Peryn's founder,
+// 2026-11-05) and registered addresses keep the terms. While its peryn.ai/api/live says
+// `launch.foundingRegistration` is "open" they ride as `founding` with the closing day; once it says anything else
+// or the day is over, as `foundingClosed` (a new field: 2.1.11 apps read `founding` as open sign-ups).
 const PERYN_LAUNCH = "https://peryn.ai/api/live";
 const PERYN_FOUNDING = { "PPS+": { fee: 0.5 }, PPLNS: { fee: 0, afterFP8Months: 6 } };
+const PERYN_FOUNDING_CLOSES = "2026-11-08";
+const PERYN_FOUNDING_CLOSED = Date.parse(`${PERYN_FOUNDING_CLOSES}T24:00:00Z`) / 1000;
 const perynPercent = (v) => (num(v) != null && num(v) >= 0 && num(v) <= 100 ? num(v) : null);
+// Its 7-day trend and average, which miningpoolstats gives the other pools: `history` holds one hashrate per UTC day
+// (the day's average; today's so far) and `hourly` the last 25 hours. The trend takes each day at its noon until the
+// hours begin, then the hours at their half past; the average weighs the last 7 × 24 hours by day, today by the part
+// of it that has passed and the eighth day back by the rest (fewer days, fewer weights: a pool younger than a week).
+const perynDay = (d) => (typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d) ? Date.parse(`${d}T00:00:00Z`) / 1000 : NaN);
+const perynHour = (h) => (typeof h === "string" ? Date.parse(h) / 1000 : NaN);
+export function perynHistory(o, t = now()) {
+  const sorted = (rows, at) => (Array.isArray(rows) ? rows : [])
+    .map((r) => ({ ts: at(r), hashrate: num(r?.hashrate) }))
+    .filter((p) => Number.isFinite(p.ts) && p.ts > 0 && p.ts <= t && p.hashrate != null && p.hashrate >= 0)
+    .sort((a, b) => a.ts - b.ts);
+  const days = sorted(o?.history, (r) => perynDay(r?.day)), hours = sorted(o?.hourly, (r) => perynHour(r?.hour));
+  const firstHour = hours[0]?.ts ?? Infinity;
+  const points = [...days.filter((d) => d.ts + 43200 < firstHour).map((d) => ({ ts: d.ts + 43200, hashrate: d.hashrate })),
+    ...hours.map((h) => ({ ts: h.ts + 1800, hashrate: h.hashrate }))];
+  const end = points.at(-1)?.ts ?? 0;
+  let weight = 0, sum = 0;
+  const today = days.at(-1);
+  if (today && today.ts > t - 86400) {
+    const passed = Math.min(Math.max((t - today.ts) / 86400, 0), 1);
+    for (const d of days) {
+      const back = (today.ts - d.ts) / 86400;
+      const w = back === 0 ? passed : back < 7 ? 1 : back === 7 ? 1 - passed : 0;
+      weight += w; sum += w * d.hashrate;
+    }
+  }
+  return { history: points.filter((p) => p.ts >= end - 7 * 86400), averageHashrate7d: weight >= 1 ? sum / weight : null };
+}
+// Its blocks over the last 24 hours. `blocks.recent` lists only its newest 10: once all 10 fall inside the day the list
+// no longer reaches back 24 hours (2026-11-09: it showed 10 where it had found 15, Peryn: "our 24h blocks count is
+// stuck?"). The rest of the day then comes from `hourly` (blocks per UTC hour, the last 25): what the hour of the
+// oldest listed block holds beyond the listed ones, and every earlier hour whose middle is inside the day.
+export function perynBlocks24h(blocks, hourly, t = now()) {
+  const recent = Array.isArray(blocks?.recent) ? blocks.recent : null;
+  if (!recent) return null;
+  const time = (b) => (typeof b?.foundAt === "string" ? Date.parse(b.foundAt) / 1000 : NaN);
+  const listed = recent.map(time).filter((s) => Number.isFinite(s) && s > 0 && s <= t + 60);
+  const kept = recent.filter((b) => !/^(orphan|reject)/i.test(typeof b?.status === "string" ? b.status : ""))
+    .map(time).filter((s) => Number.isFinite(s) && s > 0 && s <= t + 60);
+  const day = t - 86400, inDay = kept.filter((s) => s > day).length;
+  if (!listed.length || Math.min(...listed) <= day) return inDay;
+  const hours = (Array.isArray(hourly) ? hourly : []).map((h) => ({ ts: typeof h?.hour === "string" ? Date.parse(h.hour) / 1000 : NaN, n: count(h?.blocks) }))
+    .filter((h) => Number.isFinite(h.ts) && h.ts % 3600 === 0 && h.n != null);
+  const cut = Math.floor(Math.min(...listed) / 3600) * 3600;
+  // Without the hours before the list began, the listed day is all there is to count.
+  if (!hours.some((h) => h.ts < cut && h.ts + 1800 > day)) return inDay;
+  const sameHour = hours.find((h) => h.ts === cut)?.n ?? 0;
+  const before = hours.filter((h) => h.ts < cut && h.ts + 1800 > day).reduce((total, h) => total + h.n, 0);
+  return inDay + Math.max(0, sameHour - listed.filter((s) => s >= cut && s < cut + 3600).length) + before;
+}
 export function perynPool(o, t = now()) {
   const pool = o?.pool, blocks = o?.blocks;
   const hashrate = positive(pool?.hashrate?.macsPerSecond);
@@ -197,13 +251,14 @@ export function perynPool(o, t = now()) {
     url: PERYN_URL,
     hashrate,
     miners: count(pool.minersLastHour),
-    blocks: recent ? times.filter((s) => s > t - 86400).length : found === 0 ? 0 : null,
+    blocks: recent ? perynBlocks24h(blocks, o?.hourly, t) : found === 0 ? 0 : null,
     fee: own || ppsFee == null ? perynPercent(pool.feePct) : ppsFee,
     scheme: own || (ppsFee != null ? "PPS+" : null),
     // PPS+ beside a shared-reward scheme; a pool whose own scheme is PPS already says it.
     ppsFee: own && !/^(PPS|FPPS)/i.test(own) ? ppsFee : null,
     lifetimeBlocks: found != null && found >= lost ? found - lost : null,
     lastBlockTime: times.length ? Math.max(...times) : null,
+    ...perynHistory(o, t),
   };
 }
 export function averageDifficulty(o, days) {
@@ -309,14 +364,39 @@ function mpsNetwork(m, k) {
     difficulty7d: null,
   };
 }
+/// prlscan.com's count of each pool's blocks over the last 24 hours (api.prlscan.com/v1/pools, read 2026-11-10: 27
+/// pools, each counted on the chain by the address its blocks pay, the reply refreshed every 30 s). The 24h blocks
+/// column, and the yield that follows from it, take its count wherever it lists the pool (owner, 2026-11-10); a pool
+/// it doesn't list, a SOLO row (its blocks pay the miner) or a reply older than PRLSCAN_MAX_AGE keeps the table's.
+const PRLSCAN_POOLS = "https://api.prlscan.com/v1/pools";
+const PRLSCAN_MAX_AGE = 1800;
+export function prlscanBlocks(o, t = now()) {
+  const at = typeof o?.updated_at === "string" ? Date.parse(o.updated_at) / 1000 : NaN;
+  if (!Number.isFinite(at) || at > t + 300 || t - at > PRLSCAN_MAX_AGE || !Array.isArray(o.items)) return [];
+  return o.items.flatMap((p) => {
+    const url = safeURL(p?.website_url), blocks = p?.blocks_24h;
+    return url && Number.isSafeInteger(blocks) && blocks >= 0 ? [{ url, blocks }] : [];
+  });
+}
+// A row's prlscan entry: the one on the same host, else the one pool of the same name (Kryptex is pool.kryptex.com
+// there, prl.kryptex.network here); none when two could be it.
+function prlscanFor(scan, url) {
+  if (!safeURL(url)) return null;
+  const host = (u) => new URL(u).hostname.toLowerCase();
+  const same = scan.filter((p) => samePool(p.url, url)), exact = same.filter((p) => host(p.url) === host(url));
+  return exact.length === 1 ? exact[0].blocks : !exact.length && same.length === 1 ? same[0].blocks : null;
+}
 export function buildOverview(
   rows,
   network,
-  { hero = null, lucky = null, kryptex = null, mps = null, chain = null, fortune = null, fortuneFees = null, peryn = null, perynLaunch = null } = {},
+  { hero = null, lucky = null, kryptex = null, mps = null, chain = null, fortune = null, fortuneFees = null, peryn = null, perynLaunch = null, prlscan = null } = {},
 ) {
+  const scan = prlscanBlocks(prlscan);
   // Peryn from its own API, unless the table already lists it (then that row takes its terms).
   const perynData = perynPool(peryn);
-  const foundingOpen = perynLaunch?.launch?.foundingRegistration === "open";
+  const registration = perynLaunch?.launch?.foundingRegistration;
+  const foundingClosed = now() >= PERYN_FOUNDING_CLOSED || (typeof registration === "string" && registration !== "open");
+  const foundingOpen = !foundingClosed && registration === "open";
   const normalized = [...rows.map((r) => ({
     ...r,
     sampleDays: 1,
@@ -414,8 +494,9 @@ export function buildOverview(
         if (rate != null && rate >= 0 && rate <= 1) ppsFee = Math.round(rate * 10000) / 100;
       }
       const pps = /^(PPS|FPPS)/i.test(payout || "");
-      let perDay =
-        r.blocks != null && r.sampleDays > 0 ? r.blocks / r.sampleDays : null;
+      const scanned = solo ? null : prlscanFor(scan, r.url);
+      let perDay = scanned ??
+        (r.blocks != null && r.sampleDays > 0 ? r.blocks / r.sampleDays : null);
       const reward = network?.reward;
       let theoretical = reward > 0 && network?.difficulty24h > 0
         ? reward * 86400 * 1e15 / (network.difficulty24h * WORK)
@@ -425,17 +506,19 @@ export function buildOverview(
         : hash > 0 && reward > 0 && perDay != null
           ? (perDay * reward) / (hash / 1e15)
           : null;
-      let sample = r.blocks;
-      let sampleDays = r.sampleDays;
+      let sample = scanned ?? r.blocks;
+      let sampleDays = scanned != null ? 1 : r.sampleDays;
       const rolling = Array.isArray(fortune?.pool_stats?.rolling_stats) ? fortune.pool_stats.rolling_stats : [];
       const day = rolling.find((p) => num(p.hours) === 24);
       if (isFortune && fortune) {
         hash = positive(rolling.find((p) => num(p.hours) === 1)?.hashrate) || hash;
         if (positive(day?.hashrate)) {
           hash ||= positive(day.hashrate);
-          perDay = count(day.block_count);
-          sample = perDay;
-          sampleDays = 1;
+          if (scanned == null) {
+            perDay = count(day.block_count);
+            sample = perDay;
+            sampleDays = 1;
+          }
           earnings = num(day.total_coins) != null && num(day.total_coins) >= 0
             ? num(day.total_coins) / (num(day.hashrate) / 1e15) : null;
           theoretical = num(day.expected_coins) != null && num(day.expected_coins) >= 0
@@ -452,7 +535,10 @@ export function buildOverview(
       ];
       const bonus = !solo && Object.hasOwn(MERGE_BONUS, r.name) ? MERGE_BONUS[r.name] : null;
       if (bonus) for (const p of payouts) p.mergeBonus = { ...bonus };
-      if (isPeryn && foundingOpen) for (const p of payouts) if (Object.hasOwn(PERYN_FOUNDING, p.scheme)) p.founding = { ...PERYN_FOUNDING[p.scheme] };
+      if (isPeryn && (foundingOpen || foundingClosed)) for (const p of payouts) if (Object.hasOwn(PERYN_FOUNDING, p.scheme)) {
+        if (foundingOpen) p.founding = { ...PERYN_FOUNDING[p.scheme], closes: PERYN_FOUNDING_CLOSES };
+        else p.foundingClosed = { ...PERYN_FOUNDING[p.scheme] };
+      }
       const mpsRow = (Array.isArray(mps?.data) ? mps.data : []).find((p) =>
         samePool(p?.url, r.url) && ((p.url || "").toLowerCase().includes("solo") === solo));
       const recent = (Array.isArray(chain?.leaderboard?.recent_blocks) ? chain.leaderboard.recent_blocks : [])
@@ -480,12 +566,15 @@ export function buildOverview(
         blocksPerDay: perDay,
         blocksSample: sample,
         sampleDays,
+        ...(scanned != null ? { blocksSource: "prlscan" } : {}),
         earningsPerPH: earnings,
         theoreticalEarningsPerPH: theoretical,
         yieldRatio: !solo && !pps && theoretical > 0 && earnings != null ? earnings / theoretical : null,
         payouts,
-        history: decodePoolHistory(mpsRow),
-        averageHashrate7d: num(mpsRow?.hashrate_average_7d) >= 0 ? num(mpsRow?.hashrate_average_7d) : null,
+        // Peryn's from its own API while miningpoolstats doesn't list it.
+        history: mpsRow || !isPeryn ? decodePoolHistory(mpsRow) : perynData.history,
+        averageHashrate7d: mpsRow ? (num(mpsRow.hashrate_average_7d) >= 0 ? num(mpsRow.hashrate_average_7d) : null)
+          : isPeryn ? perynData.averageHashrate7d : null,
         lastBlockTime: lastTimes.length ? Math.max(...lastTimes) : null,
         lifetimeBlocks: lifetime.length ? lifetime.reduce((a, b) => a + b, 0) : isPeryn ? perynData.lifetimeBlocks : null,
         trustworthy:
@@ -583,7 +672,7 @@ const LOP_PUBLIC = "https://lordofpearls.xyz/api/public";
 const HERO_STATS = "https://pearl.herominers.com/api/stats";
 const LUCKY_STATS = "https://pearl.luckypool.io/api/stats";
 const fetchJSONFor = (db) => (url, budget) => get(url, db, budget).then(JSON.parse);
-export async function overview(env, ctx) {
+export async function overview(env, ctx, rollingCost = false) {
   try {
     // What this snapshot read that the luck bookkeeping reads too, so it isn't fetched twice.
     let prefetched = null;
@@ -612,13 +701,20 @@ export async function overview(env, ctx) {
             return null;
           }),
         feed("Peryn", () => get(PERYN_STATS, env.DB, "Peryn").then(JSON.parse), true),
-        // Whether its Founding Miner sign-ups are open: read once; without it the founding terms are left out.
+        // Whether its Founding Miner sign-ups are open: read once; without it the founding terms are left out until
+        // the closing day is over.
         get(PERYN_LAUNCH, env.DB, "Peryn").then(JSON.parse).catch((e) => {
           console.warn(`overview feed failed: Peryn launch, ${e?.status != null ? `HTTP ${e.status}` : `${e?.name || "Error"}: ${e?.message || e}`}`);
           return null;
         }),
+        // prlscan's 24h block counts: read once; without them each pool keeps the table's count (logged, never a
+        // partial snapshot).
+        get(PRLSCAN_POOLS, env.DB, "overview-prlscan").then(JSON.parse).catch((e) => {
+          console.warn(`overview feed failed: prlscan, ${e?.status != null ? `HTTP ${e.status}` : `${e?.name || "Error"}: ${e?.message || e}`}`);
+          return null;
+        }),
       ]);
-      const [html, chain, mps, kryptex, hero, lucky, fortune, fortuneFees, peryn, perynLaunch] = replies.map((r) =>
+      const [html, chain, mps, kryptex, hero, lucky, fortune, fortuneFees, peryn, perynLaunch, prlscan] = replies.map((r) =>
         r.status === "fulfilled" ? r.value : null,
       );
       prefetched = { [LOP_PUBLIC]: chain, [HERO_STATS]: hero, [LUCKY_STATS]: lucky };
@@ -634,6 +730,7 @@ export async function overview(env, ctx) {
         fortuneFees,
         peryn,
         perynLaunch,
+        prlscan,
       });
       if (!rows.length && !network) throw new Error("upstream");
       return {
@@ -657,7 +754,7 @@ export async function overview(env, ctx) {
     let measurements = [], luck = { pplns: [], luck: new Map() };
     try { measurements = await readRealFees(env.DB); } catch {}
     try { luck = await readPoolLuck(env.DB); } catch {}
-    return json(attachLuck(attachRealFees(snapshot, measurements, luck.pplns), luck.luck));
+    return json(attachLuck(attachRealFees(snapshot, measurements, luck.pplns, rollingCost), luck.luck));
   } catch {
     return json({ ok: false, error: "upstream" }, 502);
   }

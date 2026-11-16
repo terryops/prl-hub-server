@@ -14,13 +14,33 @@ export function recalculate(db, uid) {
       OR pro_src IS NOT (SELECT source FROM entitlements WHERE user_id=? AND revoked_at IS NULL AND platform='web' ORDER BY granted_at, source LIMIT 1)
       OR pro_ref IS NOT (SELECT ref FROM entitlements WHERE user_id=? AND revoked_at IS NULL AND platform='web' ORDER BY granted_at, source LIMIT 1))`).bind(uid, uid, uid, uid, uid, uid, uid);
 }
+// Run after marking the order paid, in the same settlement batch.
+export function orderEntitlements(db, id) {
+  return [
+    db.prepare(`INSERT OR IGNORE INTO entitlements(source, ref, user_id, product, platform, granted_at)
+      SELECT CASE WHEN o.txid IS NULL THEN 'admin' ELSE 'prl' END,COALESCE(o.txid,'order:'||o.id),
+        COALESCE(o.account_id,o.gid),'pro','web',o.paid_at FROM orders o
+      LEFT JOIN users u ON u.id=COALESCE(o.account_id,o.gid)
+      LEFT JOIN purchase_visitors v ON v.id=o.gid
+      WHERE o.id=? AND o.status='paid' AND o.paid_at IS NOT NULL
+      AND ((u.id IS NOT NULL AND u.deleted_at IS NULL)
+        OR (o.txid IS NULL AND o.account_id IS NULL AND v.id IS NOT NULL AND v.revoked_at IS NULL))`).bind(id),
+    db.prepare(`INSERT OR IGNORE INTO purchase_licenses(visitor_id,source,ref,granted_at)
+      SELECT v.id,e.source,e.ref,e.granted_at FROM orders o
+      JOIN purchase_visitors v ON v.id=o.gid AND v.revoked_at IS NULL
+      JOIN entitlements e ON e.source=CASE WHEN o.txid IS NULL THEN 'admin' ELSE 'prl' END
+        AND e.ref=COALESCE(o.txid,'order:'||o.id) AND e.user_id=COALESCE(o.account_id,o.gid)
+      WHERE o.id=? AND o.status='paid' AND e.product='pro' AND e.platform='web' AND e.revoked_at IS NULL`).bind(id),
+  ];
+}
 export async function syncPaid(env, uid) {
   await env.DB.batch([
     env.DB.prepare(`INSERT OR IGNORE INTO entitlements(source, ref, user_id, product, platform, granted_at)
-      SELECT 'prl', txid, gid, 'pro', 'web', paid_at FROM orders WHERE gid=? AND status='paid' AND txid IS NOT NULL
-      AND EXISTS(SELECT 1 FROM users WHERE id=? AND deleted_at IS NULL)`).bind(uid, uid),
+      SELECT 'prl', txid, ?, 'pro', 'web', paid_at FROM orders WHERE COALESCE(account_id,gid)=? AND status='paid' AND txid IS NOT NULL
+      AND EXISTS(SELECT 1 FROM users WHERE id=? AND deleted_at IS NULL)`).bind(uid, uid, uid),
     env.DB.prepare(`INSERT OR IGNORE INTO entitlements(source, ref, user_id, product, platform, granted_at)
       SELECT 'admin', gid, gid, 'pro', 'web', pro_at FROM groups WHERE gid=? AND pro_src='admin' AND pro_at IS NOT NULL
+      AND NOT EXISTS(SELECT 1 FROM entitlements e WHERE e.source='admin' AND e.ref=groups.pro_ref AND e.user_id=groups.gid)
       AND EXISTS(SELECT 1 FROM users WHERE id=? AND deleted_at IS NULL)`).bind(uid, uid),
     recalculate(env.DB, uid),
   ]);

@@ -116,6 +116,9 @@ export function installFetch() {
     if (u.hostname === "api.coinex.com") return J({ code: 0, data: [{ last: p, open: "0.78" }] });
     // BigONE answers only the current pair name; the pre-rename PRL-USDT is "Resource not found".
     if (u.hostname === "big.one" && u.pathname === "/api/v3/asset_pairs/PEARL-USDT/ticker") return J({ code: 0, data: { close: p, open: "0.78" } });
+    if (u.hostname === "api.gateio.ws" && u.pathname === "/api/v4/spot/tickers" && u.searchParams.get("currency_pair") === "PEARL_USDT") {
+      return J([{ currency_pair: "PEARL_USDT", last: p, change_percentage: String(((state.price - 0.78) / 0.78) * 100) }]);
+    }
     if (u.hostname === "whattomine.com") return J({ exchange_rate: state.price / 80000, timestamp: Date.now() / 1000 });
     if (u.hostname === "api.kraken.com") return J({ result: { XXBTZUSD: { c: ["80000"] } } });
     if (u.hostname === "api.coinbase.com") return J({ data: { amount: "80000" } });

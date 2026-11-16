@@ -83,13 +83,19 @@ export const SOURCES = {
   },
   "Pearl Fortune": {
     // `configured` is true for any address, so this pool never says "no such miner".
+    // Since 2026-11-06 a worker lists its connections (`sessions`) and is online while any
+    // of them is; before, it was one connection with `stale` / `last_stats_at` on top.
     url: (a) => `https://pearlfortune.org/api/v1/miners/${a}/connections`,
     parse(o) {
       if (!o.data || typeof o.data !== "object") throw new Error("no data");
       return {
-        workers: list(o.data.workers).map((w) => ({
-          name: text(w.worker), online: w.stale === false, last: stamp(Date.parse(text(w.last_stats_at)) / 1000),
-        })),
+        workers: list(o.data.workers).map((w) => {
+          const conns = Array.isArray(w.sessions) ? list(w.sessions) : [w];
+          return {
+            name: text(w.worker), online: conns.some((s) => s.stale === false),
+            last: stamp(Math.max(0, ...conns.map((s) => Date.parse(text(s.last_stats_at)) / 1000 || 0))),
+          };
+        }),
       };
     },
   },
