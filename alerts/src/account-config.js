@@ -2,6 +2,7 @@ import { now, webJson as json } from "./http.js";
 import { random } from "./auth.js";
 import { sanitizeRule, sanitizeWindow, UPSERT_RULE } from "./rules.js";
 import { sanitizeWatch, UPSERT_WATCH } from "./watch.js";
+import { DELISTED } from "./pools.js";
 import { purchaseProSQL } from "./purchases.js";
 import { accountPro, accountProSQL } from "./entitlements.js";
 
@@ -118,7 +119,8 @@ export async function projection(env, uid, config, commit) {
     WHERE COALESCE(d.sync_gid,d.gid)=? AND a.revoked_at IS NULL AND (EXISTS(SELECT 1 FROM groups WHERE gid=? AND pro_at IS NOT NULL) OR ${purchaseProSQL("d.gid")})`)
     .bind(uid, uid).all()).results;
   const rules = config.rules.filter((r) => !r.deleted).map(sanitizeRule);
-  const watches = config.monitors.filter((m) => !m.deleted && !m.paused && m.alert).map(sanitizeWatch);
+  // A delisted pool's monitor stays in the config but is never watched.
+  const watches = config.monitors.filter((m) => !m.deleted && !m.paused && m.alert && !DELISTED.has(m.pool)).map(sanitizeWatch);
   const conditional = (sql) => sql.replace(/VALUES\s*\(([^)]+)\)/, `SELECT $1 WHERE ${guard}`);
   const remove = (table, token, ids) => db.prepare(`DELETE FROM ${table} WHERE token=? ${ids.length ? `AND id NOT IN (${ids.map(() => "?").join(",")})` : ""} AND ${guard}`).bind(token, ...ids);
   for (const d of devices) {

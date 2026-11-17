@@ -99,26 +99,6 @@ export const SOURCES = {
       };
     },
   },
-  PearlHash: {
-    url: (a) => `https://pearlhash.xyz/api/account/${a}`,
-    gone: [404],
-    // Lists the connected workers only: one that drops just disappears. Repeats of a
-    // name are numbered, so two workers under one name stay two. They are often
-    // unnamed; those are counted as ANON, ANON (2)… and NOT told apart by IP (the
-    // app's label for them): a rig whose address changed would read as one worker
-    // gone and another arrived, and be pushed as offline.
-    parse(o) {
-      const seen = new Map();     // names are whatever a miner typed: "constructor" is a name
-      return {
-        workers: list(o.connected_workers).map((w) => {
-          const base = text(w.worker_name) || ANON;
-          const n = (seen.get(base) || 0) + 1;
-          seen.set(base, n);
-          return { name: n > 1 ? `${base} (${n})` : base, online: true, last: null };
-        }),
-      };
-    },
-  },
   Kryptex: {
     // 200 with an empty list for an address that never mined here.
     url: (a) => `https://prl-api.kryptex.network/api/v3/miner/workers/${a}`,
@@ -202,7 +182,6 @@ export function statsRequests(pool, a) {
       const base = primary.replace(/\/connections$/, "");
       return [base, primary, `${base}/ledger`];
     }
-    case "PearlHash": return [primary, "https://pearlhash.xyz/api/stats"];
     case "Kryptex": return [primary, `https://prl-api.kryptex.network/api/v1/miner/balance/${p}`, `https://prl-api.kryptex.network/api/v1/miner/payouts/${p}/stats`];
     case "F2Pool": {
       const base = primary.split("&action=")[0];
@@ -213,13 +192,27 @@ export function statsRequests(pool, a) {
   }
 }
 
-export const POOLS = Object.keys(SOURCES);
+/// Pools taken down at their owner's request (PearlHash, 2026-11-17): no overview row, no stats read, no
+/// offline polling, nothing asked of them. The names stay valid targets: an app's synced monitors or a device's
+/// registration that still carries one is accepted whole (refusing it would drop that user's other monitors
+/// and alerts too) and the delisted monitor is simply never read.
+export const DELISTED = new Set(["PearlHash"]);
+const DELISTED_HOSTS = ["pearlhash.xyz"];
+/// An overview row of a delisted pool, under its own name or, from a directory, its domain.
+export function delistedRow(r) {
+  if (DELISTED.has(r?.name)) return true;
+  let host = "";
+  try { host = new URL(r?.url || r?.id || "").hostname.toLowerCase(); } catch {}
+  return DELISTED_HOSTS.some((h) => host === h || host.endsWith("." + h));
+}
+/// The pools a target may name; only those in SOURCES are ever asked.
+export const POOLS = [...Object.keys(SOURCES), ...DELISTED];
 
 /// The stored form of a client's (pool, identifier), or null when it isn't one.
 /// Address pools: a lowercase PRL address. F2Pool: the read-only key, plus the
 /// account name the page was shared under.
 export function sanitizeTarget(pool, addr, acct) {
-  if (!Object.hasOwn(SOURCES, pool) || typeof addr !== "string") return null;
+  if (!POOLS.includes(pool) || typeof addr !== "string") return null;
   if (pool !== "F2Pool") return /^prl1[0-9a-z]{20,100}$/.test(addr) ? addr : null;
   if (!/^[0-9a-f]{16,64}$/.test(addr)) return null;
   if (acct == null || acct === "") return addr;

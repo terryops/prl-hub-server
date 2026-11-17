@@ -1,6 +1,6 @@
 // Public pool work and attributed block counters only; no miner credentials.
 import { now } from "./http.js";
-import { HERO, PEARLHASH, SHARE_YIELD_DAYS, rollingShareMeasurement, rollingPearlHashMeasurement, validRollingShareMeasurement } from "./shareyield.js";
+import { HERO, SHARE_YIELD_DAYS, rollingShareMeasurement, validRollingShareMeasurement } from "./shareyield.js";
 
 // MIN_WINDOW is observed time, not span: holes left by gaps do not count towards it.
 // The PPLNS cost estimate keeps its seven-day span; block luck reads the full fortnight.
@@ -24,17 +24,12 @@ export function sharedPayout(row) {
   return row.payouts?.find((p) => !p.solo && !/^(PPS|FPPS|SOLO)/i.test(p.scheme?.trim() || "")) || null;
 }
 
-/// Pools that name no scheme but were checked on chain to pay out the blocks they find, so a
-/// cost estimate means what it means for PPLNS. PearlHash, 2026-10-20: each payout round, about
-/// every two hours, is a whole number of full block rewards, and the pool keeps no reserve.
-const BLOCK_SHARING = new Set(["https://pearlhash.xyz/"]);
-
-/// Whether a payout gets a cost estimate: PPLNS or PROP by name, or an unnamed scheme on a pool
-/// checked to pay out its blocks. Both pay out the blocks found, so luck is part of the cost.
+/// Whether a payout gets a cost estimate: PPLNS or PROP by name. Both pay out the blocks found,
+/// so luck is part of the cost.
 export function costEstimated(row, payout) {
   if (!row || row.solo || !payout || payout.solo) return false;
   const name = payout.scheme?.trim().toUpperCase() || "";
-  return name === "PPLNS" || name === "PROP" || (!name && BLOCK_SHARING.has(row.id));
+  return name === "PPLNS" || name === "PROP";
 }
 
 export function pplnsPoint(snapshot, row) {
@@ -99,8 +94,7 @@ export function extendPPLNSHistory(previous, id, pool, point) {
 /// the work it displayed (fee, luck and lost work together); the pool's own block list says
 /// how much work those blocks took (Σ effort, each block's shares ÷ difficulty), so its luck
 /// is blocks ÷ Σ effort. Dividing that out leaves the fee and the work the pool loses: what a
-/// miner gives up in the long run. Pools that publish no per-block effort get no estimate here
-/// (PearlHash gets the rolling accepted-share count estimate in shareyield.js).
+/// miner gives up in the long run. Pools that publish no per-block effort get no estimate here.
 export function pplnsMeasurement(history, t = now(), effort = null) {
   if (!validHistory(history) || !validEffort(effort)) return null;
   const end = history.last.ts, daily = dailyPart(effort, end);
@@ -150,7 +144,7 @@ export function pplnsMeasurement(history, t = now(), effort = null) {
 }
 
 export function validPPLNSMeasurement(o, t = now()) {
-  if (o?.theoryBasis === "accepted_share_rounds" || o?.theoryBasis === "accepted_share_work") return validRollingShareMeasurement(o, t);
+  if (o?.theoryBasis === "accepted_share_rounds") return validRollingShareMeasurement(o, t);
   return !!o && typeof o.id === "string" && typeof o.pool === "string" && o.scheme === "PPLNS" &&
     o.theoryBasis === "pool_effort" && o.estimated === true &&
     finite(o.start) && o.start > 0 && finite(o.end) && o.end - o.start >= MIN_WINDOW && o.end - o.start <= FEE_SPAN + 3600 &&
@@ -563,59 +557,10 @@ const validLuck = (w, span, t) => !!w && finite(w.start) && finite(w.end) && w.e
   [w.expectedBlocks, w.ratio, w.grossPerPH, w.theoreticalPerPH].every((v) => finite(v) && v >= 0) &&
   w.expectedBlocks > 0 && w.theoreticalPerPH > 0;
 
-// ── PearlHash: its accepted-share rate, recorded to learn what its own numbers mean ───────
-
-/// PearlHash publishes no per-block effort, only `hashrate_diff_5m` in `/api/stats`: its accepted
-/// share difficulty per second (an account's value ÷ the pool's equals that account's share of
-/// an hourly payout). Per UTC day this keeps the observed seconds, the canonical blocks found and
-/// the blocks each reading predicts, up to 60 days, feeding its 30-day rolling output estimate.
-const PH_KEY = "public:pearlhash-work:v1", PH_DAYS = 60;
-const validPHPoint = (p) => !!p && finite(p.ts) && p.ts > 0 && Number.isSafeInteger(p.blocks) && p.blocks >= 0 &&
-  finite(p.diffRate) && p.diffRate >= 0 && finite(p.display) && p.display >= 0 && finite(p.difficulty) && p.difficulty > 0;
-const validPHDays = (days) => Array.isArray(days) && days.length <= PH_DAYS + 1 && days.every((d, i) => Array.isArray(d) &&
-  d.length === 5 && Number.isSafeInteger(d[0]) && d[0] % DAY === 0 && d.slice(1).every((v) => finite(v) && v >= 0) &&
-  Number.isSafeInteger(d[2]) && (!i || d[0] > days[i - 1][0]));
-
-/// Adds one observation. Like the PPLNS history, a gap, a counter that went back or an implausible
-/// jump leaves the interval out. Per day: [UTC day, seconds, blocks found, blocks predicted by the
-/// accepted-share rate at 2^48 hashes a unit, blocks predicted by the displayed hashrate].
-export function extendPearlHashWork(previous, point) {
-  if (!validPHPoint(point)) return previous;
-  const ok = previous && validPHPoint(previous.last) && validPHDays(previous.days);
-  const days = ok ? previous.days.filter((d) => d[0] >= Math.floor(point.ts / DAY) * DAY - PH_DAYS * DAY).map((d) => [...d]) : [];
-  const last = ok ? previous.last : null, dt = last ? point.ts - last.ts : 0;
-  if (last && dt <= 0) return previous;
-  if (last && dt <= MAX_GAP && point.blocks >= last.blocks) {
-    const difficulty = (last.difficulty + point.difficulty) / 2;
-    const accepted = (last.diffRate + point.diffRate) / 2 * dt / difficulty;
-    const shown = (last.display + point.display) / 2 * dt / (difficulty * 2 ** 48);
-    const blocks = point.blocks - last.blocks;
-    if (blocks <= Math.max(5, 10 * Math.max(accepted, shown)) && finite(accepted) && finite(shown)) {
-      const day = Math.floor(point.ts / DAY) * DAY;
-      if (days.at(-1)?.[0] !== day) days.push([day, 0, 0, 0, 0]);
-      const d = days.at(-1);
-      d[1] += dt; d[2] += blocks; d[3] += accepted; d[4] += shown;
-    }
-  }
-  return { last: { ts: point.ts, blocks: point.blocks, diffRate: point.diffRate, display: point.display, difficulty: point.difficulty }, days };
-}
-
-/// PearlHash's row and network difficulty from the snapshot, its own rate and display from `/api/stats`.
-async function recordPearlHash(stored, snapshot, fetchJSON) {
-  const row = snapshot.rows.find((r) => r.id === PEARLHASH && !r.solo);
-  const difficulty = snapshot.network?.difficulty;
-  if (!row || !Number.isSafeInteger(row.lifetimeBlocks) || !finite(difficulty) || difficulty <= 0) return null;
-  let o;
-  try { o = await fetchJSON("https://pearlhash.xyz/api/stats", "PearlHash"); } catch { return null; }
-  const point = { ts: snapshot.ts, blocks: row.lifetimeBlocks, diffRate: amount(o?.hashrate_diff_5m), display: amount(o?.hashrate), difficulty };
-  const previous = stored.get(PH_KEY), next = extendPearlHashWork(previous, point);
-  return next !== previous ? next : null;
-}
-
 const estimatedRows = (rows) => rows.filter((r) => costEstimated(r, sharedPayout(r)) && Object.hasOwn(EFFORT_SOURCES, r.id));
 async function histories(db, rows) {
   const keys = [...new Set([...rows.filter(sharedPayout).map((r) => key(r.id)), ...estimatedRows(rows).map((r) => effortKey(r.id)),
-    ...(rows.some((r) => r.id === PEARLHASH) ? [PH_KEY] : []), CHAIN_KEY])];
+    CHAIN_KEY])];
   if (!keys.length) return new Map();
   const { results } = await db.prepare(`SELECT k,v FROM kv WHERE k IN (${keys.map(() => "?").join(",")})`).bind(...keys).all();
   return new Map(results.flatMap(({ k, v }) => { try { return [[k, JSON.parse(v)]]; } catch { return []; } }));
@@ -636,19 +581,17 @@ export async function recordPPLNSSnapshot(db, snapshot, fetchJSON = null, prefet
   }
   const stored = await histories(db, snapshot.rows), writes = [], summary = [];
   const ids = [...new Set(estimatedRows(snapshot.rows).map((r) => r.id))];
-  // The block lists, PearlHash's rate, the explorer's orphans and our node's blocks do not depend on
-  // each other: asked for together, the snapshot's first reader waits for the slowest, not for all in turn.
-  const [efforts, pearlhash, lop, node] = await Promise.all([
+  // The block lists, the explorer's orphans and our node's blocks do not depend on each other:
+  // asked for together, the snapshot's first reader waits for the slowest, not for all in turn.
+  const [efforts, lop, node] = await Promise.all([
     fetchJSON ? refreshEfforts(stored, ids, snapshot.ts, fetchJSON)
       : new Map(ids.map((id) => [id, validEffort(stored.get(effortKey(id))) ? stored.get(effortKey(id)) : null])),
-    fetchJSON ? recordPearlHash(stored, snapshot, fetchJSON) : null,
     fetchJSON ? Promise.resolve().then(() => fetchJSON("https://lordofpearls.xyz/api/public", "overview-lop")).catch(() => null) : null,
     fetchJSON ? Promise.resolve().then(() => fetchJSON(NODE_BLOCKS, "overview-node")).catch(() => null) : null,
   ]);
   const recent = lop?.orphans?.recent ?? null;
   for (const [id, effort] of efforts) if (effort && !same(effort, stored.get(effortKey(id))))
     writes.push(db.prepare("INSERT OR REPLACE INTO kv(k,v,ts) VALUES(?,?,?)").bind(effortKey(id), JSON.stringify(effort), snapshot.ts));
-  if (pearlhash) writes.push(db.prepare("INSERT OR REPLACE INTO kv(k,v,ts) VALUES(?,?,?)").bind(PH_KEY, JSON.stringify(pearlhash), snapshot.ts));
   let chain = validChain(stored.get(CHAIN_KEY)) ? stored.get(CHAIN_KEY) : null;
   if (fetchJSON) {
     const extended = extendChainOrphans(chain, recent, snapshot.rows, snapshot.ts, (id, row) => counterSeed(stored.get(key(id)), row, snapshot.ts));
@@ -665,11 +608,10 @@ export async function recordPPLNSSnapshot(db, snapshot, fetchJSON = null, prefet
     if (next !== previous) writes.push(db.prepare("INSERT OR REPLACE INTO kv(k,v,ts) VALUES(?,?,?)")
       .bind(key(row.id), JSON.stringify(next), snapshot.ts));
     // Every shared contract gets luck windows; a cost estimate only where `costEstimated` says so
-    // and the pool publishes its blocks' effort (PearlHash: its share record). The measurement keeps
-    // scheme "PPLNS": it names the kind of estimate, not the pool's contract.
-    const effort = row.id === PEARLHASH ? pearlhash ?? stored.get(PH_KEY) : efforts.get(row.id);
+    // and the pool publishes its blocks' effort. The measurement keeps scheme "PPLNS": it names the
+    // kind of estimate, not the pool's contract.
+    const effort = efforts.get(row.id);
     const pplns = row.id === HERO ? rollingShareMeasurement(effort, sharedPayout(row)?.fee, snapshot.ts)
-      : row.id === PEARLHASH ? rollingPearlHashMeasurement(effort, sharedPayout(row)?.fee, snapshot.ts)
       : costEstimated(row, sharedPayout(row)) ? pplnsMeasurement(next, snapshot.ts, effort) : null;
     summary.push({ id: row.id, pool: row.name, luck: luckWindows(next, snapshot.ts), pplns, orphans: orphanRate(row) });
     summarized.add(row.id);

@@ -1,6 +1,6 @@
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { pplnsPoint, extendPPLNSHistory, pplnsMeasurement, validPPLNSMeasurement, recordPPLNSSnapshot, readPoolLuck, luckWindows, sharedPayout, costEstimated, mergeEfforts, EFFORT_SOURCES, extendPearlHashWork, orphanWindow, validOrphans, attachLuck, extendChainOrphans, chainOrphanWindow, counterSeed, nodeOrphanWindow, validNodeBlocks, addressOwners, NODE_BLOCKS } from "../src/pplns.js";
+import { pplnsPoint, extendPPLNSHistory, pplnsMeasurement, validPPLNSMeasurement, recordPPLNSSnapshot, readPoolLuck, luckWindows, sharedPayout, costEstimated, mergeEfforts, EFFORT_SOURCES, orphanWindow, validOrphans, attachLuck, extendChainOrphans, chainOrphanWindow, counterSeed, nodeOrphanWindow, validNodeBlocks, addressOwners, NODE_BLOCKS } from "../src/pplns.js";
 import { makeEnv, setNow, restoreNow, T0, call, installFetch, tick } from "./helpers.js";
 
 afterEach(restoreNow);
@@ -446,7 +446,7 @@ test("pool lists: rejected and solo blocks on a pool's pages do not stall the ba
   assert.deepEqual(stored(hero).blocks.map((b) => b[0]), [...range(1, 70), ...range(80, 90)]);
 });
 
-test("pool lists: the block lists, PearlHash and the explorer's orphans are asked for at once", async () => {
+test("pool lists: the block lists and the explorer's orphans are asked for at once; nothing of a delisted pool", async () => {
   const env = makeEnv(), end = T0 + DAY, hero = "https://pearl.herominers.com/";
   const rows = [{ ...row, id: hero, name: "HeroMiners", payouts: [{ scheme: "PROP", solo: false, fee: 0 }] },
     { ...row, id: "https://pearlhash.xyz/", name: "PearlHash", payouts: [{ scheme: null, solo: false, fee: 1 }] }];
@@ -461,7 +461,7 @@ test("pool lists: the block lists, PearlHash and the explorer's orphans are aske
   setNow(end);
   const done = recordPPLNSSnapshot(env.DB, snapshot(end, { rows, network: { ts: end, prlPerTHDay: .1, reward: 1, difficulty: 1000 } }), fetchJSON);
   await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.deepEqual(started.sort(), ["lordofpearls.xyz", "node.pearlhub.net", "pearl.herominers.com", "pearlhash.xyz"]);
+  assert.deepEqual(started.sort(), ["lordofpearls.xyz", "node.pearlhub.net", "pearl.herominers.com"]);
   open(); await done;
 });
 
@@ -506,90 +506,6 @@ test("pool lists: Lucky Pool's daily totals are read while its list is short of 
   const before = asked.length;
   setNow(end + 900); await recordPPLNSSnapshot(env.DB, snapshot(end + 900, { rows }), fetchJSON);
   assert.deepEqual(asked.slice(before).map((a) => a[0]), ["https://pearl.luckypool.io/api/stats"]);
-});
-
-test("PearlHash: per UTC day, the blocks found and the blocks its share rate and its display each predict", () => {
-  // Difficulty 1000; a share rate of 0.01 units a second predicts 0.01 × 300 / 1000 = 0.003 blocks in five minutes.
-  const p = (ts, blocks, changes = {}) => ({ ts, blocks, diffRate: .01, display: .01 * 2 ** 48 * .915, difficulty: 1000, ...changes });
-  let w;
-  for (let ts = T0; ts <= T0 + DAY; ts += 300) w = extendPearlHashWork(w, p(ts, 1000 + Math.floor((ts - T0) / 30000)));
-  assert.equal(w.days.length, 2);
-  const [d0, d1] = w.days;
-  assert.equal(d0[0], T0); assert.equal(d0[1], DAY - 300); assert.equal(d1[0], T0 + DAY); assert.equal(d1[1], 300);
-  near(d0[3], .01 * (DAY - 300) / 1000); near(d0[4], d0[3] * .915);
-  assert.equal(d0[2] + d1[2], 2);
-  // A gap, a counter that went back or a jump leaves the interval out but keeps the point.
-  const end = w.last.ts;
-  for (const next of [p(end + 1801, 1002), p(end + 300, 1000), p(end + 300, 1100)]) {
-    const v = extendPearlHashWork(w, next);
-    assert.deepEqual(v.days, w.days); assert.equal(v.last.ts, next.ts);
-  }
-  // Repeated or older points and unreadable values change nothing.
-  assert.equal(extendPearlHashWork(w, p(end, 1002)), w);
-  assert.equal(extendPearlHashWork(w, p(end + 300, 1002, { diffRate: null })), w);
-  // Sixty days are kept.
-  let long;
-  for (let ts = T0; ts <= T0 + 70 * DAY; ts += 1800) long = extendPearlHashWork(long, p(ts, 1000));
-  assert.ok(long.days.length <= 61 && long.days[0][0] >= T0 + 10 * DAY - DAY);
-});
-
-/// PearlHash's record for a history: the same snapshots and block counter, its accepted shares worth
-/// `perDay` blocks of work a day (difficulty 1000), from `start`; its display worth `shownPerDay` (by default
-/// the 80 a day it finds, as PearlHash's own display follows its blocks).
-const shareRecord = (end, perDay, start = T0, shownPerDay = 80) => {
-  let w;
-  for (let ts = start; ts <= end; ts += 300) w = extendPearlHashWork(w, { ts, blocks: point(ts).blocks, diffRate: perDay * 1000 / DAY,
-    display: shownPerDay * 1000 * 2 ** 48 / DAY, difficulty: 1000 });
-  return w;
-};
-
-test("PearlHash: pplnsMeasurement rejects share-rate records (PearlHash uses rollingPearlHashMeasurement instead)", () => {
-  const end = T0 + 7 * DAY, h = history(7);
-  assert.equal(pplnsMeasurement(h, end, shareRecord(end, 100)), null);
-  const effort = effortFor(end, { effort: 1.25 });
-  const m = pplnsMeasurement(h, end, effort);
-  assert.ok(validPPLNSMeasurement(m, end));
-  assert.equal(validPPLNSMeasurement({ ...m, shareYield: .982 }, end), false);
-});
-
-test("PearlHash: a snapshot reads its /api/stats under its budget and stores the day totals", async () => {
-  const env = makeEnv(), end = T0 + DAY;
-  const ph = { ...row, id: "https://pearlhash.xyz/", name: "PearlHash", payouts: [{ scheme: null, solo: false, fee: 1 }] };
-  const asked = [];
-  const fetchJSON = async (url, budget) => { if (url.includes("lordofpearls") || url === NODE_BLOCKS) return {}; asked.push([url, budget]); return { hashrate: 1.4e19, hashrate_diff_5m: 54000 }; };
-  const stored = () => JSON.parse(env.DB.one("SELECT v FROM kv WHERE k='public:pearlhash-work:v1'")?.v || "null");
-  const snap = (ts, blocks) => snapshot(ts, { rows: [{ ...ph, lifetimeBlocks: blocks }], network: { ts, prlPerTHDay: .1, reward: 1, difficulty: 4e7 } });
-  setNow(end); await recordPPLNSSnapshot(env.DB, snap(end, 500), fetchJSON);
-  assert.deepEqual(asked, [["https://pearlhash.xyz/api/stats", "PearlHash"]]);
-  assert.deepEqual(stored().days, []); assert.equal(stored().last.diffRate, 54000);
-  setNow(end + 300); await recordPPLNSSnapshot(env.DB, snap(end + 300, 501), fetchJSON);
-  const [d] = stored().days;
-  assert.equal(d[0], end); assert.equal(d[1], 300); assert.equal(d[2], 1);
-  near(d[3], 54000 * 300 / 4e7); near(d[4], 1.4e19 * 300 / (4e7 * 2 ** 48));
-  // No fetcher (a cached read) or a failed read: nothing recorded, nothing else disturbed.
-  await recordPPLNSSnapshot(env.DB, snap(end + 600, 502));
-  assert.equal(stored().last.ts, end + 300);
-  setNow(end + 900); await recordPPLNSSnapshot(env.DB, snap(end + 900, 503), async () => { throw new Error("busy"); });
-  assert.equal(stored().last.ts, end + 300);
-  // Never in the public answer.
-  const { pplns, luck } = await readPoolLuck(env.DB, end + 900);
-  assert.ok(!JSON.stringify({ pplns, luck: [...luck] }).includes("diffRate"));
-});
-
-test("PearlHash: once five complete UTC days are recorded, the summary and rolling API carry its block-count estimate", async () => {
-  const env = makeEnv(), ph = { ...row, id: "https://pearlhash.xyz/", name: "PearlHash", payouts: [{ scheme: null, solo: false, fee: 1, grossPerPH: 80, realFeePercent: null }] };
-  // 125 blocks of work a day in shares for 80 found; PearlHash's own display is ignored by the rolling estimate.
-  const fetchJSON = async (url) => url.includes("lordofpearls") || url === NODE_BLOCKS ? {} : { hashrate: 80 * 4e7 * 2 ** 48 / DAY, hashrate_diff_5m: 125 * 4e7 / DAY };
-  const snap = (ts) => snapshot(ts, { rows: [{ ...ph, lifetimeBlocks: point(ts).blocks }], network: { ts, prlPerTHDay: .1, reward: 1, difficulty: 4e7 } });
-  for (let ts = T0; ts <= T0 + 6 * DAY; ts += 300) { setNow(ts); await recordPPLNSSnapshot(env.DB, snap(ts), fetchJSON); }
-  const { pplns } = await readPoolLuck(env.DB, T0 + 6 * DAY);
-  assert.deepEqual(pplns.map((m) => m.pool), ["PearlHash"]);
-  assert.equal(pplns[0].theoryBasis, "accepted_share_work");
-  near(pplns[0].ratio, .99 * 0.64, 2e-3);
-  assert.equal(pplns[0].shareYield, undefined);
-  // A cached read (no fetcher) still uses the stored record.
-  setNow(T0 + 6 * DAY + 300); await recordPPLNSSnapshot(env.DB, snap(T0 + 6 * DAY + 300));
-  near((await readPoolLuck(env.DB, T0 + 6 * DAY + 300)).pplns[0].ratio, .99 * 0.64, 2e-3);
 });
 
 test("chain orphans: the explorer's orphan list, named by pool URL or a checked address, with hourly block counters", () => {
@@ -716,19 +632,20 @@ test("luck: shared-reward contracts are sampled, including an unnamed scheme; PP
   assert.deepEqual(pplnsPoint(snapshot(), { ...row, payouts: [{ scheme: null, solo: false, fee: 2 }] }), point(T0));
 });
 
-test("cost estimate: PPLNS and PROP by name, and PearlHash's unnamed scheme it pays out by block; nothing else", async () => {
+test("cost estimate: PPLNS and PROP by name; nothing else, an unnamed scheme included", async () => {
   const pay = (scheme, extra = {}) => ({ scheme, solo: false, fee: 1, ...extra });
   const pearlhash = { id: "https://pearlhash.xyz/", name: "PearlHash", solo: false };
   for (const name of ["PPLNS", " pplns ", "PROP", "prop"]) assert.equal(costEstimated(row, pay(name)), true, name);
-  assert.equal(costEstimated(pearlhash, pay(null)), true);
-  assert.equal(costEstimated(pearlhash, pay("")), true);
+  // PearlHash's unnamed scheme had one until it was delisted (2026-11-17).
+  assert.equal(costEstimated(pearlhash, pay(null)), false);
+  assert.equal(costEstimated(pearlhash, pay("")), false);
   assert.equal(costEstimated(row, pay(null)), false);                     // an unnamed scheme elsewhere
-  for (const name of ["PPS", "PPS+", "FPPS", "SOLO", "PPLNT"]) assert.equal(costEstimated(pearlhash, pay(name)), false, name);
-  assert.equal(costEstimated({ ...pearlhash, solo: true }, pay(null)), false);
-  assert.equal(costEstimated(pearlhash, pay(null, { solo: true })), false);
-  assert.equal(costEstimated(pearlhash, null), false);
+  for (const name of ["PPS", "PPS+", "FPPS", "SOLO", "PPLNT"]) assert.equal(costEstimated(row, pay(name)), false, name);
+  assert.equal(costEstimated({ ...row, solo: true }, pay("PROP")), false);
+  assert.equal(costEstimated(row, pay("PROP", { solo: true })), false);
+  assert.equal(costEstimated(row, null), false);
   // Six days of samples: the summary carries an estimate for a PROP pool that publishes its blocks'
-  // effort; PearlHash with no share record (no fetcher here), and an unnamed scheme elsewhere, get none.
+  // effort; an unnamed scheme (PearlHash's, or elsewhere) gets none.
   const env = makeEnv(), propPool = "https://pearl.luckypool.io/", rows = [
     { ...row, id: propPool, name: "Lucky Pool", payouts: [pay("PROP", { fee: 2, grossPerPH: 80, realFeePercent: null })] },
     { ...row, id: pearlhash.id, name: "PearlHash", payouts: [pay(null, { fee: 2, grossPerPH: 80, realFeePercent: null })] },
@@ -836,13 +753,13 @@ test("luck: a renamed pool keeps its history — Pearlski's samples carry on as 
 
 test("luck: windows reach the API by id and pool name, from a recorded summary that expires with the snapshot", async () => {
   const env = makeEnv(), end = T0 + 8 * DAY; setNow(end);
-  const hash = { id: "hash", name: "PearlHash", solo: false, hashrate: 1e15, lifetimeBlocks: point(end).blocks,
+  const hash = { id: "hash", name: "Unnamed Pool", solo: false, hashrate: 1e15, lifetimeBlocks: point(end).blocks,
     payouts: [{ scheme: null, solo: false, fee: 1, grossPerPH: 70, realFeePercent: null }] };
   const pps = { id: "kryptex", name: "Kryptex", solo: false, hashrate: 1e15, lifetimeBlocks: point(end).blocks,
     payouts: [{ scheme: "PPS+", solo: false, fee: 3, grossPerPH: 100, realFeePercent: null }] };
   const store = (id, pool) => env.DB.prepare("INSERT OR REPLACE INTO kv(k,v,ts) VALUES(?,?,?)")
     .bind(`public:pplns:${id}`, JSON.stringify({ ...historyTo(end - 300), id, pool }), end).run();
-  await store(LUCKY, "Lucky Pool"); await store("hash", "PearlHash"); await store("kryptex", "Kryptex");
+  await store(LUCKY, "Lucky Pool"); await store("hash", "Unnamed Pool"); await store("kryptex", "Kryptex");
   await env.DB.prepare("INSERT INTO kv(k,v,ts) VALUES(?,?,?)").bind(`public:effort:${LUCKY}`, JSON.stringify(effortFor(end, { effort: 1.1 })), end).run();
   const saved = snapshot(end, { rows: [{ ...row, id: LUCKY, name: "Lucky Pool", lifetimeBlocks: point(end).blocks }, hash, pps] });
   await recordPPLNSSnapshot(env.DB, saved);
@@ -860,7 +777,7 @@ test("luck: windows reach the API by id and pool name, from a recorded summary t
   assert.equal(by("kryptex").luck, null);
   // The summary is keyed by id and checked against the row's name.
   const luck = (await readPoolLuck(env.DB, end)).luck;
-  assert.equal(luck.get("hash").pool, "PearlHash");
+  assert.equal(luck.get("hash").pool, "Unnamed Pool");
   const { attachLuck } = await import("../src/pplns.js");
   assert.equal(attachLuck({ rows: [{ ...hash, name: "Renamed" }] }, luck).rows[0].luck, null);
   // Half an hour without a recorded snapshot and nothing is served.

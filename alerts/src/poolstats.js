@@ -8,6 +8,7 @@ import {
   SOURCES,
   normalizeWorkers,
   statsRequests,
+  DELISTED,
 } from "./pools.js";
 import { cached, sha256, webJson as json, now } from "./http.js";
 const n = (v) => {
@@ -149,25 +150,6 @@ export function parseStats(pool, replies, t = now()) {
       if (n(m?.observed_24h_s) > 0 && m.hashrate_24h != null) r.day = n(m.hashrate_24h);
       return r;
     });
-  } else if (pool === "PearlHash") {
-    const ledger = list(o.balance_transactions).filter(prl);
-    s.paid = -sum(ledger, (x) => Math.min(n(x.amount), 0));
-    s.pending =
-      sum(ledger, (x) => n(x.amount)) + n(o.pending_rewards?.total_pending_prl);
-    if (
-      !(list(o.connected_workers).length || s.pending || s.paid || ledger.length)
-    )
-      return { missing: true };
-    s.workers = withRates(rows(o.connected_workers), (w) => ({ live: sum(w.gpu_info, (g) => n(g.hashrate)) }));
-    const epoch = list(o.pending_rewards?.epochs)
-      .filter((x) => prl(x) && n(x.share) > 0)
-      .at(-1);
-    const hour = n(epoch?.share) * n(extra?.hashrate);
-    s.windows = hour > 0 ? ["live", "hour"] : ["live"];
-    s.rates = {
-      live: sum(s.workers, (w) => w.rates.live),
-      ...(hour > 0 ? { hour } : {}),
-    };
   } else if (pool === "Kryptex") {
     s.pending = n(extra?.total);
     s.paid = n(third?.paid);
@@ -224,7 +206,7 @@ export function parseStats(pool, replies, t = now()) {
 
 /// Reserve all requests atomically before starting any: concurrent cache misses share a cap.
 export async function reserveBudget(db, pool, count, t, ip) {
-  const limit = pool === "PearlHash" ? 20 : 60;
+  const limit = 60;
   if (!Number.isSafeInteger(count) || count < 1 || count > limit) return false;
   const reserve = (key, cap) => db
     .prepare(
@@ -245,10 +227,11 @@ export async function poolStats(env, body, ctx, ip = "?") {
   if (!addr) return json({ ok: false, error: "bad target" }, 400);
   const pool = body.pool,
     t = now();
+  if (DELISTED.has(pool)) return json({ ok: false, error: "delisted" }, 410);
   try {
     return await cached(
       `pool/${encodeURIComponent(pool)}/${await sha256(addr)}`,
-      pool === "PearlHash" ? 600 : 300,
+      300,
       ctx,
       async () => {
         const urls = statsRequests(pool, addr);

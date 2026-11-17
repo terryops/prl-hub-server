@@ -162,16 +162,6 @@ for (const [pool, files, pending, paid, window, count, online, total] of [
     2263271839527266,
   ],
   [
-    "PearlHash",
-    ["pearlhash_account.json", "pearlhash_stats.json"],
-    1.921944989121971,
-    54.67318902928431,
-    "live",
-    9,
-    9,
-    486951712142131.2,
-  ],
-  [
     "Kryptex",
     ["kryptex_workers.json", "kryptex_balance.json", "kryptex_payouts.json"],
     39.809957971072265,
@@ -203,8 +193,6 @@ for (const [pool, files, pending, paid, window, count, online, total] of [
     near(value(s, window), total);
     assert.equal(s.workers.length, count);
     assert.equal(s.workers.filter((x) => x.online).length, online);
-    if (pool === "PearlHash")
-      assert.equal(s.workers[0].rates.day, undefined);
     if (pool === "Pearl Fortune")
       assert.deepEqual(s.workers.find((x) => x.name === "storage01").rates,
                        { live: 230952662098890.88, hour: 225055001718919.88, day: 238843688127861.56 });
@@ -279,12 +267,12 @@ test("web data: validation, 502, 404 missing and per-IP shared read limit", asyn
   );
   globalThis.fetch = async () => new Response("down", { status: 500 });
   assert.deepEqual(
-    await call(env, "POST", "/v1/pool/stats", { pool: "PearlHash", addr }),
+    await call(env, "POST", "/v1/pool/stats", { pool: "Lucky Pool", addr }),
     { status: 502, body: { ok: false, error: "upstream" } },
   );
   globalThis.fetch = async () => new Response("", { status: 404 });
   assert.equal(
-    (await call(env, "POST", "/v1/pool/stats", { pool: "PearlHash", addr }))
+    (await call(env, "POST", "/v1/pool/stats", { pool: "Lucky Pool", addr }))
       .body.missing,
     true,
   );
@@ -292,7 +280,7 @@ test("web data: validation, 502, 404 missing and per-IP shared read limit", asyn
   for (const [method, path, body] of [
     ["GET", "/v1/price/history", undefined],
     ["POST", "/v1/address", { addr }],
-    ["POST", "/v1/pool/stats", { pool: "PearlHash", addr }],
+    ["POST", "/v1/pool/stats", { pool: "Lucky Pool", addr }],
   ])
     assert.equal((await call(env, method, path, body)).status, 429);
 });
@@ -300,7 +288,7 @@ test("web budget: actual subrequests and atomic exhaustion", async () => {
   const env = makeEnv();
   setNow(T0);
   const reservations = await Promise.all(
-    Array.from({ length: 11 }, () => reserveBudget(env.DB, "PearlHash", 2, T0)),
+    Array.from({ length: 11 }, () => reserveBudget(env.DB, "Kryptex", 6, T0)),
   );
   assert.equal(reservations.filter(Boolean).length, 10);
   let requests = 0;
@@ -309,7 +297,7 @@ test("web budget: actual subrequests and atomic exhaustion", async () => {
     return Response.json({});
   };
   const r = await call(env, "POST", "/v1/pool/stats", {
-    pool: "PearlHash",
+    pool: "Kryptex",
     addr,
   });
   assert.equal(r.status, 429);
@@ -580,7 +568,6 @@ test("orders: seen payment survives quote expiry, me reload and concurrent new c
 test("pool worker identities and online rules match push parsing for malformed and unnamed workers", () => {
   const cases = [
     ["F2Pool", [{ originData: { workers: [{ name: "bad", status: "" }, { name: "ok", status: " 0 " }] } }]],
-    ["PearlHash", [{ connected_workers: [{ worker_name: "", ip: "one", gpu_info: [{ hashrate: 1 }] }, { worker_name: 42, ip: "two", gpu_info: [{ hashrate: 2 }] }, { worker_name: "", ip: "three" }] }]],
     ["AlphaPool", [{ last_seen: T0, workers: [{ name: "rig", online: "no", time: T0 - 700 }] }]],
   ];
   for (const [pool, replies] of cases) {
@@ -591,29 +578,18 @@ test("pool worker identities and online rules match push parsing for malformed a
 });
 test("pool budget: one IP cannot spend the entire shared pool budget using fresh addresses", async () => {
   const env = makeEnv(); setNow(T0); let requests = 0;
-  globalThis.fetch = async () => { requests++; return Response.json({ connected_workers: [] }); };
-  for (let i = 0; i < 15; i++) await call(env, "POST", "/v1/pool/stats", { pool: "PearlHash", addr: `prl1${String(i).padStart(38, "a")}` });
-  assert.ok(requests <= 6, `one IP used ${requests} upstream requests`);
-  const other = await call(env, "POST", "/v1/pool/stats", { pool: "PearlHash", addr }, { "cf-connecting-ip": "192.0.2.2" });
+  globalThis.fetch = async () => { requests++; return Response.json(f("alphapool_miner_idle.json")); };
+  for (let i = 0; i < 30; i++) await call(env, "POST", "/v1/pool/stats", { pool: "AlphaPool", addr: `prl1${String(i).padStart(38, "a")}` });
+  assert.ok(requests <= 20, `one IP used ${requests} upstream requests`);
+  const other = await call(env, "POST", "/v1/pool/stats", { pool: "AlphaPool", addr }, { "cf-connecting-ip": "192.0.2.2" });
   assert.equal(other.status, 200);
 });
-test("pool cache: twenty monitors refreshed by tabs each minute reuse the ten-minute PearlHash copy", async () => {
-  const env = makeEnv(), entries = new Map(); let requests = 0;
-  globalThis.caches = { default: {
-    match: async (req) => { const entry = entries.get(req.url); return entry && entry.until > Date.now() ? entry.response.clone() : undefined; },
-    put: async (req, response) => { const ttl = Number(response.headers.get("cache-control").match(/max-age=(\d+)/)[1]); entries.set(req.url, { response, until: Date.now() + ttl * 1000 }); },
-  } };
-  globalThis.fetch = async () => { requests++; return Response.json({ connected_workers: [] }); };
-  const targets = Array.from({ length: 20 }, (_, i) => ({ pool: "PearlHash", addr: `prl1${String(i).padStart(38, "a")}` }));
-  // Cold accounts are admitted within each IP's share, then reused by every tab.
-  for (const [i, target] of targets.entries()) { setNow(T0 + Math.floor(i / 3) * 60); assert.equal((await call(env, "POST", "/v1/pool/stats", target)).status, 200); }
-  assert.equal(requests, 40);
-  for (const offset of [420, 480, 540]) {
-    setNow(T0 + offset);
-    const results = await Promise.all(targets.flatMap((target) => [call(env, "POST", "/v1/pool/stats", target), call(env, "POST", "/v1/pool/stats", target)]));
-    assert.ok(results.every((r) => r.status === 200));
-  }
-  assert.equal(requests, 40);
+test("a delisted pool's card read (PearlHash, 2026-11-17) is refused before anything is asked", async () => {
+  const env = makeEnv(); setNow(T0); let requests = 0;
+  globalThis.fetch = async () => { requests++; return Response.json({}); };
+  assert.deepEqual(await call(env, "POST", "/v1/pool/stats", { pool: "PearlHash", addr }), { status: 410, body: { ok: false, error: "delisted" } });
+  assert.equal((await call(env, "POST", "/v1/pool/stats", { pool: "PearlHash", addr: "https://pearlhash.xyz/" })).status, 400);
+  assert.equal(requests, 0);
 });
 test("pool cache: concurrent cold tabs coalesce into one upstream request", async () => {
   const env = makeEnv(); setNow(T0); let requests = 0;

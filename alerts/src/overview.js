@@ -1,5 +1,5 @@
 // Address-free pool comparison and network yield. Mirrors LordOfPearls / PoolsOverview.
-import { readCapped, MAX_BODY } from "./pools.js";
+import { readCapped, MAX_BODY, delistedRow } from "./pools.js";
 import { cached, webJson as json, now } from "./http.js";
 import { reserveBudget } from "./poolstats.js";
 import { attachRealFees, readRealFees } from "./realfees.js";
@@ -62,7 +62,6 @@ const names = {
   "alphapool.tech": "AlphaPool",
   "luckypool.io": "Lucky Pool",
   "herominers.com": "HeroMiners",
-  "pearlhash.xyz": "PearlHash",
   "pearlfortune.org": "Pearl Fortune",
   "f2pool.com": "F2Pool",
   "kryptex.network": "Kryptex",
@@ -428,7 +427,8 @@ export function buildOverview(
       sampleDays: mpsDays,
       source: "miningpoolstats",
     }));
-  const all = [...normalized, ...extra];
+  // A delisted pool (pools.js DELISTED) gets no row, under its name or its domain; its hashrate is the network's rest.
+  const all = [...normalized, ...extra].filter((r) => !delistedRow(r));
   return all
     .map((r) => {
       const solo =
@@ -472,10 +472,6 @@ export function buildOverview(
         if (own === "PROP" || own === "PPLNS") payout = own;
         if (ownFee != null && ownFee >= 0 && ownFee <= 100) { fee = ownFee; feeFromPoolAPI = true; }
       }
-      // PearlHash's API names neither. Its account API, 2026-10-31: each UTC hour's blocks are shared by
-      // that hour's shares (PROP by the hour). The fee is its site's "1% pool fee" (owner, 2026-11-01),
-      // though its hours paid out 99.9% of their coinbases that week. WildRig: see MINER_REPORT (realfees.js).
-      if (r.name === "PearlHash") { fee = 1; if (!solo) payout = "PROP"; }
       // Peryn's own API names its scheme and fee, and is where its own row's hashrate comes from.
       const isPeryn = r.name === "Peryn" && !solo && !!perynData;
       if (isPeryn) {
@@ -751,6 +747,8 @@ export async function overview(env, ctx, rollingCost = false) {
     }, record));
     if (!response.ok) return response;
     const snapshot = await response.json();
+    // A snapshot stored before a pool was delisted still carries its row until it is rebuilt.
+    if (Array.isArray(snapshot.rows)) snapshot.rows = snapshot.rows.filter((r) => !delistedRow(r));
     let measurements = [], luck = { pplns: [], luck: new Map() };
     try { measurements = await readRealFees(env.DB); } catch {}
     try { luck = await readPoolLuck(env.DB); } catch {}

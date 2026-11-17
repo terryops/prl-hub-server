@@ -4,7 +4,7 @@ import { readCapped, MAX_BODY, UA, SOURCES, sanitizeTarget } from "./pools.js";
 import { reserveBudget } from "./poolstats.js";
 import { now, webJson as json } from "./http.js";
 import { validPPLNSMeasurement, costEstimated } from "./pplns.js";
-import { HERO, PEARLHASH, validRollingShareMeasurement } from "./shareyield.js";
+import { HERO, validRollingShareMeasurement } from "./shareyield.js";
 
 const DAY = 86400, DAYS = 5, WORK = 2 ** 48, EMISSION = 650226n;
 const POOLS = { "Pearl Fortune": "PPS", Kryptex: "PPS+", F2Pool: "PPS" };
@@ -47,14 +47,14 @@ export async function realFees(env) {
 }
 
 // PPLNS / PROP: luck taken out by the pool's own per-block effort (pplnsMeasurement). HeroMiners' effort counts the
-// same shares it pays for, and PearlHash publishes no per-block effort at all, so both get the rolling 30-day output
-// estimate against accepted share work instead, with its count interval (shareyield.js), and nothing until then.
+// same shares it pays for, so it gets the rolling 30-day output estimate against accepted share work instead, with
+// its count interval (shareyield.js), and nothing until then.
 function pplnsEstimate(row, payout, measurements) {
   if (!costEstimated(row, payout)) return null;
   const sample = measurements.find((o) => o.id === row.id && o.pool === row.name && validPPLNSMeasurement(o));
-  const rollingPool = row.id === HERO || row.name === "HeroMiners" || row.id === PEARLHASH || row.name === "PearlHash";
+  const rollingPool = row.id === HERO || row.name === "HeroMiners";
   if (rollingPool && !validRollingShareMeasurement(sample, now())) return null;
-  const isRolling = sample?.theoryBasis === "accepted_share_rounds" || sample?.theoryBasis === "accepted_share_work";
+  const isRolling = sample?.theoryBasis === "accepted_share_rounds";
   return sample ? { percent: (1 - sample.ratio) * 100, start: sample.start, end: sample.end,
     rolling: isRolling ? sample : null } : null;
 }

@@ -8,7 +8,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import * as H from "./helpers.js";
 import { installFetch, setNow, restoreNow, T0, tok, call, register, tick, makeChain, signJWS, proTx } from "./helpers.js";
-import { parseMiner, sanitizeTarget, POOLS, MAX_WORKERS, ANON } from "../src/pools.js";
+import { parseMiner, sanitizeTarget, POOLS, DELISTED, MAX_WORKERS, ANON } from "../src/pools.js";
 import { fold, due, tell, unpack, sanitizeWatch, COOLDOWN, STEADY, RECHECK, AFTER, AGAIN } from "../src/watch.js";
 import { offlinePayloadFor, onlinePayloadFor, stillPayloadFor, fmtAgo, LANGS } from "../src/i18n.js";
 
@@ -122,20 +122,8 @@ test("pools: Pearl Fortune — online while any connection isn't stale, last rep
   assert.throws(() => parseMiner("Pearl Fortune", 200, '{"error":"busy"}', 0));
 });
 
-test("pools: PearlHash — only connected workers are listed; repeats of a name are numbered", () => {
-  const r = parseMiner("PearlHash", 200, fx("pearlhash_account.json"), 0);
-  assert.deepEqual(names(r), ["53320", "54353", "54369", "54655", "54655 (2)", "54353 (2)", "54353 (3)", "53320 (2)", "54687"]);
-  assert.ok(r.workers.every((w) => w.online && w.last === null));
-  assert.deepEqual(parseMiner("PearlHash", 404, "", 0), { missing: true });
-  // Unnamed workers are counted, never told apart by IP: an address can change under a rig that never dropped.
-  const unnamed = JSON.stringify({ connected_workers: [{ ip: "1.2.3.4" }, { ip: "5.6.7.8", worker_name: " " }, {}] });
-  assert.deepEqual(names(parseMiner("PearlHash", 200, unnamed, 0)), [ANON, `${ANON} (2)`, `${ANON} (3)`]);
-  const odd = JSON.stringify({ connected_workers: ["constructor", "constructor", "__proto__", "__proto__", "toString"].map((worker_name) => ({ worker_name })) });
-  assert.deepEqual(names(parseMiner("PearlHash", 200, odd, 0)), ["constructor", "constructor (2)", "__proto__", "__proto__ (2)", "toString"]);
-});
-
 test("pools: an answer that isn't the pool's data is a failed poll, never an empty miner", () => {
-  for (const pool of POOLS) {
+  for (const pool of POOLS.filter((p) => !DELISTED.has(p))) {
     assert.throws(() => parseMiner(pool, 500, "{}", 0), /http 500/, pool);
     assert.throws(() => parseMiner(pool, 429, "{}", 0), /http 429/, pool);
     assert.throws(() => parseMiner(pool, 200, "<html>challenge</html>", 0), pool);
@@ -823,27 +811,6 @@ test("watch: a pool that fails or rate-limits never reads as offline, and is lef
   assert.equal(env.DB.one("SELECT COUNT(*) AS n FROM miners WHERE checked_at >= ?", T0 + 2100).n, 20);
 });
 
-test("watch: PearlHash lists only connected workers — one that vanishes is pushed 10 min after it was first missed", async () => {
-  setNow(T0);
-  const net = installFetch();
-  const env = makeEnv();
-  let workers = [{ worker_name: "g1" }, { worker_name: "g2" }];
-  net.pool = () => Response.json({ connected_workers: workers });
-  await watch(env, tok(1), [{ id: "w1", pool: "PearlHash", addr: addr(1), label: "PH", after: 600 }]);
-  await tick(env);
-  workers = [{ worker_name: "g1" }];
-  await at(env, T0 + 300);
-  await at(env, T0 + 600);
-  assert.equal(net.alerts().length, 0);
-  await at(env, T0 + 900);
-  assert.deepEqual(net.alerts().map((c) => c.body.aps.alert), [{ title: "🔴 g2 offline", subtitle: "PH", body: "Offline for 10 min" }]);
-  // The whole account gone quiet is every worker offline, not "no such miner".
-  workers = [];
-  await at(env, T0 + 1200);
-  await at(env, T0 + 1800);
-  assert.deepEqual(net.alerts().map((c) => c.body.aps.alert.title), ["🔴 g2 offline", "🔴 g1 offline"]);
-});
-
 test("watch: the pool saying 'no such miner' is flagged, pushes nothing and keeps the last known state", async () => {
   setNow(T0);
   const net = installFetch();
@@ -925,19 +892,19 @@ test("watch: each pool has its own cap per tick; the backlog just takes more tic
   setNow(T0);
   const net = installFetch();
   const env = makeEnv();
-  net.pool = (u) => (u.hostname === "pearlhash.xyz" ? Response.json({ connected_workers: [] }) : kx([]));
-  for (let d = 0; d < 2; d++) {
-    const ws = Array.from({ length: 20 }, (_, i) => ({ id: `p${i}`, pool: "PearlHash", addr: addr(d * 20 + i), after: 600 }));
+  net.pool = (u) => (u.hostname === "pearl.luckypool.io" ? Response.json({}) : kx([]));
+  for (let d = 0; d < 4; d++) {
+    const ws = Array.from({ length: 20 }, (_, i) => ({ id: `p${i}`, pool: "Lucky Pool", addr: addr(d * 20 + i), after: 600 }));
     assert.equal((await watch(env, tok(d), ws)).status, 200);
   }
   await watch(env, tok(9), [K("k", { addr: addr(999) })]);
   await tick(env);
   const hosts = (from) => net.polls.slice(from).reduce((m, p) => (m[new URL(p.url).hostname] = (m[new URL(p.url).hostname] || 0) + 1, m), {});
-  assert.deepEqual(hosts(0), { "pearlhash.xyz": 30, "prl-api.kryptex.network": 1 });
+  assert.deepEqual(hosts(0), { "pearl.luckypool.io": 60, "prl-api.kryptex.network": 1 });
   await at(env, T0 + 60);
-  assert.deepEqual(hosts(31), { "pearlhash.xyz": 10 });
+  assert.deepEqual(hosts(61), { "pearl.luckypool.io": 20 });
   await at(env, T0 + 120);
-  assert.equal(net.polls.length, 41);
+  assert.equal(net.polls.length, 81);
 });
 
 test("watch: the pools are still checked on a tick that has no price", async () => {
@@ -951,22 +918,6 @@ test("watch: the pools are still checked on a tick that has no price", async () 
   await tick(env);
   assert.equal(env.DB.one("SELECT COUNT(*) AS n FROM prices").n, 0);
   assert.equal(miner(env).checked_at, T0);
-});
-
-test("watch: an unnamed PearlHash worker whose IP changes was never offline", async () => {
-  setNow(T0);
-  const net = installFetch();
-  const env = makeEnv();
-  let workers = [{ ip: "1.2.3.4" }, { ip: "1.2.3.4" }];
-  net.pool = () => Response.json({ connected_workers: workers });
-  await watch(env, tok(1), [{ id: "w1", pool: "PearlHash", addr: addr(1), after: 600 }]);
-  await tick(env);
-  workers = [{ ip: "5.6.7.8" }, { ip: "9.9.9.9" }];          // new addresses, same two rigs
-  for (let i = 1; i <= 4; i++) await at(env, T0 + i * 300);
-  assert.equal(net.alerts().length, 0);
-  workers = [{ ip: "5.6.7.8" }];                              // one of them really drops
-  for (let i = 5; i <= 7; i++) await at(env, T0 + i * 300);
-  assert.deepEqual(net.alerts().map((c) => c.body.aps.alert.title), ["🔴 unnamed (2) offline"]);
 });
 
 test("watch: an outage on many monitors at once sends a device a few pushes per tick, the rest at the next poll", async () => {
@@ -995,23 +946,37 @@ test("watch: a pool that is resting or backed up never takes another pool's turn
   const net = installFetch();
   const env = makeEnv();
   let limited = true;
-  net.pool = (u) => (u.hostname === "pearlhash.xyz"
-    ? (limited ? new Response("{}", { status: 429 }) : Response.json({ connected_workers: [] }))
+  net.pool = (u) => (u.hostname === "pearl.luckypool.io"
+    ? (limited ? new Response("{}", { status: 429 }) : Response.json({}))
     : kx([["a", true, T0]]));
-  for (let d = 0; d < 3; d++) {
-    await watch(env, tok(d), Array.from({ length: 20 }, (_, i) => ({ id: `p${i}`, pool: "PearlHash", addr: addr(d * 20 + i), after: 600 })));
+  for (let d = 0; d < 4; d++) {
+    await watch(env, tok(d), Array.from({ length: 20 }, (_, i) => ({ id: `p${i}`, pool: "Lucky Pool", addr: addr(d * 20 + i), after: 600 })));
   }
   await watch(env, tok(9), [K("k", { addr: addr(999) })]);
   const kryptex = () => net.polls.filter((p) => p.url.includes("kryptex")).length;
-  await tick(env);                    // PearlHash answers 429 and is rested; 60 of its miners stay overdue
+  await tick(env);                    // Lucky Pool answers 429 and is rested; its miners stay overdue
   assert.equal(kryptex(), 1);
   const before = net.polls.length;
   await at(env, T0 + 300);
-  assert.equal(kryptex(), 2, "Kryptex is polled on time behind PearlHash's backlog");
-  assert.equal(net.polls.length - before, 1, "and PearlHash is left alone while it rests");
+  assert.equal(kryptex(), 2, "Kryptex is polled on time behind Lucky Pool's backlog");
+  assert.equal(net.polls.length - before, 1, "and Lucky Pool is left alone while it rests");
   limited = false;
   await at(env, T0 + 600);
-  assert.equal(net.polls.filter((p) => p.url.includes("pearlhash")).length > 6, true);
+  assert.equal(net.polls.filter((p) => p.url.includes("luckypool")).length > 6, true);
+});
+
+test("watch: a delisted pool's monitor (PearlHash) is accepted with the rest and never polled", async () => {
+  setNow(T0);
+  const net = installFetch();
+  const env = makeEnv();
+  net.pool = () => kx([["a", true, T0]]);
+  const res = await watch(env, tok(1), [{ id: "ph", pool: "PearlHash", addr: addr(2), after: 600 }, K()]);
+  assert.equal(res.status, 200);
+  await tick(env);
+  await at(env, T0 + 600);
+  assert.equal(net.polls.filter((p) => p.url.includes("pearlhash")).length, 0);
+  assert.ok(net.polls.some((p) => p.url.includes("kryptex")));
+  assert.deepEqual(env.DB.rows("SELECT pool FROM watches").map((w) => w.pool), ["Kryptex"]);
 });
 
 test("watch: the app is told when the pool hasn't answered for a monitor", async () => {

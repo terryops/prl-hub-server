@@ -71,7 +71,7 @@ import { fetchQuotes, combine, parseSafeTrade, ST_MAX_AGE } from "./price.js";
 import { evaluate, sanitizeRule, upsertRule, pctChange, WINDOWS, sanitizeWindow, windowOpen, localHM } from "./rules.js";
 import { send, apnsConfigured } from "./apns.js";
 import { payloadFor, deferredPayloadFor, offlinePayloadFor, onlinePayloadFor, stillPayloadFor, LANGS } from "./i18n.js";
-import { fetchMiner, POOLS } from "./pools.js";
+import { fetchMiner, POOLS, DELISTED } from "./pools.js";
 import { fold, due as outages, tell, unpack, pack, sanitizeWatch, upsertWatch, POLL_EVERY, RECHECK } from "./watch.js";
 import { jwsPayload, notificationFields, PRO } from "./sales.js";
 import { verifyAppleJWS } from "./jws.js";
@@ -109,7 +109,7 @@ const MAX_RULES = 20;
 const MAX_WATCHES = 20;
 const POLL_SLACK = 20;              // a miner is due this much before its turn is up (cron jitter)
 const POLL_PER_TICK = 200;          // miners polled per tick, all pools together…
-const POLL_PER_POOL = { default: 60, PearlHash: 30 };   // …and per pool (PearlHash allows 60 requests / min)
+const POLL_PER_POOL = { default: 60 };   // …and per pool
 const POLL_PARALLEL = 6;            // Workers hold at most 6 connections open at once
 const POLL_WALL_MS = 35_000;        // no new poll is started this far into a tick
 const POOL_FAILS = 3;               // failed polls after which a pool is left alone until the next tick
@@ -612,7 +612,7 @@ async function pollWatches(env) {
   // Each pool's oldest due miners, up to that pool's cap: a pool that is resting,
   // failing or simply large never takes another pool's turn.
   const perPool = await Promise.all(backlog
-    .filter((b) => POOLS.includes(b.pool) && !resting.has(b.pool))
+    .filter((b) => POOLS.includes(b.pool) && !DELISTED.has(b.pool) && !resting.has(b.pool))
     .map((b) => db
       .prepare("SELECT pool, addr, workers, tried_at FROM miners WHERE pool = ? AND (tried_at IS NULL OR tried_at <= ?) ORDER BY tried_at LIMIT ?")
       .bind(b.pool, dueBefore, POLL_PER_POOL[b.pool] || POLL_PER_POOL.default)
@@ -878,6 +878,8 @@ function sanitizeSettings(body) {
     if (watches.some((x) => !x) || new Set(watches.map((x) => x.id)).size !== watches.length) {
       return { bad: json({ error: "bad watches" }, 400) };
     }
+    // A delisted pool's monitor (an app not yet updated) is accepted and left out: nothing is asked of that pool.
+    watches = watches.filter((x) => !DELISTED.has(x.pool));
   }
   // 2.1.8+: `income`, the one address this device wants 到账提醒 for ({ addr, label }), or
   // null for none. undefined (an app that doesn't know it): whatever is stored stays.

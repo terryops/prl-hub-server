@@ -123,12 +123,11 @@ test("PPLNS requires five days of public work; the cost is the luck-free ratio, 
   }
 });
 
-test("the shared-reward estimate reaches PROP and PearlHash's unnamed payout, not an unnamed payout elsewhere", () => {
+test("the shared-reward estimate reaches PROP, not an unnamed payout (PearlHash's included since its delisting)", () => {
   setNow(t);
   const cost = (id, name, scheme) => attachRealFees({ ts: t, rows: [{ id, name, solo: false,
     payouts: [{ scheme, fee: 2, grossPerPH: 80, solo: false }] }] }, [], [publicPPLNS(id, name)]).rows[0].payouts[0];
   assert.equal(cost("hero", "HeroMiners", "PROP").realFeePercent, null); // Legacy summaries cannot replace its rolling estimate.
-  assert.equal(cost("https://pearlhash.xyz/", "PearlHash", "PROP").realFeePercent, null); // Same for PearlHash.
   const end = Math.floor(t / 86400) * 86400, start = end - 7 * 86400;
   const rollingPH = { id: "https://pearlhash.xyz/", pool: "PearlHash", scheme: "PPLNS", theoryBasis: "accepted_share_work",
     start, end, measuredAt: t, estimated: true, targetDays: 30, blocksSample: 560, poolBlocks: 560, orphans: 0,
@@ -136,15 +135,13 @@ test("the shared-reward estimate reaches PROP and PearlHash's unnamed payout, no
     cost95: [0, 16], confidence: .95, confidenceMethod: "poisson_count_only", sourceVersion: 2 };
   const pearlhash = attachRealFees({ ts: t, rows: [{ id: "https://pearlhash.xyz/", name: "PearlHash", solo: false,
     payouts: [{ scheme: null, fee: 1, grossPerPH: 80, solo: false }] }] }, [], [rollingPH]).rows[0].payouts[0];
-  near(pearlhash.realFeePercent, (1 - rollingPH.ratio) * 100);
-  assert.equal(pearlhash.realFeeEstimated, true);
-  assert.deepEqual(pearlhash.realFeePeriod, { start, end });
-  assert.equal(pearlhash.realFeeEstimate.theoryBasis, "accepted_share_work");
+  assert.equal(pearlhash.realFeePercent, null);
+  assert.equal(pearlhash.realFeeEstimate ?? null, null);
   assert.equal(cost("other", "Other", null).realFeePercent, null);
   assert.equal(cost("https://pearlhash.xyz/", "PearlHash", "PPS").realFeePercent, null);
 });
 
-test("PearlHash and HeroMiners require rolling observations and strip retired shareYield fields", () => {
+test("HeroMiners requires rolling observations; PearlHash's old rolling record yields nothing; retired shareYield fields are stripped", () => {
   setNow(t);
   const out = (rows, samples, rolling = true) => attachRealFees({ ts: t, rows }, [], samples, rolling).rows;
   const row = (id, name, solo = false) => ({ id, name, solo, payouts: [{ scheme: solo ? "SOLO" : "PROP", fee: 1, grossPerPH: 80, solo }] });
@@ -156,10 +153,9 @@ test("PearlHash and HeroMiners require rolling observations and strip retired sh
   const [ph, phSolo, hero] = out([row(PH, "PearlHash"), row(PH + "solo", "PearlHash SOLO", true), row("hero", "HeroMiners")],
     [phRolling, publicPPLNS("hero", "HeroMiners", .99)]);
   const p = ph.payouts[0];
-  near(p.realFeePercent, (1 - phRolling.ratio) * 100);
+  assert.equal(p.realFeePercent, null);
   assert.equal(p.shareYield, undefined);
-  assert.equal(p.realFeeEstimated, true);
-  assert.equal(p.realFeeEstimate.poolBlocks, 560);
+  assert.equal(p.realFeeEstimate ?? null, null);
   // Legacy clients (rollingEnabled = false) and legacy shareYield summaries get no figure.
   assert.equal(out([row(PH, "PearlHash")], [phRolling], false)[0].payouts[0].realFeePercent, null);
   const legacy = out([row(PH, "PearlHash")], [{ ...publicPPLNS(PH, "PearlHash", .99), shareYield: .982 }])[0].payouts[0];
@@ -170,7 +166,7 @@ test("PearlHash and HeroMiners require rolling observations and strip retired sh
   // A cached payout carrying a retired shareYield field is cleaned when re-attached.
   const stale = { ...row(PH, "PearlHash"), payouts: [{ ...row(PH, "PearlHash").payouts[0], shareYield: .982, realFeePercent: 2.77 }] };
   const cleaned = out([stale], [phRolling])[0].payouts[0];
-  near(cleaned.realFeePercent, (1 - phRolling.ratio) * 100);
+  assert.equal(cleaned.realFeePercent, null);
   assert.equal(cleaned.shareYield, undefined);
 });
 

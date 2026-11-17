@@ -59,14 +59,16 @@ test("chain identity: a verified payout address names Jetski's blocks; other bar
   assert.equal(pool.lifetimeBlocks, 1032);
   assert.equal(pool.lastBlockTime, 1400);
 });
-test("PearlHash: PROP by the hour at its site's 1% fee, whatever the pool table says", () => {
-  // Its own account API, 2026-10-31: each hour's blocks go to that hour's shares. Its site: "1% pool fee".
-  const [pool] = buildOverview([], { hashrate: 1000, reward: 1, prlPerTHDay: .02 }, {
-    mps: { block_time_average: 180, data: [{ pool_id: "pearlhash.xyz", url: "https://pearlhash.xyz/", hashrate: 30, blocks_1000: 25, fee: 0.5, feetype: "" }] },
-  });
-  assert.equal(pool.name, "PearlHash");
-  assert.equal(pool.fee, 1);
-  assert.deepEqual(pool.payouts.map((p) => [p.scheme, p.fee]), [["PROP", 1]]);
+test("PearlHash is delisted (2026-11-17): no row from either directory, by its name or its domain", () => {
+  const mps = { block_time_average: 180, data: [
+    { pool_id: "pearlhash.xyz", url: "https://pearlhash.xyz/", hashrate: 30, blocks_1000: 25, fee: 0.5, feetype: "" },
+    { pool_id: "solo.pearlhash.xyz", url: "https://solo.pearlhash.xyz/", hashrate: 3, blocks_1000: 1, fee: 1, feetype: "SOLO" },
+    { pool_id: "kryptex.network", url: "https://prl.kryptex.network/", hashrate: 40, blocks_1000: 30, fee: 3, feetype: "PPS+" }] };
+  const table = [{ name: "PearlHash", url: "https://pearlhash.xyz/", hashrate: 30, miners: 10, blocks: 70, fee: 1, scheme: "PROP" }];
+  for (const rows of [[], table]) {
+    const pools = buildOverview(rows, { hashrate: 1000, reward: 1, prlPerTHDay: .02 }, { mps });
+    assert.deepEqual(pools.map((p) => p.name), ["Kryptex"], JSON.stringify(rows));
+  }
 });
 test("miningpoolstats: the data file's host comes from the page's preload link", () => {
   // The page on 2026-10-25: the pool data on server.miningpoolstats.stream, the old host only in comments
