@@ -221,14 +221,18 @@ export const validOrphans = (o, t = now()) => !!o && finite(o.start) && o.start 
 /// the last 30 with their miner and, when it knows it, the pool. Kept for a week and a day next to
 /// each pool's chain block counter (an hourly point), they give an orphan rate for every pool whose
 /// blocks the explorer credits. A node does not see every orphan: on 2026-10-20 it had none of
-/// Pearl Fortune's 1 or HeroMiners' 3 that their own lists show. So a pool gets the higher of the
-/// two rates, and the window says which source it came from.
+/// Pearl Fortune's 1 or HeroMiners' 3 that their own lists show. No longer served (2026-11-17): the
+/// explorer listed a block that stayed on the main chain (Pearl Fortune's 144502) after its node
+/// briefly followed the other branch, so only our own node's count is published (nodeOrphanWindow).
+/// Still recorded, as a cross-check of our node and for the names of the addresses it credits.
 const CHAIN_KEY = "public:chain-orphans:v1", CHAIN_KEEP = 8 * DAY, CHAIN_STEP = 3600;
 /// Payout addresses the explorer leaves unnamed, checked against the pool's own block list or its
 /// coinbase tag (as POOL_ADDRESSES in overview.js).
 const CHAIN_ADDRESSES = {
   prl1pgr2znrzz8nwu2lrw4phrzaqqa8ukt76qsqc29wxgcwgalanur7zsk8w070: "https://pearl.jetskipool.ai/",
   prl1prsmhnjnphz4ll4v9lhg8nhr0tv3v7g8sl6qkuyqmnwkq7rhs9c2qqak0rr: "https://www.f2pool.com/",
+  // Peryn's 10 recent blocks in app.peryn.ai/api/pool/live all pay it; 295 found = the explorer's count for it (2026-11-17).
+  prl1pj7zvvfag58glzyeu7hssuwkg9sqwajxhptmjm6d7kvxnw7cj29fsa3g6f5: "https://peryn.ai/",
 };
 const hostOf = (u) => { try { return new URL(u).hostname.toLowerCase().replace(/^www\./, ""); } catch { return null; } };
 const MAX_OWNERS = 500;
@@ -272,6 +276,7 @@ export function extendChainOrphans(previous, recent, rows, t, seed = () => []) {
 
 /// A pool's orphan rate on chain over the last week: the orphans the node saw ÷ the blocks the
 /// chain credits the pool with plus those orphans, from its first counter point inside the week.
+/// Not served since 2026-11-17 (see CHAIN_KEY); kept to compare the explorer's count with ours.
 export function chainOrphanWindow(chain, id, t = now()) {
   if (!validChain(chain)) return null;
   const pts = chain.counters[id];
@@ -292,9 +297,9 @@ const worseOrphans = (own, chain) => !own ? chain : !chain ? own : chain.orphans
 /// every block it saw over the last 8 days: the main chain (`blocks`, [height, time, miner]) and
 /// the side branches (`stale`, [hash, height, time, miner]: blocks that lost the race), each with
 /// the address its coinbase pays (`miners[miner]`). A pool's orphan rate is then read off the
-/// chain itself, by its payout addresses. One node does not see every orphan either (one that
-/// lost at once may never reach it), so the orphans lordofpearls' node saw are added by hash, and
-/// the pool's own list still wins when it shows more.
+/// chain itself, by its payout addresses. Only what our node saw: the explorer's list once counted
+/// a block that stayed on the main chain. One node does not see every orphan (one that lost at
+/// once may never reach it), so the pool's own list still wins when it shows more.
 export const NODE_BLOCKS = "https://node.pearlhub.net/chain/blocks.json";
 const HASH_RE = /^[0-9a-f]{64}$/;
 const minerAt = (i, miners) => i === null || Number.isSafeInteger(i) && i >= 0 && i < miners;
@@ -324,8 +329,8 @@ export function addressOwners(previous, lop, rows) {
   return Object.keys(owners).length <= MAX_OWNERS ? owners : fresh;
 }
 
-/// A pool's orphan rate over the last week from the node's blocks: its side-branch blocks (with
-/// the explorer's, by hash) ÷ those plus its main-chain blocks, by block time.
+/// A pool's orphan rate over the last week from the node's blocks: its side-branch blocks ÷ those
+/// plus its main-chain blocks, by block time.
 export function nodeOrphanWindow(node, chain, id, t = now()) {
   if (!validNodeBlocks(node, t) || !validChain(chain) || !chain.owners) return null;
   const start = Math.max(t - FEE_SPAN, node.from);
@@ -337,7 +342,6 @@ export function nodeOrphanWindow(node, chain, id, t = now()) {
   for (const [, ts, i] of node.blocks) if (ts > start && ts <= t && mine.has(i)) kept++;
   const lost = new Set();
   for (const [hash, , ts, i] of node.stale) if (ts > start && ts <= t && mine.has(i)) lost.add(hash);
-  for (const [hash, ts, , owner] of chain.orphans) if (owner === id && ts > start && ts <= t) lost.add(hash);
   const blocks = kept + lost.size;
   return blocks >= MIN_ORPHAN_BLOCKS ? { start, end: t, blocks, orphans: lost.size, source: "chain" } : null;
 }
@@ -652,7 +656,7 @@ export async function recordPPLNSSnapshot(db, snapshot, fetchJSON = null, prefet
     if (next && !same(next, chain)) { chain = next; writes.push(db.prepare("INSERT OR REPLACE INTO kv(k,v,ts) VALUES(?,?,?)").bind(CHAIN_KEY, JSON.stringify(chain), snapshot.ts)); }
   }
   const orphanRate = (row) => worseOrphans(efforts.get(row.id) ? orphanWindow(efforts.get(row.id), snapshot.ts) : null,
-    chain && !row.solo ? nodeOrphanWindow(node, chain, row.id, snapshot.ts) ?? chainOrphanWindow(chain, row.id, snapshot.ts) : null);
+    chain && !row.solo ? nodeOrphanWindow(node, chain, row.id, snapshot.ts) : null);
   const summarized = new Set();
   for (const row of snapshot.rows) {
     const point = pplnsPoint(snapshot, row);

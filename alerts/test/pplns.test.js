@@ -650,7 +650,7 @@ test("chain orphans: a history seeds counter points back to its last hole, an ho
   assert.deepEqual(counterSeed(holed, null, holed.last.ts + 60), [[holed.last.ts, holed.last.blocks]]);
 });
 
-test("chain orphans: a PPS pool with no history starts from the explorer's 24-hour count, then grows to the week", async () => {
+test("chain orphans: a PPS pool with no history starts its counter from the explorer's 24-hour count; the explorer's rate is not served", async () => {
   const env = makeEnv(), id = "https://prl.kryptex.network/", end = T0 + 3 * DAY; setNow(end);
   const kryptex = { id, name: "Kryptex", solo: false, hashrate: 1e15, lifetimeBlocks: 5000, source: "lordofpearls", sampleDays: 1, blocksSample: 250,
     payouts: [{ scheme: "PPS+", solo: false, fee: 3, grossPerPH: 100, realFeePercent: null }] };
@@ -660,9 +660,10 @@ test("chain orphans: a PPS pool with no history starts from the explorer's 24-ho
   await recordPPLNSSnapshot(env.DB, snapshot(end, { rows: [kryptex] }), fetchJSON);
   const stored = JSON.parse(env.DB.one("SELECT v FROM kv WHERE k='public:chain-orphans:v1'").v);
   assert.deepEqual(stored.counters[id], [[end - DAY, 4750], [end, 5000]]);
-  const summary = JSON.parse(env.DB.one("SELECT v FROM kv WHERE k='public:pool-luck:v1'").v);
-  // The last day: 3 orphans the node saw (not the one two days ago) against 250 chain blocks.
-  assert.deepEqual(summary.rows[0].orphans, { start: end - DAY, end, blocks: 253, orphans: 3, source: "chain" });
+  // The explorer's orphans are recorded but not served: without our node, no rate (nor a summary row for this PPS pool).
+  assert.equal(stored.orphans.length, 4);
+  const summary = env.DB.one("SELECT v FROM kv WHERE k='public:pool-luck:v1'");
+  assert.equal(summary ? JSON.parse(summary.v).rows.find((r) => r.id === id)?.orphans ?? null : null, null);
 });
 
 test("chain orphans: a week's rate is orphans ÷ (chain blocks + orphans); the higher of the pool's and the chain's is served", async () => {
@@ -680,8 +681,8 @@ test("chain orphans: a week's rate is orphans ÷ (chain blocks + orphans); the h
   assert.equal(chainOrphanWindow({ since: T0, orphans: [], counters: { [id]: [[end - 2 * DAY, 0], [end, 10]] } }, id, end), null);
   assert.equal(chainOrphanWindow(chain, "other", end), null);
 
-  // Through the snapshot: Lucky's own list shows none, the explorer saw some, so the chain's rate is served;
-  // Kryptex (PPS, no list) gets the chain's; a pool whose own list shows more keeps its own.
+  // Through the snapshot (no node here): the explorer's orphans are not served. Lucky keeps its own
+  // list's none, Kryptex (PPS, no list) gets nothing, HeroMiners its own list's.
   const env = makeEnv(); setNow(end);
   const put = (k, v) => env.DB.prepare("INSERT OR REPLACE INTO kv(k,v,ts) VALUES(?,?,?)").bind(k, JSON.stringify(v), end).run();
   const lucky = { ...row, id: LUCKY, name: "Lucky Pool", lifetimeBlocks: point(end).blocks };
@@ -698,8 +699,8 @@ test("chain orphans: a week's rate is orphans ÷ (chain blocks + orphans); the h
   await recordPPLNSSnapshot(env.DB, saved);
   await env.DB.prepare("INSERT INTO kv(k,v,ts) VALUES(?,?,?)").bind("public:overview:v1", JSON.stringify(saved), end).run();
   const rows = (await call(env, "GET", "/v1/pools")).body.rows, by = (x) => rows.find((r) => r.id === x);
-  assert.equal(by(LUCKY).orphans.source, "chain"); assert.equal(by(LUCKY).orphans.orphans, 2);
-  assert.equal(by(id).orphans.source, "chain"); assert.equal(by(id).orphans.orphans, w.orphans); assert.equal(by(id).luck, null);
+  assert.equal(by(LUCKY).orphans.source, "pool"); assert.equal(by(LUCKY).orphans.orphans, 0);
+  assert.equal(by(id).orphans, null); assert.equal(by(id).luck, null);
   assert.equal(by("https://pearl.herominers.com/").orphans.source, "pool"); assert.ok(by("https://pearl.herominers.com/").orphans.orphans > 1);
   assert.ok(!JSON.stringify(rows).includes("counters"));
 });
@@ -944,9 +945,9 @@ test("node orphans: a pool's side-branch blocks ÷ all its blocks over the week,
   const kept = node.blocks.filter(([, ts, i]) => i === 0 && ts > end - 7 * DAY && ts <= end).length;
   // The week's one side-branch block of Lucky's (not the one eight days ago, nor one paying nobody).
   assert.deepEqual(nodeOrphanWindow(node, chain, LUCKY, end), { start: end - 7 * DAY, end, blocks: kept + 1, orphans: 1, source: "chain" });
-  // The explorer's orphans join by hash: the one ours saw too counts once.
+  // Only what our node saw: the explorer's orphans add nothing (it once listed a block that stayed on the main chain).
   const both = { ...chain, orphans: [[H("a"), end - DAY + 5, 7, LUCKY], [H("e"), end - 3 * DAY, 5, LUCKY], [H("f"), end - 3 * DAY, 6, "x"]] };
-  assert.deepEqual(nodeOrphanWindow(node, both, LUCKY, end), { start: end - 7 * DAY, end, blocks: kept + 2, orphans: 2, source: "chain" });
+  assert.deepEqual(nodeOrphanWindow(node, both, LUCKY, end), { start: end - 7 * DAY, end, blocks: kept + 1, orphans: 1, source: "chain" });
   // A pool with no known address, a node that started under a day ago, a stale or malformed file: no window.
   assert.equal(nodeOrphanWindow(node, chain, "https://pearl.herominers.com/", end), null);
   assert.equal(nodeOrphanWindow(node, { ...chain, owners: undefined }, LUCKY, end), null);
@@ -975,11 +976,13 @@ test("node orphans: addresses are named by the explorer and the checked list, an
     "https://www.f2pool.com/");
 });
 
-test("node orphans: through the snapshot the node's rate is served, a tie is labelled chain, the explorer's counters stand in", async () => {
+test("node orphans: through the snapshot the node's rate is served, a tie is labelled chain, the explorer's orphans never count", async () => {
   const end = T0 + 30 * DAY, hero = "https://pearl.herominers.com/";
   const lucky = { ...row, id: LUCKY, name: "Lucky Pool", lifetimeBlocks: 5000 };
   const heroRow = { ...row, id: hero, name: "HeroMiners", lifetimeBlocks: 4000 };
-  const lop = { lifetime: { top: [{ address: "prl1plucky", pool: { url: LUCKY } }, { address: "prl1phero", pool: { url: hero } }] }, orphans: { recent: [] } };
+  // The explorer lists one of Lucky's blocks as an orphan (as it did Pearl Fortune's 144502, which stayed on the main chain).
+  const lop = { lifetime: { top: [{ address: "prl1plucky", pool: { url: LUCKY } }, { address: "prl1phero", pool: { url: hero } }] },
+    orphans: { recent: [{ hash: H("9"), height: 4, detected_at: end - DAY, miner: "prl1plucky", pool: { url: LUCKY } }] } };
   const run = async (node, lists = {}) => {
     const env = makeEnv(); setNow(end);
     const put = (k, v) => env.DB.prepare("INSERT OR REPLACE INTO kv(k,v,ts) VALUES(?,?,?)").bind(k, JSON.stringify(v), end).run();
@@ -997,7 +1000,7 @@ test("node orphans: through the snapshot the node's rate is served, a tie is lab
   };
   const node = nodeBlocks(end, { miners: ["prl1plucky", "prl1phero"], stale: [[H("a"), 7, end - DAY, 1]] });
   const week = (i) => node.blocks.filter(([, ts, m]) => m === i && ts > end - 7 * DAY).length;
-  // Lucky's own list shows no orphan and neither does the chain: the chain's figure, labelled chain.
+  // Lucky's own list shows no orphan and neither does our node (the explorer's one is left out): the chain's figure, labelled chain.
   const ownLucky = effortFor(end, { since: end - 7 * DAY });
   let r = await run(node, { [LUCKY]: ownLucky });
   assert.ok(r.asked.includes(NODE_BLOCKS));
@@ -1008,7 +1011,9 @@ test("node orphans: through the snapshot the node's rate is served, a tie is lab
   const ownHero = { ...effortFor(end, { since: end - 7 * DAY }), sourceVersion: 2 }; ownHero.blocks = ownHero.blocks.map((b, i) => i % 10 ? b : [b[0], b[1], b[2], 1]);
   r = await run(node, { [hero]: ownHero });
   assert.equal(r.by(hero).source, "pool"); assert.ok(r.by(hero).orphans > 1);
-  // Node unreachable: Lucky's own list, as before (the explorer's counters start with this snapshot).
+  assert.equal(r.stored.orphans.length, 1); // still recorded, as a cross-check
+  // Node unreachable: Lucky's own list; HeroMiners, with none, gets no rate (the explorer's is not served).
   r = await run(null, { [LUCKY]: ownLucky });
   assert.equal(r.by(LUCKY).source, "pool"); assert.equal(r.by(LUCKY).orphans, 0);
+  assert.equal(r.by(hero), null);
 });
