@@ -199,3 +199,23 @@ test("PearlHash rolling accepted-share estimate ignores its display multiplier, 
   assert.equal(live.realFeeEstimate.theoryBasis, "accepted_share_work");
   assert.equal(live.shareYield, undefined);
 });
+
+test("PearlHash factor-change history exposes displayFactor, prior and since segments without altering the 30-day figure", () => {
+  const days = [];
+  for (let i = 27; i >= 15; i--) days.push([end - i * DAY, 86400, 99, 109.28, 109.28 * 0.915]);
+  days.push([end - 14 * DAY, 86400, 84, 92.97, 92.97 * 0.9442]);
+  for (let i = 13; i >= 1; i--) days.push([end - i * DAY, 86400, 81, 79.7, 79.7 * 0.9821]);
+  const record = { last: { ts: at, blocks: 22358, diffRate: 50000, display: 1.4e19, difficulty: 6e7 }, days };
+  const r = rollingPearlHashMeasurement(record, 1, at);
+  assert.ok(r); assert.equal(validRollingShareMeasurement(r, at), true);
+  assert.ok(r.displayFactor && r.prior && r.since);
+  near(r.displayFactor.factor, 0.9821, 1e-6);
+  near(r.displayFactor.percent, (1 - 0.99 * 0.9821) * 100, 1e-4);
+  assert.equal(r.displayFactor.since, end - 13 * DAY);
+  assert.equal(r.prior.start, end - 27 * DAY); assert.equal(r.prior.end, end - 14 * DAY);
+  assert.equal(r.since.start, end - 14 * DAY); assert.equal(r.since.end, end);
+  assert.equal(r.prior.poolBlocks + r.since.poolBlocks, r.poolBlocks);
+  near(r.prior.work + r.since.work, r.work, 1e-6);
+  assert.equal(validRollingShareMeasurement({ ...r, displayFactor: { ...r.displayFactor, factor: 1.2 } }, at), false);
+  assert.equal(validRollingShareMeasurement({ ...r, prior: { ...r.prior, end: r.since.start - DAY } }, at), false);
+});
