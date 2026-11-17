@@ -4,7 +4,7 @@ import { readCapped, MAX_BODY, UA, SOURCES, sanitizeTarget } from "./pools.js";
 import { reserveBudget } from "./poolstats.js";
 import { now, webJson as json } from "./http.js";
 import { validPPLNSMeasurement, costEstimated } from "./pplns.js";
-import { HERO, validRollingShareMeasurement } from "./shareyield.js";
+import { HERO, PEARLHASH, validRollingShareMeasurement } from "./shareyield.js";
 
 const DAY = 86400, DAYS = 5, WORK = 2 ** 48, EMISSION = 650226n;
 const POOLS = { "Pearl Fortune": "PPS", Kryptex: "PPS+", F2Pool: "PPS" };
@@ -17,7 +17,7 @@ const oldestEnd = (t) => Math.floor(t / DAY) * DAY - DAY;
 const current = (end, t) => end <= t && end >= oldestEnd(t);
 
 // Peryn's PPS+ is measured per fee tier: its Founding Miners' addresses and everyone else's (perynMeasurement).
-const PERYN = "Peryn", PERYN_TIERS = ["founding", "standard"], PERYN_MIN_DAYS = 3;
+const PERYN = "Peryn", PERYN_TIERS = ["standard", "founding"], PERYN_MIN_DAYS = 3;
 const perynKey = (tier) => key(`${PERYN}:${tier}`);
 const KEYS = [...Object.keys(POOLS).map(key), ...PERYN_TIERS.map(perynKey)];
 
@@ -47,46 +47,39 @@ export async function realFees(env) {
 }
 
 // PPLNS / PROP: luck taken out by the pool's own per-block effort (pplnsMeasurement). HeroMiners' effort counts the
-// same shares it pays for, so dividing it out would also hide the shares it never turns into blocks: it gets the
-// rolling 30-day output estimate instead, its count interval carried with it (shareyield.js), and nothing until then.
+// same shares it pays for, and PearlHash publishes no per-block effort at all, so both get the rolling 30-day output
+// estimate against accepted share work instead, with its count interval (shareyield.js), and nothing until then.
 function pplnsEstimate(row, payout, measurements) {
   if (!costEstimated(row, payout)) return null;
   const sample = measurements.find((o) => o.id === row.id && o.pool === row.name && validPPLNSMeasurement(o));
-  if ((row.id === HERO || row.name === "HeroMiners") && !validRollingShareMeasurement(sample, now())) return null;
-  return sample ? { percent: (1 - sample.ratio) * 100, start: sample.start, end: sample.end, shareYield: sample.shareYield,
-    rolling: sample.theoryBasis === "accepted_share_rounds" ? sample : null } : null;
+  const rollingPool = row.id === HERO || row.name === "HeroMiners" || row.id === PEARLHASH || row.name === "PearlHash";
+  if (rollingPool && !validRollingShareMeasurement(sample, now())) return null;
+  const isRolling = sample?.theoryBasis === "accepted_share_rounds" || sample?.theoryBasis === "accepted_share_work";
+  return sample ? { percent: (1 - sample.ratio) * 100, start: sample.start, end: sample.end,
+    rolling: isRolling ? sample : null } : null;
 }
-
-// PearlHash turns only part of its accepted shares into blocks, the part its displayed hashrate shows (pearlHashYield):
-// Real Cost counts that with the fee, 100 − (100 − cost) × yield, and the payout carries `shareYield` for the bubble.
-// Without the measured ratio it has no figure (the former fixed 0.915 is retired: PearlHash changed it on 2026-11-02).
-const SHARE_YIELD_POOLS = new Set(["PearlHash"]);
 
 const measuredPercent = (o) => (1 - o.netPRL / o.expectedPRL) * 100;
 
 export function attachRealFees(snapshot, measurements, pplnsMeasurements = [], rollingEnabled = true) {
   return { ...snapshot, rows: snapshot.rows.map((row) => {
     const own = measurements.filter((o) => o.pool === row.name && validMeasurement(o));
-    // Peryn: the Founding Miners' figure, everyone else's only when it alone was measured (owner 2026-11-09: everyone
-    // else's group includes VIP addresses paid +2% on top, which pulls it to about zero). Both go in `realFeeTiers`
-    // for the bubble beside the figure.
+    // Peryn: the standard ("Other addresses") figure leads, and Founding Miners' only when it alone was measured
+    // (now that > 50 PH/s and VIP custom-rebate accounts are excluded). Both go in `realFeeTiers` for the bubble.
     const tiers = row.name === PERYN ? Object.fromEntries(own.filter((o) => o.tier).map((o) => [o.tier, o])) : null;
-    const observation = tiers ? ["founding", "standard"].map((k) => tiers[k]).find(Boolean)
+    const observation = tiers ? ["standard", "founding"].map((k) => tiers[k]).find(Boolean)
       : own.find((o) => o.tier == null);
     const matches = !row.solo && observation && (row.payouts || []).some((p) => !p.solo && p.scheme === observation.scheme);
     return { ...row, realFeeMeasurement: matches ? observation : null,
       payouts: row.payouts?.map((p) => {
         const measured = matches && !p.solo && p.scheme === observation.scheme;
         const observationEstimate = measured ? null : pplnsEstimate(row, p, pplnsMeasurements);
-        const yieldPool = !row.solo && !p.solo && SHARE_YIELD_POOLS.has(row.name);
-        const shareYield = yieldPool ? observationEstimate?.shareYield ?? null : null;
-        // The rolling estimate only for clients that can show its interval; a share-yield pool only with its ratio.
-        const estimate = observationEstimate?.rolling && !rollingEnabled || yieldPool && shareYield == null ? null : observationEstimate;
-        const percent = measured ? measuredPercent(observation) : estimate?.percent ?? null;
-        const cost = percent != null && shareYield != null ? 100 - (100 - percent) * shareYield : percent;
+        // The rolling estimate only for clients that can show its interval.
+        const estimate = observationEstimate?.rolling && !rollingEnabled ? null : observationEstimate;
+        const cost = measured ? measuredPercent(observation) : estimate?.percent ?? null;
         const { shareYield: previousYield, realFeeEstimate: previousEstimate, outputObservation: previousOutput,
           settlementCost: previousSettlement, realFeeTier: previousTier, realFeeTiers: previousTiers, ...payout } = p;
-        return { ...payout, ...(shareYield != null && cost != null ? { shareYield } : {}),
+        return { ...payout,
           ...(estimate?.rolling ? { realFeeEstimate: estimate.rolling } : {}),
           ...(measured && observation.tier ? { realFeeTier: observation.tier,
             realFeeTiers: Object.fromEntries(PERYN_TIERS.map((k) => [k, tiers[k] ? measuredPercent(tiers[k]) : null])) } : {}),
@@ -341,7 +334,8 @@ export async function refreshRealFees(env) {
 // minutes late lands on the next day) and Peryn's prediction is within 3% of ours (a day with PPLNS work, or a
 // misread figure, is not a PPS+ day).
 const PERYN_APP = "https://app.peryn.ai", PERYN_TX = "https://blockbook.pearlresearch.ai/api/v2/tx/";
-const PERYN_PAYMENTS = 12, PERYN_PAGES = 24, PERYN_PAGE_BYTES = 4_000_000, PERYN_SETTLE = 1800, PERYN_BATCH = 4;
+const PERYN_PAYMENTS = 12, PERYN_PAGES = 32, PERYN_PAGE_BYTES = 4_000_000, PERYN_SETTLE = 1800, PERYN_BATCH = 4;
+export const PERYN_MAX_HASHRATE = 50e15;
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const HASH_UNITS = { H: 1, kH: 1e3, KH: 1e3, MH: 1e6, GH: 1e9, TH: 1e12, PH: 1e15, EH: 1e18 };
 const figure = (s) => { const v = Number(String(s).replace(/,/g, "")); return Number.isFinite(v) && v >= 0 ? v : null; };
@@ -357,7 +351,7 @@ function perynDay(d, m, t) {
   return null;
 }
 
-export function perynPayees(txs) {
+export function perynPayees(txs, maxPaid = Infinity) {
   const pool = new Set(), paid = new Map();
   for (const tx of txs) for (const v of tx?.vin || []) for (const a of v?.addresses || []) pool.add(a);
   for (const tx of txs) for (const o of tx?.vout || []) {
@@ -365,15 +359,15 @@ export function perynPayees(txs) {
     if (typeof a !== "string" || !/^prl1[0-9a-z]{20,100}$/.test(a) || pool.has(a) || v == null || v <= 0) continue;
     paid.set(a, (paid.get(a) || 0) + v);
   }
-  return [...paid].sort((a, b) => b[1] - a[1]).map(([a]) => a);
+  return [...paid].filter(([, v]) => !(v > maxPaid)).sort((a, b) => b[1] - a[1]).map(([a]) => a);
 }
 
-// One address's dashboard: its tier and days, or null unless every worker shown is on PPS+.
+// One address's dashboard: its tier and days, or null unless every worker shown is on PPS+ (excluding VIP custom-rebate accounts).
 export function perynAddress(html, t = now()) {
   if (typeof html !== "string") return null;
   const fee = html.match(/>PPS\+ · ([0-9.]+)% fee( \(Founding Miner\))?</);
   const mode = html.match(/data-payout-mode="[^"]*">([^<]*)</);
-  if (!fee || !mode || !/^PPS\+/.test(mode[1]) || />PPLNS</.test(html)) return null;
+  if (!fee || !mode || !/^PPS\+/.test(mode[1]) || />PPLNS</.test(html) || />VIP Miner</i.test(html)) return null;
   const hashrate = new Map(), credit = new Map(), seen = new Set();
   for (const [, d, m, v, u] of html.matchAll(/<title>(\d{1,2}) ([A-Z][a-z]{2}): ([\d,.]+) ([kKMGTPE]?H)\/s<\/title>/g)) {
     const s = perynDay(d, m, t), h = figure(v);
@@ -397,7 +391,7 @@ export function perynMeasurement(tier, addresses, points, t = now()) {
   let netPRL = 0, expectedPRL = 0;
   const days = new Set(), used = new Set();
   for (const [i, a] of addresses.entries()) {
-    if (a?.tier !== tier) continue;
+    if (a?.tier !== tier || a.days.some((d) => d.hashrate > PERYN_MAX_HASHRATE)) continue;
     const credited = new Map(a.days.map((d) => [d.start, d.actual]));
     for (const d of a.days) {
       if (d.start < start || d.start >= end || !(d.hashrate > 0) || !(d.actual > 0) || !(credited.get(d.start - DAY) > 0)) continue;
@@ -444,12 +438,18 @@ export async function refreshPerynFees(env) {
       .filter((id) => /^[0-9a-f]{64}$/.test(id)).slice(0, 2 * PERYN_PAYMENTS);
     const txs = await settled(txids, (id) => getJSON(env, PERYN, PERYN_TX + id));
     if (!txids.length || txs.length < txids.length / 2) throw new Error("upstream");
-    const targets = perynPayees(txs).slice(0, PERYN_PAGES);
-    const read = await settled(targets, async (a) => ({ page: perynAddress(await getPage(env, `${PERYN_APP}/address/${a}`), t) }));
-    if (!targets.length || read.length < targets.length / 2) throw new Error("upstream");
     const { results: points } = await env.DB.prepare("SELECT height,ts,difficulty FROM network_samples WHERE ts>=? ORDER BY ts,height")
       .bind(oldestEnd(t) - (DAYS + 3) * DAY).all();
-    const distinct = points.filter((p, i) => !i || p.ts > points[i - 1].ts), pages = read.map((r) => r.page).filter(Boolean);
+    const distinct = points.filter((p, i) => !i || p.ts > points[i - 1].ts);
+    let maxPaid = Infinity;
+    try {
+      const capDayPRL = expectedEarnings(distinct, { start: end - DAY, end, hashrate: PERYN_MAX_HASHRATE });
+      if (capDayPRL > 0) maxPaid = 1.05 * capDayPRL * 1e8 * Math.min(1, Math.max(txs.length, 6) / PERYN_PAYMENTS);
+    } catch {}
+    const targets = perynPayees(txs, maxPaid).slice(0, PERYN_PAGES);
+    const read = await settled(targets, async (a) => ({ page: perynAddress(await getPage(env, `${PERYN_APP}/address/${a}`), t) }));
+    if (!targets.length || read.length < targets.length / 2) throw new Error("upstream");
+    const pages = read.map((r) => r.page).filter(Boolean);
     const found = PERYN_TIERS.flatMap((tier) => { try { return [perynMeasurement(tier, pages, distinct, t)]; } catch { return []; } });
     await env.DB.batch([
       ...found.map((o) => env.DB.prepare("INSERT OR REPLACE INTO kv (k,v,ts) VALUES (?,?,?)").bind(perynKey(o.tier), JSON.stringify(o), t)),

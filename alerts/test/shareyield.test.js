@@ -1,7 +1,7 @@
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { HERO, poissonInterval, rollingShareMeasurement, validRollingShareMeasurement } from "../src/shareyield.js";
+import { HERO, PEARLHASH, poissonInterval, rollingShareMeasurement, rollingPearlHashMeasurement, validRollingShareMeasurement } from "../src/shareyield.js";
 import { mergeEfforts, recordPPLNSSnapshot, readPoolLuck, EFFORT_SOURCES, NODE_BLOCKS } from "../src/pplns.js";
 import { attachRealFees } from "../src/realfees.js";
 import { makeEnv, setNow, restoreNow, call } from "./helpers.js";
@@ -20,7 +20,7 @@ test("count intervals match independent Poisson inversion, including zero and la
   const interval = poissonInterval(656);
   near(interval[0] / expected.sumRoundEffort, expected.foundBlockYieldCount95Diagnostic[0]);
   near(interval[1] / expected.sumRoundEffort, expected.foundBlockYieldCount95Diagnostic[1]);
-  for (const bad of [-1, .5, 3001, NaN]) assert.throws(() => poissonInterval(bad));
+  for (const bad of [-1, .5, 10001, NaN]) assert.throws(() => poissonInterval(bad));
 });
 
 test("real 27-day history reproduces the independent audit, without fixing either .955 or 1", () => {
@@ -150,4 +150,52 @@ test("a pre-correction HeroMiners cache is rebuilt before it can publish mixed S
   assert.equal(saved.sourceVersion, 2);
   assert.equal(saved.blocks.length, 10);
   assert.equal((await readPoolLuck(env.DB, at)).pplns.length, 0);
+});
+
+test("PearlHash rolling accepted-share estimate ignores its display multiplier, stops at incomplete days and carries 95% CI", async () => {
+  const days = [
+    // Incomplete start day (<90% observed): stops the contiguous backward walk, never tilted in.
+    [end - 8 * DAY, 50960, 69, 68.95, 63.09],
+    // Complete days across both display regimes (0.915 then 0.9821): display column d[4] is ignored.
+    [end - 7 * DAY, 86400, 86, 102.62, 93.90],
+    [end - 6 * DAY, 86175, 84, 100.12, 91.61],
+    [end - 5 * DAY, 86485, 84, 92.96, 87.77],
+    [end - 4 * DAY, 86493, 88, 85.93, 1],
+    [end - 3 * DAY, 86524, 75, 84.77, 999],
+    [end - 2 * DAY, 86055, 77, 82.13, 80.66],
+    [end - DAY, 86573, 83, 83.30, 81.81],
+    // Partial current UTC day: excluded.
+    [end, 10691, 9, 10.18, 10.00],
+  ];
+  const record = { last: { ts: at, blocks: 22000, diffRate: 60000, display: 1.6e19, difficulty: 6e7 }, days };
+  const r = rollingPearlHashMeasurement(record, 1, at);
+  assert.ok(r); assert.equal(validRollingShareMeasurement(r, at), true);
+  assert.equal(r.id, PEARLHASH); assert.equal(r.pool, "PearlHash"); assert.equal(r.theoryBasis, "accepted_share_work");
+  assert.equal(r.start, end - 7 * DAY); assert.equal(r.end, end);
+  const wantBlocks = 86 + 84 + 84 + 88 + 75 + 77 + 83;
+  const wantWork = 102.62 + 100.12 + 92.96 + 85.93 + 84.77 + 82.13 + 83.30;
+  assert.equal(r.poolBlocks, wantBlocks); assert.equal(r.blocksSample, wantBlocks); assert.equal(r.orphans, 0);
+  near(r.work, wantWork); near(r.ratio, .99 * wantBlocks / wantWork);
+  assert.ok(r.cost95[0] < (1 - r.ratio) * 100 && r.cost95[1] > (1 - r.ratio) * 100);
+  // Large 30-day block counts (>3000) work cleanly; legacy /v1/pools withholds it while rolling-capable clients get it.
+  const thirty = Array.from({ length: 30 }, (_, i) => [end - (30 - i) * DAY, 86400, 120, 122, 120]);
+  const big = rollingPearlHashMeasurement({ ...record, days: thirty }, 1, at);
+  assert.equal(big.poolBlocks, 3600); assert.equal(validRollingShareMeasurement(big, at), true);
+  assert.equal(validRollingShareMeasurement({ ...big, orphans: 1, blocksSample: 3599 }, at), false);
+
+  setNow(at);
+  const env = makeEnv();
+  const phRow = { id: PEARLHASH, name: "PearlHash", solo: false, hashrate: 1.6e19, lifetimeBlocks: 22000,
+    payouts: [{ scheme: "PROP", fee: 1, grossPerPH: 11, solo: false }] };
+  const snapshot = { ok: true, schemaVersion: 1, ts: at, network: { ts: at, prlPerTHDay: .01, reward: 2200, difficulty: 6e7 }, rows: [phRow] };
+  await env.DB.prepare("INSERT OR REPLACE INTO kv(k,v,ts) VALUES(?,?,?)")
+    .bind("public:pearlhash-work:v1", JSON.stringify(record), at).run();
+  await recordPPLNSSnapshot(env.DB, snapshot);
+  await env.DB.prepare("INSERT OR REPLACE INTO kv(k,v,ts) VALUES(?,?,?)")
+    .bind("public:overview:v1", JSON.stringify(snapshot), at).run();
+  assert.equal((await call(env, "GET", "/v1/pools")).body.rows[0].payouts[0].realFeePercent, null);
+  const live = (await call(env, "GET", "/v1/pools?real_cost=rolling")).body.rows[0].payouts[0];
+  near(live.realFeePercent, (1 - r.ratio) * 100);
+  assert.equal(live.realFeeEstimate.theoryBasis, "accepted_share_work");
+  assert.equal(live.shareYield, undefined);
 });

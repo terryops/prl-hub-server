@@ -1,8 +1,9 @@
-// Rolling, count-based output estimates. The pool reports round share work;
+// Rolling, count-based output estimates. The pool reports share work;
 // intervals cover count randomness, not independent verification of that work.
 export const HERO = "https://pearl.herominers.com/";
+export const PEARLHASH = "https://pearlhash.xyz/";
 export const SHARE_YIELD_DAYS = 30;
-const DAY = 86400, MIN_DAYS = 5, MIN_BLOCKS = 100, MAX_BLOCKS = 3000;
+const DAY = 86400, MIN_DAYS = 5, MIN_BLOCKS = 100, MAX_BLOCKS = 10000, COVERAGE = .9;
 const finite = (v) => typeof v === "number" && Number.isFinite(v);
 
 // Stable inversion of the Poisson CDF (Garwood limits). Counts are at most 3000.
@@ -60,10 +61,41 @@ export function rollingShareMeasurement(effort, feePercent, t) {
   return validRollingShareMeasurement(result, t) ? result : null;
 }
 
+export function rollingPearlHashMeasurement(record, feePercent, t) {
+  const last = record?.last, days = record?.days;
+  if (!last || !finite(last.ts) || last.ts < t - 1800 || last.ts > t + 60 || !Array.isArray(days) || !days.length ||
+      !finite(feePercent) || feePercent < 0 || feePercent > 100) return null;
+  for (let i = 0; i < days.length; i++) {
+    const d = days[i];
+    if (!Array.isArray(d) || d.length !== 5 || !Number.isSafeInteger(d[0]) || d[0] <= 0 || d[0] % DAY !== 0 ||
+        !Number.isSafeInteger(d[2]) || d.slice(1).some((v) => !finite(v) || v < 0) || (i && d[0] <= days[i - 1][0])) return null;
+  }
+  const end = Math.floor(t / DAY) * DAY, byDay = new Map(days.map((d) => [d[0], d]));
+  let start = end, canonical = 0, work = 0;
+  for (let day = end - DAY; day >= end - SHARE_YIELD_DAYS * DAY; day -= DAY) {
+    const d = byDay.get(day);
+    if (!d || d[1] < COVERAGE * DAY || !(d[3] > 0)) break;
+    start = day; canonical += d[2]; work += d[3];
+  }
+  if (end - start < MIN_DAYS * DAY || canonical < MIN_BLOCKS || canonical > MAX_BLOCKS || !(work > 0)) return null;
+  const retained = 1 - feePercent / 100;
+  const canonical95 = poissonInterval(canonical).map((v) => v / work);
+  const result = { id: PEARLHASH, pool: "PearlHash", scheme: "PPLNS", theoryBasis: "accepted_share_work",
+    start, end, measuredAt: last.ts, estimated: true, targetDays: SHARE_YIELD_DAYS,
+    blocksSample: canonical, poolBlocks: canonical, orphans: 0, work, feePercent,
+    foundYield: canonical / work, foundYield95: canonical95,
+    ratio: retained * canonical / work,
+    cost95: [100 * (1 - retained * canonical95[1]), 100 * (1 - retained * canonical95[0])],
+    confidence: .95, confidenceMethod: "poisson_count_only", sourceVersion: 2 };
+  return validRollingShareMeasurement(result, t) ? result : null;
+}
+
 export function validRollingShareMeasurement(o, t) {
   const pair = (v) => Array.isArray(v) && v.length === 2 && v.every(finite) && v[0] <= v[1];
-  return !!o && o.id === HERO && o.pool === "HeroMiners" && o.scheme === "PPLNS" &&
-    o.theoryBasis === "accepted_share_rounds" && o.sourceVersion === 2 && o.estimated === true && o.targetDays === SHARE_YIELD_DAYS &&
+  const hero = o?.id === HERO && o.pool === "HeroMiners" && o.theoryBasis === "accepted_share_rounds";
+  const pearlhash = o?.id === PEARLHASH && o.pool === "PearlHash" && o.theoryBasis === "accepted_share_work" && o.orphans === 0;
+  return !!o && (hero || pearlhash) && o.scheme === "PPLNS" &&
+    o.sourceVersion === 2 && o.estimated === true && o.targetDays === SHARE_YIELD_DAYS &&
     Number.isSafeInteger(o.start) && o.start > 0 && o.start % DAY === 0 && Number.isSafeInteger(o.end) && o.end % DAY === 0 &&
     o.end === Math.floor(t / DAY) * DAY && o.end - o.start >= MIN_DAYS * DAY && o.end - o.start <= SHARE_YIELD_DAYS * DAY &&
     finite(o.measuredAt) && o.measuredAt >= o.end && o.measuredAt >= t - 1800 && o.measuredAt <= t + 60 &&

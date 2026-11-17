@@ -128,44 +128,50 @@ test("the shared-reward estimate reaches PROP and PearlHash's unnamed payout, no
   const cost = (id, name, scheme) => attachRealFees({ ts: t, rows: [{ id, name, solo: false,
     payouts: [{ scheme, fee: 2, grossPerPH: 80, solo: false }] }] }, [], [publicPPLNS(id, name)]).rows[0].payouts[0];
   assert.equal(cost("hero", "HeroMiners", "PROP").realFeePercent, null); // Legacy summaries cannot replace its rolling estimate.
-  // PearlHash: with the share yield its record measured (its display ÷ its accepted shares).
+  assert.equal(cost("https://pearlhash.xyz/", "PearlHash", "PROP").realFeePercent, null); // Same for PearlHash.
+  const end = Math.floor(t / 86400) * 86400, start = end - 7 * 86400;
+  const rollingPH = { id: "https://pearlhash.xyz/", pool: "PearlHash", scheme: "PPLNS", theoryBasis: "accepted_share_work",
+    start, end, measuredAt: t, estimated: true, targetDays: 30, blocksSample: 560, poolBlocks: 560, orphans: 0,
+    work: 600, feePercent: 1, foundYield: 560 / 600, foundYield95: [.85, 1.02], ratio: .99 * 560 / 600,
+    cost95: [0, 16], confidence: .95, confidenceMethod: "poisson_count_only", sourceVersion: 2 };
   const pearlhash = attachRealFees({ ts: t, rows: [{ id: "https://pearlhash.xyz/", name: "PearlHash", solo: false,
-    payouts: [{ scheme: null, fee: 2, grossPerPH: 80, solo: false }] }] }, [],
-    [{ ...publicPPLNS("https://pearlhash.xyz/", "PearlHash"), shareYield: .982 }]).rows[0].payouts[0];
-  near(pearlhash.realFeePercent, 100 - (100 - 5.92) * .982);
+    payouts: [{ scheme: null, fee: 1, grossPerPH: 80, solo: false }] }] }, [], [rollingPH]).rows[0].payouts[0];
+  near(pearlhash.realFeePercent, (1 - rollingPH.ratio) * 100);
   assert.equal(pearlhash.realFeeEstimated, true);
-  assert.deepEqual(pearlhash.realFeePeriod, { start: t - 5 * 86400, end: t });
+  assert.deepEqual(pearlhash.realFeePeriod, { start, end });
+  assert.equal(pearlhash.realFeeEstimate.theoryBasis, "accepted_share_work");
   assert.equal(cost("other", "Other", null).realFeePercent, null);
   assert.equal(cost("https://pearlhash.xyz/", "PearlHash", "PPS").realFeePercent, null);
 });
 
-test("PearlHash counts its measured share yield, never the retired 0.915; HeroMiners never reuses a legacy summary", () => {
+test("PearlHash and HeroMiners require rolling observations and strip retired shareYield fields", () => {
   setNow(t);
-  const out = (rows, samples) => attachRealFees({ ts: t, rows }, [], samples).rows;
+  const out = (rows, samples, rolling = true) => attachRealFees({ ts: t, rows }, [], samples, rolling).rows;
   const row = (id, name, solo = false) => ({ id, name, solo, payouts: [{ scheme: solo ? "SOLO" : "PROP", fee: 1, grossPerPH: 80, solo }] });
-  const PH = "https://pearlhash.xyz/", phSample = (ratio, y = .982) => ({ ...publicPPLNS(PH, "PearlHash", ratio), shareYield: y });
+  const PH = "https://pearlhash.xyz/", end = Math.floor(t / 86400) * 86400, start = end - 7 * 86400;
+  const phRolling = { id: PH, pool: "PearlHash", scheme: "PPLNS", theoryBasis: "accepted_share_work",
+    start, end, measuredAt: t, estimated: true, targetDays: 30, blocksSample: 560, poolBlocks: 560, orphans: 0,
+    work: 600, feePercent: 1, foundYield: 560 / 600, foundYield95: [.85, 1.02], ratio: .99 * 560 / 600,
+    cost95: [0, 16], confidence: .95, confidenceMethod: "poisson_count_only", sourceVersion: 2 };
   const [ph, phSolo, hero] = out([row(PH, "PearlHash"), row(PH + "solo", "PearlHash SOLO", true), row("hero", "HeroMiners")],
-    [phSample(.99), publicPPLNS("hero", "HeroMiners", .99)]);
+    [phRolling, publicPPLNS("hero", "HeroMiners", .99)]);
   const p = ph.payouts[0];
-  near(p.realFeePercent, 100 - 99 * .982); // ≈ 2.78%: the 1% fee and the 1.8% of shares that find no block
-  assert.equal(p.shareYield, .982);
+  near(p.realFeePercent, (1 - phRolling.ratio) * 100);
+  assert.equal(p.shareYield, undefined);
   assert.equal(p.realFeeEstimated, true);
-  // A summary without the measured ratio (written before it, or the check failed): no figure, not the old constant.
-  const unmeasured = out([row(PH, "PearlHash")], [publicPPLNS(PH, "PearlHash", .99)])[0].payouts[0];
-  assert.equal(unmeasured.realFeePercent, null); assert.equal(unmeasured.shareYield, undefined); assert.equal(unmeasured.realFeePeriod, null);
-  // HeroMiners waits for a rolling observation rather than showing 0% from its old base estimate.
+  assert.equal(p.realFeeEstimate.poolBlocks, 560);
+  // Legacy clients (rollingEnabled = false) and legacy shareYield summaries get no figure.
+  assert.equal(out([row(PH, "PearlHash")], [phRolling], false)[0].payouts[0].realFeePercent, null);
+  const legacy = out([row(PH, "PearlHash")], [{ ...publicPPLNS(PH, "PearlHash", .99), shareYield: .982 }])[0].payouts[0];
+  assert.equal(legacy.realFeePercent, null); assert.equal(legacy.shareYield, undefined); assert.equal(legacy.realFeePeriod, null);
   assert.equal(phSolo.payouts[0].shareYield, undefined);
   assert.equal(hero.payouts[0].shareYield, undefined); assert.equal(hero.payouts[0].realFeePercent, null);
-  const [other] = out([row("other", "Other")], [publicPPLNS("other", "Other", .99)]);
-  assert.equal(other.payouts[0].shareYield, undefined);
   for (const k of ["minerReport", "realFeePending"]) assert.equal(p[k], undefined, k);
-  // No Real Cost yet: no figure and no bubble.
-  const none = out([row(PH, "PearlHash")], [])[0].payouts[0];
-  assert.equal(none.realFeePercent, null); assert.equal(none.shareYield, undefined);
-  // A second request applies the ratio once, not again (a payout that already carries one is read afresh).
-  const again = { ...row(PH, "PearlHash"), payouts: [{ ...row(PH, "PearlHash").payouts[0], shareYield: .5, realFeePercent: 60 }] };
-  near(out([again], [phSample(.5)])[0].payouts[0].realFeePercent, 100 - 50 * .982);
-  near(out([again], [phSample(.99, .915)])[0].payouts[0].realFeePercent, 100 - 99 * .915);
+  // A cached payout carrying a retired shareYield field is cleaned when re-attached.
+  const stale = { ...row(PH, "PearlHash"), payouts: [{ ...row(PH, "PearlHash").payouts[0], shareYield: .982, realFeePercent: 2.77 }] };
+  const cleaned = out([stale], [phRolling])[0].payouts[0];
+  near(cleaned.realFeePercent, (1 - phRolling.ratio) * 100);
+  assert.equal(cleaned.shareYield, undefined);
 });
 
 test("Fortune retains the PPS settlement window alongside its five-day PPLNS output estimate", () => {
@@ -339,7 +345,8 @@ test("Peryn: an address page gives its fee tier and days; a PPLNS worker, a PPLN
   const big = perynAddress(perynPage({ hashrate: [[fixture.start, "980 TH/s"]], credit: [[fixture.start, "1,234.56", "1,222.21"]] }), perynAt);
   assert.deepEqual(big.days, [{ start: fixture.start, predicted: 1234.56, actual: 1222.21, hashrate: 980e12 }]);
   for (const page of [perynPage({ modes: ["PPS+", "PPLNS"], ...days }), perynPage({ payout: "PPLNS · paid from blocks", ...days }),
-    perynPage({ ...days }).replace(/<p class="text-text">PPS\+[^<]*<\/p>/, "")])
+    perynPage({ ...days }).replace(/<p class="text-text">PPS\+[^<]*<\/p>/, ""),
+    perynPage({ ...days }).replace("Mining dashboard", "Mining dashboard<span>VIP Miner</span>")])
     assert.equal(perynAddress(page, perynAt), null);
   // A day listed twice is not read at all.
   const twice = perynAddress(perynPage({ credit: [[fixture.start, "1", "1"], [fixture.start, "2", "2"], [fixture.start + DAY, "3", "3"]] }), perynAt);
@@ -359,6 +366,9 @@ test("Peryn: each tier counts its own addresses, without first days or days Pery
     page("1% fee", perynMiner(20 * PH, 1.25)),
     // Peryn predicted 10% more than the chain gives: work that was not PPS+, never a fee.
     page("1% fee", perynMiner(4 * PH, 30, { predict: 1.1 })),
+    // Addresses above 50 PH/s are excluded so large custom-rebate farms cannot skew the tier average.
+    page(f, perynMiner(50.1 * PH, -2.0)),
+    page("1% fee", perynMiner(55 * PH, -2.0)),
   ];
   const founding = perynMeasurement("founding", addresses, fixture.points, perynAt);
   const standard = perynMeasurement("standard", addresses, fixture.points, perynAt);
@@ -374,18 +384,20 @@ test("Peryn: each tier counts its own addresses, without first days or days Pery
   // Fewer than three days in the window is no figure.
   const short = [page("1% fee", perynMiner(20 * PH, 1, { from: fixture.end - 3 * DAY }))];
   assert.throws(() => perynMeasurement("standard", short, fixture.points, perynAt), /no_complete_window/);
-  // Payees: largest first, never the pool's own inputs.
-  const pool = "prl1" + "p".repeat(60), a = "prl1" + "a".repeat(60), b = "prl1" + "b".repeat(60);
+  // Payees: largest first, never the pool's own inputs, and capped at maxPaid when given.
+  const pool = "prl1" + "p".repeat(60), a = "prl1" + "a".repeat(60), b = "prl1" + "b".repeat(60), whale = "prl1" + "w".repeat(60);
   const tx = (vin, vout) => ({ vin: vin.map((x) => ({ addresses: [x] })), vout: vout.map(([x, v]) => ({ addresses: [x], value: String(v) })) });
-  assert.deepEqual(perynPayees([tx([pool], [[a, 100], [pool, 9e9], [b, 300]]), tx([pool], [[a, 250], ["junk", 1e9]])]), [a, b]);
+  assert.deepEqual(perynPayees([tx([pool], [[a, 100], [pool, 9e9], [b, 300], [whale, 5000]]), tx([pool], [[a, 250], ["junk", 1e9]])], 1000), [a, b]);
 });
 
 test("Peryn: read once a day from 00:30 UTC from its payout batches; addresses never reach public JSON", async () => {
   const env = withChain(makeEnv());
-  const pool = "prl1" + "p".repeat(60), founder = "prl1" + "f".repeat(60), other = "prl1" + "s".repeat(60), mixed = "prl1" + "m".repeat(60);
+  const pool = "prl1" + "p".repeat(60), founder = "prl1" + "f".repeat(60), other = "prl1" + "s".repeat(60),
+    mixed = "prl1" + "m".repeat(60), vip = "prl1" + "v".repeat(60), whale = "prl1" + "w".repeat(60);
   const pages = {
     [founder]: perynPage({ fee: "0.5% fee (Founding Miner)", ...perynMiner(6 * PH, 0.8) }),
     [other]: perynPage({ fee: "1% fee", ...perynMiner(3 * PH, 1.3) }),
+    [vip]: perynPage({ fee: "0.5% fee (Founding Miner)", ...perynMiner(15 * PH, -2.0) }).replace("Mining dashboard", "Mining dashboard<span>VIP Miner</span>"),
     [mixed]: perynPage({ modes: ["PPLNS"], ...perynMiner(9 * PH, 50) }),
   };
   const asked = [];
@@ -393,7 +405,7 @@ test("Peryn: read once a day from 00:30 UTC from its payout batches; addresses n
     const u = new URL(url); asked.push(u.pathname.replace(/prl1([a-z])\1+/, (m) => m.slice(0, 5)));
     if (u.pathname === "/api/v1/payments") return Response.json({ v: 1, payments: [{ txids: ["a".repeat(64)] }, { txids: ["b".repeat(64), "bad"] }] });
     if (u.pathname.startsWith("/api/v2/tx/")) return Response.json({ vin: [{ addresses: [pool] }],
-      vout: [[pool, 9e10], [founder, 6e8], [other, 3e8], [mixed, 1e8]].map(([a, v]) => ({ addresses: [a], value: String(v) })) });
+      vout: [[pool, 9e10], [whale, 9e13], [founder, 6e8], [other, 3e8], [vip, 2e8], [mixed, 1e8]].map(([a, v]) => ({ addresses: [a], value: String(v) })) });
     if (u.pathname.startsWith("/address/")) return new Response(pages[u.pathname.slice(9)]);
     return new Response("bad", { status: 503 });
   };
@@ -402,14 +414,14 @@ test("Peryn: read once a day from 00:30 UTC from its payout batches; addresses n
   assert.deepEqual(asked, []);
   setNow(perynAt); await refreshRealFees(env);
   assert.deepEqual(asked, ["/api/v1/payments", "/api/v2/tx/" + "a".repeat(64), "/api/v2/tx/" + "b".repeat(64),
-    "/address/prl1f", "/address/prl1s", "/address/prl1m"]);
+    "/address/prl1f", "/address/prl1s", "/address/prl1v", "/address/prl1m"]);
   const ms = await readRealFees(env.DB, perynAt);
   const by = Object.fromEntries(ms.map((o) => [o.tier, o]));
   assert.ok(Math.abs((1 - by.founding.netPRL / by.founding.expectedPRL) * 100 - 0.8) < 0.01);
   assert.ok(Math.abs((1 - by.standard.netPRL / by.standard.expectedPRL) * 100 - 1.3) < 0.01);
   const reply = await call(env, "GET", "/v1/pool-fees");
   assert.equal(reply.body.measurements.length, 2);
-  for (const a of [pool, founder, other, mixed]) assert.ok(!JSON.stringify(reply.body).includes(a));
+  for (const a of [pool, founder, other, mixed, vip, whale]) assert.ok(!JSON.stringify(reply.body).includes(a));
   // Done for the day: later runs ask nothing, even with the lease free.
   asked.length = 0; setNow(perynAt + 2 * 3600); await refreshRealFees(env);
   assert.deepEqual(asked, []);
@@ -427,7 +439,7 @@ test("Peryn: read once a day from 00:30 UTC from its payout batches; addresses n
   assert.equal(env.DB.rows("SELECT k FROM kv WHERE k LIKE 'public:realfees:Peryn:%'").length, 0);
 });
 
-test("Peryn: the Founding Miners' figure leads, open or closed; everyone else's only when it alone was measured", () => {
+test("Peryn: the standard ('Other addresses') figure leads, open or closed; Founding Miners' only when it alone was measured", () => {
   setNow(perynAt);
   const base = { pool: "Peryn", scheme: "PPS+", start: fixture.start, end: fixture.end, measuredAt: perynAt, estimated: true,
     sampleCount: 5, activeDays: 5, addresses: 3, theoryBasis: "hashrate_chain" };
@@ -435,17 +447,17 @@ test("Peryn: the Founding Miners' figure leads, open or closed; everyone else's 
   const row = (open) => ({ name: "Peryn", solo: false, payouts: [
     { scheme: "PPLNS", solo: false, [open ? "founding" : "foundingClosed"]: { fee: 0, afterFP8Months: 6 } },
     { scheme: "PPS+", solo: false, [open ? "founding" : "foundingClosed"]: { fee: 0.5 } }] });
-  const [pplns, open] = attachRealFees({ rows: [row(true)] }, [standard, founding]).rows[0].payouts;
-  near(open.realFeePercent, 0.8); assert.equal(open.realFeeTier, "founding");
-  near(open.realFeeTiers.founding, 0.8); near(open.realFeeTiers.standard, 1.3);
+  const [pplns, open] = attachRealFees({ rows: [row(true)] }, [founding, standard]).rows[0].payouts;
+  near(open.realFeePercent, 1.3); assert.equal(open.realFeeTier, "standard");
+  near(open.realFeeTiers.standard, 1.3); near(open.realFeeTiers.founding, 0.8);
   assert.deepEqual(open.realFeePeriod, { start: fixture.start, end: fixture.end });
   assert.equal(pplns.realFeePercent, null); assert.equal(pplns.realFeeTier, undefined);
-  const closed = attachRealFees({ rows: [row(false)] }, [standard, founding]).rows[0];
-  near(closed.payouts[1].realFeePercent, 0.8); assert.equal(closed.payouts[1].realFeeTier, "founding");
-  assert.equal(closed.realFeeMeasurement.tier, "founding"); near(closed.payouts[1].realFeeTiers.standard, 1.3);
+  const closed = attachRealFees({ rows: [row(false)] }, [founding, standard]).rows[0];
+  near(closed.payouts[1].realFeePercent, 1.3); assert.equal(closed.payouts[1].realFeeTier, "standard");
+  assert.equal(closed.realFeeMeasurement.tier, "standard"); near(closed.payouts[1].realFeeTiers.founding, 0.8);
   // Only one tier measured: that one, named, with the other missing.
-  const only = attachRealFees({ rows: [row(true)] }, [standard]).rows[0].payouts[1];
-  near(only.realFeePercent, 1.3); assert.equal(only.realFeeTier, "standard"); assert.equal(only.realFeeTiers.founding, null);
+  const only = attachRealFees({ rows: [row(true)] }, [founding]).rows[0].payouts[1];
+  near(only.realFeePercent, 0.8); assert.equal(only.realFeeTier, "founding"); assert.equal(only.realFeeTiers.standard, null);
   // A tier needs three days, and a tier is Peryn's alone.
   assert.equal(validMeasurement({ ...founding, activeDays: 2 }, perynAt), false);
   assert.equal(validMeasurement({ ...founding, pool: "Kryptex" }, perynAt), false);

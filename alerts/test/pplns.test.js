@@ -160,7 +160,6 @@ test("PPLNS: a capped pool's baseline is the reward its blocks paid, not the lat
   let h;
   for (let ts = T0; ts <= end; ts += 300) h = extendPPLNSHistory(h, "alpha", "AlphaPool", point(ts, { reward: reward(ts), unit: 100 * reward(ts) }));
   near((1 - pplnsMeasurement(h, end, effortFor(end, { effort: 1.5 })).ratio) * 100, 2, 1e-9);
-  near((1 - pplnsMeasurement(h, end, shareRecord(end, 150)).ratio) * 100, 2, 1e-9);
   // Below the display (shares worth 80 a day for 80 found, the display expecting 100), the lost work stays.
   near((1 - pplnsMeasurement(h, end, effortFor(end, { effort: 1 })).ratio) * 100, (1 - .98 * .8) * 100, 1e-2);
 });
@@ -172,7 +171,6 @@ test("PPLNS: the cost counts today's fee over the whole window, so a corrected f
   for (let ts = T0; ts < end; ts += 300) h = extendPPLNSHistory(h, "alpha", "AlphaPool", point(ts, { fee: 1 }));
   h = extendPPLNSHistory(h, "alpha", "AlphaPool", point(end, { fee: .1 }));
   near((1 - pplnsMeasurement(h, end, effortFor(end, { effort: 1.5 })).ratio) * 100, .1, 1e-9);
-  near((1 - pplnsMeasurement(h, end, shareRecord(end, 150)).ratio) * 100, .1, 1e-9);
   // Below the display the lost work stays, beside the same fee.
   near((1 - pplnsMeasurement(h, end, effortFor(end, { effort: 1 })).ratio) * 100, (1 - .999 * .8) * 100, 1e-2);
   // A fee that stayed put reads as before.
@@ -545,51 +543,13 @@ const shareRecord = (end, perDay, start = T0, shownPerDay = 80) => {
   return w;
 };
 
-test("PearlHash: its accepted shares stand in for Σ effort; luck out, the same way as a block list", () => {
-  const end = T0 + 7 * DAY, h = history(7); // 80 blocks a day on chain where the display expects 100, 2% fee
-  const cost = (record, hist = h, t = end) => (1 - pplnsMeasurement(hist, t, record).ratio) * 100;
-  // Shares worth 100 blocks a day for 80 found: 1.25 blocks of work a block, the shortfall is luck.
-  near(cost(shareRecord(end, 100)), 2);
-  near(cost(shareRecord(end, 100)), cost(effortFor(end, { effort: 1.25 })), 1e-6);
-  // Shares worth what was found: the displayed work never became shares, and that is kept.
-  near(cost(shareRecord(end, 80)), (1 - .98 * .8) * 100, 1e-6);
-  // Shares above the display (PearlHash's own, 2026-10-31): the display is the baseline, the fee remains.
-  near(cost(shareRecord(end, 150)), 2);
-  // The cost window starts at its first whole UTC day; days before it do not count.
-  const late = historyTo(end + DAY / 2), m = pplnsMeasurement(late, end + DAY / 2, shareRecord(end + DAY / 2, 120));
-  assert.ok(m.start >= T0 + DAY && m.covered >= 5 * DAY); near((1 - m.ratio) * 100, 2);
-  assert.equal(m.poolBlocks, m.blocksSample); assert.equal(m.orphans, 0); near(m.work / m.poolBlocks, 1.5, 1e-2);
-  assert.ok(validPPLNSMeasurement(m, end + DAY / 2));
-  // A record that saw too little of the history, stopped, found nothing or is unreadable: no estimate.
-  assert.equal(pplnsMeasurement(h, end, shareRecord(end, 100, T0 + 3 * DAY)), null);
-  assert.equal(pplnsMeasurement(h, end, shareRecord(end - 3600, 100)), null);
-  const none = shareRecord(end, 100);
-  assert.equal(pplnsMeasurement(h, end, { ...none, days: none.days.map((d) => [d[0], d[1], 0, d[3], d[4]]) }), null);
-  assert.equal(pplnsMeasurement(h, end, { ...none, days: [[T0 + 1, 1, 1, 1, 1]] }), null);
-  assert.equal(pplnsMeasurement(h, end, { ...none, last: null }), null);
-  // Still short of five observed days or 100 expected blocks, as for every pool.
-  assert.equal(pplnsMeasurement(history(4), T0 + 4 * DAY, shareRecord(T0 + 4 * DAY, 100)), null);
-  assert.equal(pplnsMeasurement(history(7, { hashPH: .1 }), end, shareRecord(end, 100)), null);
-});
-
-test("PearlHash: the share yield is its display ÷ its accepted shares, while its blocks still follow the display", () => {
+test("PearlHash: pplnsMeasurement rejects share-rate records (PearlHash uses rollingPearlHashMeasurement instead)", () => {
   const end = T0 + 7 * DAY, h = history(7);
-  const m = (record) => pplnsMeasurement(h, end, record);
-  // Shares worth 100 blocks a day, the display (and the blocks) 80: four in five shares find blocks.
-  near(m(shareRecord(end, 100)).shareYield, .8, 1e-6);
-  near(m(shareRecord(end, 80 / .982)).shareYield, .982, 1e-6); // PearlHash since 2026-11-02
-  // A display above the shares never counts as more than every share.
-  assert.equal(m(shareRecord(end, 70, T0, 80)).shareYield, 1);
-  // Blocks that no longer follow the display (here 80 found where it shows 100): no ratio, no estimate.
-  assert.equal(m(shareRecord(end, 120, T0, 100)), null);
-  // Within luck of it, the ratio stands: 80 found where it shows 82 a day.
-  near(m(shareRecord(end, 100, T0, 82)).shareYield, .82, 1e-6);
-  // Under 300 blocks recorded, the check cannot tell: no ratio.
-  assert.equal(m(shareRecord(end, 100, T0 + 3.5 * DAY)), null);
-  // A summary's ratio must be sane; one without it is still read (every other pool).
-  assert.ok(validPPLNSMeasurement(m(shareRecord(end, 100)), end));
-  assert.equal(validPPLNSMeasurement({ ...m(shareRecord(end, 100)), shareYield: .4 }, end), false);
-  assert.equal(validPPLNSMeasurement({ ...m(shareRecord(end, 100)), shareYield: NaN }, end), false);
+  assert.equal(pplnsMeasurement(h, end, shareRecord(end, 100)), null);
+  const effort = effortFor(end, { effort: 1.25 });
+  const m = pplnsMeasurement(h, end, effort);
+  assert.ok(validPPLNSMeasurement(m, end));
+  assert.equal(validPPLNSMeasurement({ ...m, shareYield: .982 }, end), false);
 });
 
 test("PearlHash: a snapshot reads its /api/stats under its budget and stores the day totals", async () => {
@@ -616,19 +576,20 @@ test("PearlHash: a snapshot reads its /api/stats under its budget and stores the
   assert.ok(!JSON.stringify({ pplns, luck: [...luck] }).includes("diffRate"));
 });
 
-test("PearlHash: once its share record covers the week, the summary and the API carry its cost estimate", async () => {
+test("PearlHash: once five complete UTC days are recorded, the summary and rolling API carry its block-count estimate", async () => {
   const env = makeEnv(), ph = { ...row, id: "https://pearlhash.xyz/", name: "PearlHash", payouts: [{ scheme: null, solo: false, fee: 1, grossPerPH: 80, realFeePercent: null }] };
-  // 125 blocks of work a day in shares for 80 found; the history's display expects 100, PearlHash's own shows the 80.
-  const fetchJSON = async (url) => url.includes("lordofpearls") ? {} : { hashrate: 80 * 4e7 * 2 ** 48 / DAY, hashrate_diff_5m: 125 * 4e7 / DAY };
+  // 125 blocks of work a day in shares for 80 found; PearlHash's own display is ignored by the rolling estimate.
+  const fetchJSON = async (url) => url.includes("lordofpearls") || url === NODE_BLOCKS ? {} : { hashrate: 80 * 4e7 * 2 ** 48 / DAY, hashrate_diff_5m: 125 * 4e7 / DAY };
   const snap = (ts) => snapshot(ts, { rows: [{ ...ph, lifetimeBlocks: point(ts).blocks }], network: { ts, prlPerTHDay: .1, reward: 1, difficulty: 4e7 } });
   for (let ts = T0; ts <= T0 + 6 * DAY; ts += 300) { setNow(ts); await recordPPLNSSnapshot(env.DB, snap(ts), fetchJSON); }
   const { pplns } = await readPoolLuck(env.DB, T0 + 6 * DAY);
   assert.deepEqual(pplns.map((m) => m.pool), ["PearlHash"]);
-  near((1 - pplns[0].ratio) * 100, 1, 1e-6);
-  near(pplns[0].shareYield, .64, 1e-3);
+  assert.equal(pplns[0].theoryBasis, "accepted_share_work");
+  near(pplns[0].ratio, .99 * 0.64, 2e-3);
+  assert.equal(pplns[0].shareYield, undefined);
   // A cached read (no fetcher) still uses the stored record.
   setNow(T0 + 6 * DAY + 300); await recordPPLNSSnapshot(env.DB, snap(T0 + 6 * DAY + 300));
-  near((1 - (await readPoolLuck(env.DB, T0 + 6 * DAY + 300)).pplns[0].ratio) * 100, 1, 1e-6);
+  near((await readPoolLuck(env.DB, T0 + 6 * DAY + 300)).pplns[0].ratio, .99 * 0.64, 2e-3);
 });
 
 test("chain orphans: the explorer's orphan list, named by pool URL or a checked address, with hourly block counters", () => {

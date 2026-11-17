@@ -1,6 +1,6 @@
 // Public pool work and attributed block counters only; no miner credentials.
 import { now } from "./http.js";
-import { HERO, SHARE_YIELD_DAYS, rollingShareMeasurement, validRollingShareMeasurement } from "./shareyield.js";
+import { HERO, PEARLHASH, SHARE_YIELD_DAYS, rollingShareMeasurement, rollingPearlHashMeasurement, validRollingShareMeasurement } from "./shareyield.js";
 
 // MIN_WINDOW is observed time, not span: holes left by gaps do not count towards it.
 // The PPLNS cost estimate keeps its seven-day span; block luck reads the full fortnight.
@@ -99,22 +99,18 @@ export function extendPPLNSHistory(previous, id, pool, point) {
 /// the work it displayed (fee, luck and lost work together); the pool's own block list says
 /// how much work those blocks took (Σ effort, each block's shares ÷ difficulty), so its luck
 /// is blocks ÷ Σ effort. Dividing that out leaves the fee and the work the pool loses: what a
-/// miner gives up in the long run. PearlHash's accepted shares stand in for a block list (see
-/// pearlHashShares); other pools that publish no per-block effort get no estimate.
+/// miner gives up in the long run. Pools that publish no per-block effort get no estimate here
+/// (PearlHash gets the rolling accepted-share count estimate in shareyield.js).
 export function pplnsMeasurement(history, t = now(), effort = null) {
-  if (!validHistory(history)) return null;
-  const end = history.last.ts, list = validEffort(effort), shares = list ? null : pearlHashShares(effort, end);
-  if (!list && !shares) return null;
-  const daily = list ? dailyPart(effort, end) : null;
-  const segments = history.segments.filter((s) => s.end > end - FEE_SPAN && s.start >= (shares ? shares.from : daily ? daily.from : effort.since));
+  if (!validHistory(history) || !validEffort(effort)) return null;
+  const end = history.last.ts, daily = dailyPart(effort, end);
+  const segments = history.segments.filter((s) => s.end > end - FEE_SPAN && s.start >= (daily ? daily.from : effort.since));
   if (!segments.length) return null;
   const start = segments[0].start;
   const sum = (field) => segments.reduce((total, s) => total + s[field], 0);
   const covered = segments.reduce((total, s) => total + s.end - s.start, 0);
   if (covered < MIN_WINDOW || end - start > FEE_SPAN + 3600 || end > t + 60 || end < t - 1800) return null;
-  if (shares && (shares.seconds < covered * .9 || shares.shareYield == null)) return null;
-  // Net at today's fee, not the one each segment was written with: what a miner pays from now on,
-  // and a corrected fee counts at once (PearlHash: 1% assumed until 2026-11-01, 0.1% paid).
+  // Net at today's fee, not the one each segment was written with: what a miner pays from now on.
   const fee = history.last.fee;
   const gross = segments.reduce((total, s) => total + (s.grossPRL ?? (fee < 100 ? s.netPRL / (1 - fee / 100) : NaN)), 0);
   const netPRL = gross * (1 - fee / 100), expectedPRL = sum("expectedPRL");
@@ -123,9 +119,7 @@ export function pplnsMeasurement(history, t = now(), effort = null) {
   if (!(expectedBlocks >= MIN_PPLNS_BLOCKS)) return null;
   // The pool's blocks inside observed time: holes drop the pool's blocks as they drop the chain's.
   let i = 0, poolBlocks = 0, orphans = 0, work = 0;
-  // No list: the pool's blocks are the chain's, each taking its mean effort over the same days.
-  if (shares) { poolBlocks = sum("blocks"); work = poolBlocks * shares.work / shares.blocks; }
-  else for (const [, ts, e, orphan] of effort.blocks) {
+  for (const [, ts, e, orphan] of effort.blocks) {
     while (i < segments.length && segments[i].end < ts) i++;
     if (i === segments.length) break;
     if (ts <= segments[i].start) continue;
@@ -151,20 +145,19 @@ export function pplnsMeasurement(history, t = now(), effort = null) {
     chainBlocks ? (1 - fee / 100) * chainBlocks / (chainBlocks + orphans) : Infinity);
   if (!finite(ratio)) return null;
   return { id: history.id, pool: history.pool, scheme: "PPLNS", start, end, netPRL, expectedPRL, expectedBlocks,
-    poolBlocks, orphans, work, luck: poolBlocks / work, ratio, ...(shares ? { shareYield: shares.shareYield } : {}),
+    poolBlocks, orphans, work, luck: poolBlocks / work, ratio,
     estimated: true, sampleCount: sum("samples"), blocksSample: chainBlocks, covered, theoryBasis: "pool_effort" };
 }
 
 export function validPPLNSMeasurement(o, t = now()) {
-  if (o?.theoryBasis === "accepted_share_rounds") return validRollingShareMeasurement(o, t);
+  if (o?.theoryBasis === "accepted_share_rounds" || o?.theoryBasis === "accepted_share_work") return validRollingShareMeasurement(o, t);
   return !!o && typeof o.id === "string" && typeof o.pool === "string" && o.scheme === "PPLNS" &&
     o.theoryBasis === "pool_effort" && o.estimated === true &&
     finite(o.start) && o.start > 0 && finite(o.end) && o.end - o.start >= MIN_WINDOW && o.end - o.start <= FEE_SPAN + 3600 &&
     o.end <= t + 60 && o.end >= t - 1800 && finite(o.netPRL) && o.netPRL >= 0 &&
     finite(o.expectedPRL) && o.expectedPRL > 0 && finite(o.expectedBlocks) && o.expectedBlocks >= MIN_PPLNS_BLOCKS &&
     Number.isSafeInteger(o.poolBlocks) && o.poolBlocks > 0 && finite(o.work) && o.work > 0 &&
-    finite(o.ratio) && o.ratio >= 0 && o.ratio <= 2 &&
-    (o.shareYield === undefined || finite(o.shareYield) && o.shareYield >= .5 && o.shareYield <= 1) &&
+    finite(o.ratio) && o.ratio >= 0 && o.ratio <= 2 && o.shareYield === undefined &&
     Number.isSafeInteger(o.sampleCount) && o.sampleCount > 0 &&
     Number.isSafeInteger(o.blocksSample) && o.blocksSample >= 0;
 }
@@ -570,11 +563,9 @@ const validLuck = (w, span, t) => !!w && finite(w.start) && finite(w.end) && w.e
 
 /// PearlHash publishes no per-block effort, only `hashrate_diff_5m` in `/api/stats`: its accepted
 /// share difficulty per second (an account's value ÷ the pool's equals that account's share of
-/// an hourly payout). Its displayed hashrate is that × 2.5755e14 exactly, 8.5% below the 2^48
-/// hashes a unit of network difficulty takes. Per UTC day this keeps the observed seconds, the
-/// blocks found and the blocks each reading predicts. 2026-10-20 to 10-31 (10.8 days): 1,110
-/// found, 1,107 by its display, 1,210 by its shares; its display is the work that finds blocks.
-const PEARLHASH = "https://pearlhash.xyz/", PH_KEY = "public:pearlhash-work:v1", PH_DAYS = 60;
+/// an hourly payout). Per UTC day this keeps the observed seconds, the canonical blocks found and
+/// the blocks each reading predicts, up to 60 days, feeding its 30-day rolling output estimate.
+const PH_KEY = "public:pearlhash-work:v1", PH_DAYS = 60;
 const validPHPoint = (p) => !!p && finite(p.ts) && p.ts > 0 && Number.isSafeInteger(p.blocks) && p.blocks >= 0 &&
   finite(p.diffRate) && p.diffRate >= 0 && finite(p.display) && p.display >= 0 && finite(p.difficulty) && p.difficulty > 0;
 const validPHDays = (days) => Array.isArray(days) && days.length <= PH_DAYS + 1 && days.every((d, i) => Array.isArray(d) &&
@@ -603,33 +594,6 @@ export function extendPearlHashWork(previous, point) {
     }
   }
   return { last: { ts: point.ts, blocks: point.blocks, diffRate: point.diffRate, display: point.display, difficulty: point.difficulty }, days };
-}
-
-/// The record as a block list's Σ effort: its accepted share difficulty ÷ the network's, summed
-/// over time, is what each block's shares ÷ difficulty add up to. From the cost window's first
-/// whole UTC day, recorded at the same snapshots as the history; the blocks found in the same
-/// intervals make it a mean effort per block. It must have seen most of the history's time.
-function pearlHashShares(record, end) {
-  if (!record || !validPHPoint(record.last) || !validPHDays(record.days) || Math.abs(record.last.ts - end) > 1800) return null;
-  const from = Math.ceil((end - FEE_SPAN) / DAY) * DAY;
-  let seconds = 0, blocks = 0, work = 0, shown = 0;
-  for (const [day, s, n, w, d] of record.days) if (day >= from) { seconds += s; blocks += n; work += w; shown += d; }
-  return blocks > 0 && work > 0 ? { from, seconds, blocks, work, shareYield: pearlHashYield(record, shown / work) } : null;
-}
-
-/// The part of PearlHash's accepted shares that finds blocks: its displayed hashrate ÷ its accepted share rate over
-/// the cost window. PearlHash sets that display itself (× 0.915 until 2026-11-02, × 0.982 since) and its blocks
-/// follow it, not the shares: 10-20 to 11-02, 1,358 blocks against 1,363 by its display and 1,489 by its shares;
-/// 11-04 to 11-09, 427 against 421 and 430. A ratio of two work records, so no block luck is in it. It counts only
-/// while the whole record still bears that out (blocks within 2.58 σ of what the display predicts, 300 blocks at least);
-/// otherwise no figure.
-const PH_CHECK_BLOCKS = 300, PH_CHECK_Z = 2.58;
-function pearlHashYield(record, ratio) {
-  if (!finite(ratio) || ratio <= 0) return null;
-  let blocks = 0, shown = 0;
-  for (const [, , n, , d] of record.days) { blocks += n; shown += d; }
-  if (blocks < PH_CHECK_BLOCKS || !(shown > 0) || Math.abs(blocks - shown) > PH_CHECK_Z * Math.sqrt(shown)) return null;
-  return Math.min(1, ratio);
 }
 
 /// PearlHash's row and network difficulty from the snapshot, its own rate and display from `/api/stats`.
@@ -701,6 +665,7 @@ export async function recordPPLNSSnapshot(db, snapshot, fetchJSON = null, prefet
     // scheme "PPLNS": it names the kind of estimate, not the pool's contract.
     const effort = row.id === PEARLHASH ? pearlhash ?? stored.get(PH_KEY) : efforts.get(row.id);
     const pplns = row.id === HERO ? rollingShareMeasurement(effort, sharedPayout(row)?.fee, snapshot.ts)
+      : row.id === PEARLHASH ? rollingPearlHashMeasurement(effort, sharedPayout(row)?.fee, snapshot.ts)
       : costEstimated(row, sharedPayout(row)) ? pplnsMeasurement(next, snapshot.ts, effort) : null;
     summary.push({ id: row.id, pool: row.name, luck: luckWindows(next, snapshot.ts), pplns, orphans: orphanRate(row) });
     summarized.add(row.id);
