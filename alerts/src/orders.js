@@ -7,6 +7,8 @@ export const ORDER_TTL = 1800; // seconds, quote validity and empty identity lif
 const MATCH_FOR = 7 * 86400; // seconds
 const PRICE_STALE = 300; // seconds
 const CHECK_EVERY = 15; // seconds, shared by cron and order polling
+// SafeTrade takes its 0.01 PRL withdrawal fee out of the amount sent.
+const WITHDRAWAL_FEE = 1_000_000; // sats
 export const paymentSettings = (env) => ({
   enabled: ADDRESS_RE.test(env.PAY_ADDRESS || ""),
   usd: Number(env.PRO_USD || 5),
@@ -246,27 +248,30 @@ async function scanAddress(env, db, t, address, pending, threshold, budget, befo
           .run();
         payment = { txid: tx.txid, sats, first_seen: t, confirmed: 0, order_id: null, told_owner: 0 };
       }
-      let order = payment.order_id
+      // A confirmed transaction must be newer than the tip observed at checkout.
+      // Previously observed mempool payments and legacy orders use first_seen.
+      const afterQuote = (o) => !(tx.confirmations > 0 && o.start_height != null &&
+          (!Number.isSafeInteger(tx.blockHeight) || tx.blockHeight <= o.start_height));
+      // A payment WITHDRAWAL_FEE short keeps the order's random tail, so it still names one order;
+      // the exact amount wins when both are open.
+      const order = payment.order_id
         ? await db
             .prepare("SELECT * FROM orders WHERE id = ?")
             .bind(payment.order_id)
             .first()
-        : await db
+        : (await db
             .prepare(
-              `SELECT * FROM orders WHERE sats = ? AND status <> 'paid' AND (status = 'seen' OR created_at >= ?) AND created_at <= ? AND (txid IS NULL OR txid = ?)${before == null ? "" : " AND created_at < ?"}`,
+              `SELECT * FROM orders WHERE sats IN (?, ?) AND status <> 'paid' AND (status = 'seen' OR created_at >= ?) AND created_at <= ? AND (txid IS NULL OR txid = ?)${before == null ? "" : " AND created_at < ?"} ORDER BY sats`,
             )
             .bind(
               sats,
+              sats + WITHDRAWAL_FEE,
               t - MATCH_FOR,
               payment.first_seen,
               tx.txid,
               ...(before == null ? [] : [before]),
             )
-            .first();
-      // A confirmed transaction must be newer than the tip observed at checkout.
-      // Previously observed mempool payments and legacy orders use first_seen.
-      if (order && !payment.order_id && tx.confirmations > 0 && order.start_height != null &&
-          (!Number.isSafeInteger(tx.blockHeight) || tx.blockHeight <= order.start_height)) order = null;
+            .all()).results.find(afterQuote) || null;
       if (order) {
         // A late payment may outlive its identity. Restore Pro in the same
         // settlement transaction, without the free configuration quota.

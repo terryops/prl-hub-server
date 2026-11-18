@@ -311,3 +311,37 @@ test("payments: an order quoted before the pay address changed is matched on the
     assert.deepEqual(seen, [addr], JSON.stringify(extra));
   }
 });
+
+test("payments: an exchange's 0.01 PRL withdrawal fee taken from the amount still settles the order, exact amounts first", async () => {
+  const env = makeEnv({ PAY_ADDRESS: addr });
+  setNow(T0); chain(); price(env);
+  const order = await (await createOrder(env, gid, "ip", () => 3817)).json();
+  const pay = (sats, txid) => ({ txid, confirmations: 1, blockHeight: 1001, blockTime: T0 + 60,
+    vin: [{ addresses: ["sender"], value: String(sats + 100) }], vout: [{ addresses: [addr], value: String(sats) }] });
+  // Other shortfalls (0.02, 0.005 PRL) and a confirmation at the quoted tip match nothing.
+  const stale = { ...pay(order.sats - 1_000_000, "f".repeat(64)), blockHeight: 1000 };
+  chain([pay(order.sats - 2_000_000, "d".repeat(64)), pay(order.sats - 500_000, "e".repeat(64)), stale]);
+  setNow(T0 + 60); await checkPayments(env);
+  assert.equal(env.DB.one("SELECT status FROM orders WHERE id = ?", order.id).status, "pending");
+  assert.equal(env.DB.one("SELECT COUNT(*) n FROM payments WHERE order_id IS NULL").n, 3);
+  // Exactly 0.01 short: paid.
+  const tx = pay(order.sats - 1_000_000, "c".repeat(64));
+  chain([tx]);
+  setNow(T0 + 80); await checkPayments(env);
+  const settled = env.DB.one("SELECT status, txid FROM orders WHERE id = ?", order.id);
+  assert.deepEqual({ ...settled }, { status: "paid", txid: tx.txid });
+  assert.equal(env.DB.one("SELECT order_id FROM payments WHERE txid = ?", tx.txid).order_id, order.id);
+  assert.equal(env.DB.one("SELECT pro_src FROM groups WHERE gid = ?", gid).pro_src, "prl");
+  assert.equal((await call(env, "GET", "/v1/me", undefined, headers)).body.pro, true);
+
+  // When another open order asks for exactly the paid amount, that one is paid.
+  const e2 = makeEnv({ PAY_ADDRESS: addr });
+  setNow(T0); chain(); price(e2);
+  const a = await (await createOrder(e2, gid, "ip", () => 3817)).json();
+  e2.DB.raw.prepare(`INSERT INTO orders (id, gid, usd, rate, sats, created_at, expires_at, start_height)
+    VALUES ('exact', ?, 5, 0.8, ?, ?, ?, 1000)`).run("b".repeat(64), a.sats - 1_000_000, T0, T0 + ORDER_TTL);
+  chain([pay(a.sats - 1_000_000, "c".repeat(64))]);
+  setNow(T0 + 60); await checkPayments(e2);
+  assert.equal(e2.DB.one("SELECT status FROM orders WHERE id = 'exact'").status, "paid");
+  assert.equal(e2.DB.one("SELECT status FROM orders WHERE id = ?", a.id).status, "pending");
+});
